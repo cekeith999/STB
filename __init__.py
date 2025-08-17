@@ -411,16 +411,104 @@ def _meshy_import_timer():
     secs = max(1.0, float(getattr(prefs, "meshy_poll_seconds", 4))) if ok and prefs else 4.0
     return secs
 
-def _meshy_worker(prompt, do_refine=True, should_remesh=True):
-    """Background thread: Meshy preview -> optional refine -> download GLB -> enqueue path."""
+
+
+def _resolve_text_endpoint(use_pro_flag: bool):
+    """Pick the right endpoint based on prefs and flag."""
+    prefs, ok = _get_addon_prefs()
+    if not ok or not prefs:
+        return "https://api.meshy.ai/openapi/v2/text-to-3d", False, False
+    if use_pro_flag and prefs.meshy_use_pro:
+        return (prefs.meshy_pro_endpoint or "https://api.meshy.ai/openapi/v2/text-to-3d-pro",
+                True,
+                bool(prefs.meshy_pro_single_pass))
+    return (prefs.meshy_text_endpoint or "https://api.meshy.ai/openapi/v2/text-to-3d",
+            False,
+            False)
+
+def _meshy_worker(prompt, do_refine=True, should_remesh=True, force_pro=None):
+    """
+    Background thread: Meshy (Pro or Standard).
+    Emits progress events for the UI while polling.
+    """
     try:
-        _print(f"[Meshy] start: {prompt}")
-        preview = _http_post_json(f"{API_BASE}/text-to-3d", {
-            "mode": "preview",
-            "prompt": prompt,
-            "should_remesh": bool(should_remesh)
-        })
-        task_id = preview["result"]
+        # Resolve standard vs pro
+        endpoint, is_pro, pro_single = _resolve_text_endpoint(force_pro if force_pro is not None else True)
+
+        _status_emit(stage="queued", progress=0.02, msg="Queued")
+        _print(f"[Meshy] start ({'PRO' if is_pro else 'STD'}): {prompt}")
+
+        payload = {"prompt": prompt}
+        if not pro_single:
+            payload.update({"mode": "preview", "should_remesh": bool(should_remesh)})
+
+        _status_emit(stage="submitting", progress=0.05, msg=("Submitting (Pro)" if is_pro else "Submitting"))
+        preview = _http_post_json(endpoint, payload)
+        task_id = preview.get("result") or preview.get("task_id") or "<unknown>"
+        _status_emit(stage="preview", progress=0.10, msg="Preview running", task_id=task_id)
+
+        poll_url = f"{endpoint}/{task_id}"
+        while True:
+            st = _http_get_json(poll_url)
+            s = (st.get("status") or "").upper()
+            if s == "SUCCEEDED":
+                model_urls = st.get("model_urls") or {}
+                url = model_urls.get("glb") or model_urls.get("usdz") or model_urls.get("fbx")
+                if url:
+                    final_url = url
+                else:
+                    final_url = model_urls.get("model") or url
+                break
+            if s in {"FAILED", "CANCELED"}:
+                raise RuntimeError(f"Meshy task failed: {st}")
+            cur = min(0.60, (bpy.context.window_manager.meshy_progress or 0.10) + 0.04)
+            _status_emit(stage="preview", progress=cur, msg=st.get("status_text") or "Preview running…", task_id=task_id)
+            time.sleep(5)
+
+        if (not is_pro or not pro_single) and do_refine:
+            _status_emit(stage="refine_submit", progress=0.62, msg="Submitting refine", task_id=task_id)
+            ref = _http_post_json(endpoint, {"mode": "refine", "preview_task_id": task_id})
+            ref_id = ref.get("result") or ref.get("task_id") or "<unknown>"
+            _status_emit(stage="refine", progress=0.66, msg="Refine running", task_id=ref_id)
+            while True:
+                st2 = _http_get_json(f"{endpoint}/{ref_id}")
+                s2 = (st2.get("status") or "").upper()
+                if s2 == "SUCCEEDED":
+                    mu = st2.get("model_urls") or {}
+                    final_url = mu.get("glb") or mu.get("usdz") or mu.get("fbx") or mu.get("model")
+                    if not final_url:
+                        raise RuntimeError("Refine succeeded but no model URL in response")
+                    break
+                if s2 in {"FAILED", "CANCELED"}:
+                    _print(f"[Meshy] refine failed, using preview asset: {st2}")
+                    break
+                cur = min(0.90, (bpy.context.window_manager.meshy_progress or 0.66) + 0.03)
+                _status_emit(stage="refine", progress=cur, msg=st2.get("status_text") or "Refining…", task_id=ref_id)
+                time.sleep(5)
+
+        _status_emit(stage="downloading", progress=0.92, msg="Downloading asset")
+        tmpdir = tempfile.mkdtemp(prefix="meshy_")
+        glb_path = os.path.join(tmpdir, "meshy_model.glb")
+        _download_to(final_url, glb_path)
+
+        _status_emit(stage="importing", progress=0.97, msg="Importing model")
+        _MESHY_IMPORT_Q.put(glb_path)
+
+        _status_emit(stage="done", progress=1.0, msg="Imported into Meshy_Imports")
+        _print(f"[Meshy] done → {glb_path}")
+
+    except urllib.error.HTTPError as e:
+        try:
+            body = e.read().decode("utf-8", "ignore")[:300]
+        except Exception:
+            body = "<no body>"
+        _print(f"[Meshy] HTTP {e.code}: {body}")
+        _set_error(f"Meshy HTTP {e.code}: {body}")
+        _status_emit(stage="error", progress=0.0, msg=f"HTTP {e.code}: {body}")
+    except Exception as e:
+        _print(f"[Meshy] worker error: {e}")
+        _set_error(f"Meshy error: {e}")
+        _status_emit(stage="error", progress=0.0, msg=str(e))
 
         # Poll preview
         while True:
@@ -498,6 +586,25 @@ def _ensure_link_to_sandbox_selected():
                 pass
 
 def handle_voice_command(text):
+
+    # MESHY voice route (accepts 'meshy ...' and 'meshy pro ...')
+    t = (text or "").strip().lower()
+    pro_flag = None
+    prompt = None
+    if t.startswith("meshy "):
+        prompt = t[len("meshy "):].strip()
+        if prompt.startswith("pro "):
+            prompt = prompt[4:].strip()
+            pro_flag = True
+    else:
+        mm = re.match(r"(create|generate|make)\s+(.+?)\s+(with|using)\s+meshy", t)
+        if mm:
+            prompt = mm.group(2).strip()
+    if prompt:
+        threading.Thread(target=_meshy_worker, args=(prompt, True, True, pro_flag), daemon=True).start()
+        prefs, ok = _get_addon_prefs()
+        using_pro = pro_flag or (ok and getattr(prefs, "meshy_use_pro", False))
+        return f"Meshy started ({'PRO' if using_pro else 'STD'}): {prompt}. Will import into Meshy_Imports."
     """
     Routes English commands to safe primitives or Meshy.
     Blocks any file ops by keyword.
@@ -771,6 +878,13 @@ class RPCBRIDGE_AddonPrefs(bpy.types.AddonPreferences):
         layout.prop(self, "meshy_poll_seconds")
 
 # ====== PROPS ======
+        layout.separator()
+        layout.label(text="Meshy (Pro)", icon='FUND')
+        layout.prop(self, "meshy_use_pro")
+        layout.prop(self, "meshy_text_endpoint")
+        layout.prop(self, "meshy_pro_endpoint")
+        layout.prop(self, "meshy_pro_single_pass")
+
 def ensure_props():
     wm = bpy.types.WindowManager
     if not hasattr(wm, "rpc_server_running"):
@@ -787,6 +901,39 @@ def ensure_props():
         wm.rpc_last_blocked = bpy.props.StringProperty(name="Last Blocked (JSON)", default="", options={'HIDDEN'})
 
 # ====== OPERATORS ======
+
+# Meshy (advanced)
+meshy_use_pro: bpy.props.BoolProperty(
+    name="Use Meshy Pro",
+    description="Route Text→3D calls to your Pro endpoint/model",
+    default=True
+)
+meshy_text_endpoint: bpy.props.StringProperty(
+    name="Text-to-3D Endpoint",
+    description="Standard Text→3D endpoint",
+    default="https://api.meshy.ai/openapi/v2/text-to-3d"
+)
+meshy_pro_endpoint: bpy.props.StringProperty(
+    name="Pro Text-to-3D Endpoint",
+    description="Pro Text→3D endpoint (override here if Meshy gives you a different path)",
+    default="https://api.meshy.ai/openapi/v2/text-to-3d-pro"
+)
+meshy_pro_single_pass: bpy.props.BoolProperty(
+    name="Pro: Single-pass (no refine)",
+    description="Some Pro routes return final assets without a separate refine step",
+    default=True
+)
+
+    wm = bpy.context.window_manager
+    if not hasattr(wm, "meshy_stage"):
+        wm.meshy_stage = bpy.props.StringProperty(name="Meshy Stage", default="idle", options={'HIDDEN'})
+    if not hasattr(wm, "meshy_progress"):
+        wm.meshy_progress = bpy.props.FloatProperty(name="Meshy Progress", default=0.0, min=0.0, max=1.0, options={'HIDDEN'})
+    if not hasattr(wm, "meshy_message"):
+        wm.meshy_message = bpy.props.StringProperty(name="Meshy Message", default="", options={'HIDDEN'})
+    if not hasattr(wm, "meshy_task_id"):
+        wm.meshy_task_id = bpy.props.StringProperty(name="Meshy Task", default="", options={'HIDDEN'})
+
 class RPCBRIDGE_OT_server_toggle(bpy.types.Operator):
     bl_idname = "rpcbridge.server_toggle"
     bl_label = "Start/Stop RPC Server"
@@ -949,6 +1096,18 @@ class RPCBRIDGE_PT_panel(bpy.types.Panel):
 
 
 # ====== VOICE OPERATOR (routes to handle_voice_command) ======
+        layout.separator()
+        box = layout.box()
+        box.label(text="Meshy Status", icon='MOD_BUILD')
+        wm = context.window_manager
+        box.template_progressbar(wm.meshy_progress, text=wm.meshy_stage or "idle")
+        if wm.meshy_task_id:
+            row = box.row()
+            row.label(text=f"Task: {wm.meshy_task_id}")
+        if wm.meshy_message:
+            for line in (wm.meshy_message[:300]).splitlines()[:3]:
+                box.label(text=line)
+
 class VOICE_OT_Handle(bpy.types.Operator):
     """Route a natural-language command to primitives/Meshy"""
     bl_idname = "voice.handle"
@@ -967,6 +1126,44 @@ class VOICE_OT_Handle(bpy.types.Operator):
             print(f"[VoiceMeshy] ERROR: {e}")
             return {'CANCELLED'}
 
+
+
+# Meshy status updates from background thread → UI-safe timer
+_MESHY_STATUS_Q = queue.Queue()
+
+def _status_emit(stage=None, progress=None, msg=None, task_id=None):
+    """Push thread-safe status updates for UI (consumed by a timer)."""
+    _MESHY_STATUS_Q.put({
+        "stage": stage,
+        "progress": progress,
+        "msg": msg,
+        "task_id": task_id,
+        "ts": time.time(),
+    })
+
+def _meshy_status_timer():
+    """Main-thread: drain status queue into WindowManager props for UI."""
+    try:
+        wm = bpy.context.window_manager
+        updated = False
+        while not _MESHY_STATUS_Q.empty():
+            evt = _MESHY_STATUS_Q.get()
+            if evt.get("stage") is not None:
+                wm.meshy_stage = str(evt["stage"])
+                updated = True
+            if evt.get("progress") is not None:
+                wm.meshy_progress = max(0.0, min(1.0, float(evt["progress"])))
+                updated = True
+            if evt.get("msg") is not None:
+                wm.meshy_message = str(evt["msg"])
+                updated = True
+            if evt.get("task_id") is not None:
+                wm.meshy_task_id = str(evt["task_id"])
+                updated = True
+        return 0.3
+    except Exception:
+        return 0.5
+
 # ====== REGISTER ======
 _CLASSES = (
     RPCBRIDGE_AddonPrefs,
@@ -974,7 +1171,7 @@ _CLASSES = (
     RPCBRIDGE_OT_voice_toggle,
     RPCBRIDGE_OT_console,
     RPCBRIDGE_OT_validate,
-    RPCBRIDGE_PT_panel,,
+    RPCBRIDGE_PT_panel,
     VOICE_OT_Handle,
 )
 
@@ -988,6 +1185,7 @@ def register():
     # kick off Meshy import timer so it runs even if server is off
     bpy.app.timers.register(_meshy_import_timer, first_interval=3.0)
     _print("REGISTER OK")
+    bpy.app.timers.register(_meshy_status_timer, first_interval=0.3)
 
 def unregister():
     _stop_voice_process()
