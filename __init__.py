@@ -946,6 +946,27 @@ class RPCBRIDGE_PT_panel(bpy.types.Panel):
             for line in wm.rpc_last_error.splitlines():
                 box.label(text=line)
 
+
+
+# ====== VOICE OPERATOR (routes to handle_voice_command) ======
+class VOICE_OT_Handle(bpy.types.Operator):
+    """Route a natural-language command to primitives/Meshy"""
+    bl_idname = "voice.handle"
+    bl_label  = "Handle Voice Command"
+    bl_options = {'INTERNAL'}
+    text: bpy.props.StringProperty(name="Text", description="Transcript to execute")
+
+    def execute(self, context):
+        try:
+            msg = handle_voice_command(self.text)
+            self.report({'INFO'}, msg)
+            print(f"[VoiceMeshy] {msg}")
+            return {'FINISHED'}
+        except Exception as e:
+            self.report({'ERROR'}, str(e))
+            print(f"[VoiceMeshy] ERROR: {e}")
+            return {'CANCELLED'}
+
 # ====== REGISTER ======
 _CLASSES = (
     RPCBRIDGE_AddonPrefs,
@@ -953,7 +974,8 @@ _CLASSES = (
     RPCBRIDGE_OT_voice_toggle,
     RPCBRIDGE_OT_console,
     RPCBRIDGE_OT_validate,
-    RPCBRIDGE_PT_panel,
+    RPCBRIDGE_PT_panel,,
+    VOICE_OT_Handle,
 )
 
 def register():
