@@ -1,14 +1,15 @@
 bl_info = {
-    "name": "Blender RPC Bridge (RPC tab, voice controls) – with Safety Gate",
+    "name": "Blender RPC Bridge (RPC tab, voice controls) – with Safety Gate + Meshy",
     "author": "you",
-    "version": (0, 6, 1),
+    "version": (0, 7, 0),
     "blender": (3, 6, 0),
     "category": "System",
     "location": "3D View > N-panel > RPC",
-    "description": "XML-RPC server + Voice launcher with rich diagnostics and operator Safety Gate (with auto Whisper CLI setup)",
+    "description": "XML-RPC server + Voice launcher with diagnostics, operator Safety Gate, and Meshy text→3D import (API only)",
 }
 
-import bpy, threading, queue, time, os, subprocess, sys, socket, shutil, json, re, textwrap
+import bpy, threading, queue, time, os, subprocess, sys, socket, shutil, json, re, textwrap, tempfile
+import urllib.request, urllib.error
 from xmlrpc.server import SimpleXMLRPCServer, SimpleXMLRPCRequestHandler
 
 # ====== CONFIG ======
@@ -18,6 +19,8 @@ DEFAULT_PYTHON_EXE   = ""
 HOST = "127.0.0.1"
 PORT = 8765
 
+API_BASE = "https://api.meshy.ai/openapi/v2"   # Meshy REST base
+
 # ====== GLOBAL STATE ======
 _SERVER_THREAD = None
 _SERVER = None
@@ -26,6 +29,9 @@ _TASKQ = queue.Queue()
 
 _VOICE_POPEN = None
 _VOICE_RUNNING = False
+
+# Meshy main-thread import queue (workers enqueue downloaded .glb paths here)
+_MESHY_IMPORT_Q = queue.Queue()
 
 # ====== UTIL ======
 def _print(*a):
@@ -154,7 +160,6 @@ def main():
 if __name__ == "__main__":
     main()
 ''',
-    # Fallback wrapper for user-scripts location; bundled CLI uses a different .bat
     "whisper-cli.bat": r'''@echo off
 setlocal
 set PY=python
@@ -343,6 +348,201 @@ def _safe_call_operator(op_fullname: str, kwargs: dict):
     except Exception as e:
         return False, f"Operator error {op_fullname}: {e}"
 
+# ====== MESHY HELPERS ======
+def _meshy_headers():
+    prefs, ok = _get_addon_prefs()
+    key = (getattr(prefs, "meshy_api_key", "") if ok and prefs else "").strip()
+    if not key:
+        raise RuntimeError("Set your Meshy API key in Add-on Preferences.")
+    return {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
+
+def _http_post_json(url, payload):
+    req = urllib.request.Request(url, data=json.dumps(payload).encode("utf-8"),
+                                 headers=_meshy_headers(), method="POST")
+    with urllib.request.urlopen(req) as r:
+        return json.loads(r.read().decode("utf-8"))
+
+def _http_get_json(url):
+    req = urllib.request.Request(url, headers=_meshy_headers(), method="GET")
+    with urllib.request.urlopen(req) as r:
+        return json.loads(r.read().decode("utf-8"))
+
+def _download_to(url, dst_path):
+    urllib.request.urlretrieve(url, dst_path)
+
+def _ensure_sandbox_collection(ctx):
+    col = bpy.data.collections.get("Meshy_Imports")
+    if not col:
+        col = bpy.data.collections.new("Meshy_Imports")
+        ctx.scene.collection.children.link(col)
+    elif col.name not in ctx.scene.collection.children:
+        ctx.scene.collection.children.link(col)
+    return col
+
+def _import_glb_on_main(glb_path):
+    """Main-thread import of a GLB, then move to Meshy_Imports collection."""
+    try:
+        ok, _ = _safe_call_operator("import_scene.gltf", {"filepath": glb_path})
+        if not ok:
+            return
+        col = _ensure_sandbox_collection(bpy.context)
+        for obj in list(bpy.context.selected_objects):
+            # unlink from any other collections and relink into sandbox
+            for c in list(obj.users_collection):
+                try:
+                    c.objects.unlink(obj)
+                except Exception:
+                    pass
+            if col not in obj.users_collection:
+                col.objects.link(obj)
+        _print(f"[Meshy] Imported: {glb_path}")
+    except Exception as e:
+        _print(f"[Meshy] Import error: {e}")
+
+def _meshy_import_timer():
+    """Timer that drains the Meshy import queue on the main thread."""
+    drained = False
+    while not _MESHY_IMPORT_Q.empty():
+        drained = True
+        path = _MESHY_IMPORT_Q.get()
+        _import_glb_on_main(path)
+    # Re-schedule based on preference
+    prefs, ok = _get_addon_prefs()
+    secs = max(1.0, float(getattr(prefs, "meshy_poll_seconds", 4))) if ok and prefs else 4.0
+    return secs
+
+def _meshy_worker(prompt, do_refine=True, should_remesh=True):
+    """Background thread: Meshy preview -> optional refine -> download GLB -> enqueue path."""
+    try:
+        _print(f"[Meshy] start: {prompt}")
+        preview = _http_post_json(f"{API_BASE}/text-to-3d", {
+            "mode": "preview",
+            "prompt": prompt,
+            "should_remesh": bool(should_remesh)
+        })
+        task_id = preview["result"]
+
+        # Poll preview
+        while True:
+            st = _http_get_json(f"{API_BASE}/text-to-3d/{task_id}")
+            s = st.get("status")
+            if s == "SUCCEEDED":
+                url = st["model_urls"]["glb"]
+                break
+            if s in {"FAILED", "CANCELED"}:
+                raise RuntimeError(f"Meshy preview failed: {st}")
+            time.sleep(5)
+
+        final_url = url
+        if do_refine:
+            ref = _http_post_json(f"{API_BASE}/text-to-3d", {"mode": "refine", "preview_task_id": task_id})
+            ref_id = ref["result"]
+            while True:
+                st2 = _http_get_json(f"{API_BASE}/text-to-3d/{ref_id}")
+                s2 = st2.get("status")
+                if s2 == "SUCCEEDED":
+                    final_url = st2["model_urls"]["glb"]
+                    break
+                if s2 in {"FAILED", "CANCELED"}:
+                    raise RuntimeError(f"Meshy refine failed: {st2}")
+                time.sleep(5)
+
+        tmpdir = tempfile.mkdtemp(prefix="meshy_")
+        glb_path = os.path.join(tmpdir, "meshy_model.glb")
+        _download_to(final_url, glb_path)
+        _MESHY_IMPORT_Q.put(glb_path)
+        _print(f"[Meshy] done → {glb_path}")
+    except urllib.error.HTTPError as e:
+        try:
+            body = e.read().decode("utf-8", "ignore")[:300]
+        except Exception:
+            body = "<no body>"
+        _print(f"[Meshy] HTTP {e.code}: {body}")
+        _set_error(f"Meshy HTTP {e.code}: {body}")
+    except Exception as e:
+        _print(f"[Meshy] worker error: {e}")
+        _set_error(f"Meshy error: {e}")
+
+# ====== SIMPLE VOICE COMMAND ROUTER ======
+_PRIMS = {
+    "cube":       lambda size: _safe_call_operator("mesh.primitive_cube_add", {"size": size}),
+    "sphere":     lambda size: _safe_call_operator("mesh.primitive_uv_sphere_add", {"radius": size/2}),
+    "ico sphere": lambda size: _safe_call_operator("mesh.primitive_ico_sphere_add", {"radius": size/2, "subdivisions": 3}),
+    "cylinder":   lambda size: _safe_call_operator("mesh.primitive_cylinder_add", {"radius": size/2, "depth": size}),
+    "cone":       lambda size: _safe_call_operator("mesh.primitive_cone_add", {"radius1": size/2, "depth": size}),
+    "torus":      lambda size: _safe_call_operator("mesh.primitive_torus_add", {}),
+    "plane":      lambda size: _safe_call_operator("mesh.primitive_plane_add", {"size": size}),
+}
+
+def _parse_size(text):
+    """
+    Extract a numeric size in Blender units from phrases like:
+    '2', '2m', '2 meters', '0.5', '50 cm' (default 2.0)
+    """
+    m = re.search(r"(\d+(\.\d+)?)\s*(m|meter|meters|cm|centimeter|centimeters)?", text or "")
+    if not m:
+        return 2.0
+    val = float(m.group(1))
+    unit = (m.group(3) or "").lower()
+    if unit in {"cm", "centimeter", "centimeters"}:
+        return val / 100.0
+    return val
+
+def _ensure_link_to_sandbox_selected():
+    col = _ensure_sandbox_collection(bpy.context)
+    for obj in list(bpy.context.selected_objects):
+        if col not in obj.users_collection:
+            try:
+                col.objects.link(obj)
+            except Exception:
+                pass
+
+def handle_voice_command(text):
+    """
+    Routes English commands to safe primitives or Meshy.
+    Blocks any file ops by keyword.
+    """
+    t = (text or "").strip().lower()
+    if not t:
+        return "Empty command."
+
+    # Block obvious dangerous intents
+    if any(w in t for w in ["delete", "erase", "save", "overwrite", "quit", "close file", "new file", "open file"]):
+        return "Blocked: file operations are not allowed."
+
+    # PRIMITIVE: "add cube 2 meters", "create plane 50 cm"
+    m = re.match(r"(add|create|spawn)\s+([a-z ]+?)(?:\s+(\d.*))?$", t)
+    if m:
+        prim_name = m.group(2).strip().replace("icosphere", "ico sphere")
+        size = _parse_size(m.group(3) or "")
+        # fuzzy match
+        pick = None
+        for k in _PRIMS.keys():
+            if prim_name == k or prim_name.startswith(k):
+                pick = k; break
+        if pick:
+            ok, msg = _PRIMS[pick](size)
+            if ok:
+                _ensure_link_to_sandbox_selected()
+                return f"Added {pick} (size ~{size:.2f})."
+            return f"Blocked/failed: {pick} -> {msg}"
+
+    # MESHY: "meshy a glossy red mask...", "create XXX with meshy"
+    if t.startswith("meshy "):
+        prompt = t[len("meshy "):].strip()
+        if not prompt:
+            return "Give me a prompt after 'meshy …'."
+        threading.Thread(target=_meshy_worker, args=(prompt, True, True), daemon=True).start()
+        return f"Meshy started: {prompt}. Will import into Meshy_Imports."
+
+    mm = re.match(r"(create|generate|make)\s+(.+?)\s+(with|using)\s+meshy", t)
+    if mm:
+        prompt = mm.group(2).strip()
+        threading.Thread(target=_meshy_worker, args=(prompt, True, True), daemon=True).start()
+        return f"Meshy started: {prompt}. Will import into Meshy_Imports."
+
+    return "Command not recognized. Try: 'add cube', 'add sphere 2 meters', or 'meshy a futuristic mask'."
+
 # ====== XML-RPC SERVER THREAD ======
 class _RequestHandler(SimpleXMLRPCRequestHandler):
     rpc_paths = ("/RPC2",)
@@ -380,10 +580,19 @@ def _server_loop():
                     "allow": [rx.pattern for rx in allow],
                 }
 
+            def voice_handle(text):
+                """Handle a natural-language command (primitive or Meshy)."""
+                try:
+                    msg = handle_voice_command(text)
+                    return {"ok": True, "message": msg}
+                except Exception as e:
+                    return {"ok": False, "error": str(e)}
+
             server.register_function(ping, "ping")
             server.register_function(enqueue_op, "enqueue_op")
             server.register_function(enqueue_op_safe, "enqueue_op_safe")
             server.register_function(safety_info, "safety_info")
+            server.register_function(voice_handle, "voice_handle")
 
             _SERVER_RUNNING = True
             _print(f"XML-RPC listening on http://{HOST}:{PORT}/RPC2")
@@ -511,7 +720,7 @@ def _stop_voice_process():
     _VOICE_RUNNING = False
     _print("Voice subprocess stopped")
 
-# ====== MAIN THREAD TIMER ======
+# ====== MAIN THREAD TIMERS ======
 def _drain_task_queue():
     try:
         while True:
@@ -540,6 +749,10 @@ class RPCBRIDGE_AddonPrefs(bpy.types.AddonPreferences):
     allow_view3d_menus: bpy.props.BoolProperty(name="Allow Menu Calls", default=False, description="If ON, unblocks wm.call_menu style ops (still UI-only)")
     safety_extra_allow: bpy.props.StringProperty(name="Extra Allow Regex (one per line)", description="Advanced: add regex lines like ^pose\\. or ^sequencer\\.", subtype='NONE', default="")
     safety_extra_deny: bpy.props.StringProperty(name="Extra Deny Regex (one per line)", description="Advanced: add regex lines; deny always wins", subtype='NONE', default="")
+    # Meshy prefs
+    meshy_api_key: bpy.props.StringProperty(name="Meshy API Key", subtype='PASSWORD', description="Format: msy-RtHUDJezqJJG7KlQK0UNosTVemaIMGEmqh6C", default="")
+    meshy_poll_seconds: bpy.props.IntProperty(name="Meshy importer poll (sec)", default=4, min=2, max=30)
+
     def draw(self, context):
         layout = self.layout
         layout.label(text="Paths")
@@ -552,6 +765,10 @@ class RPCBRIDGE_AddonPrefs(bpy.types.AddonPreferences):
         col = layout.column()
         col.prop(self, "safety_extra_allow")
         col.prop(self, "safety_extra_deny")
+        layout.separator()
+        layout.label(text="Meshy")
+        layout.prop(self, "meshy_api_key")
+        layout.prop(self, "meshy_poll_seconds")
 
 # ====== PROPS ======
 def ensure_props():
@@ -581,6 +798,8 @@ class RPCBRIDGE_OT_server_toggle(bpy.types.Operator):
             if ok:
                 context.window_manager.rpc_server_running = True
                 bpy.app.timers.register(_drain_task_queue, first_interval=0.3)
+                # ensure Meshy import timer is running
+                bpy.app.timers.register(_meshy_import_timer, first_interval=3.0)
                 self.report({'INFO'}, f"RPC server started on {HOST}:{PORT}")
             else:
                 self.report({'ERROR'}, f"Couldn't start (port {PORT} in use?)")
@@ -744,6 +963,8 @@ def register():
             bpy.utils.register_class(cls)
         except Exception:
             pass
+    # kick off Meshy import timer so it runs even if server is off
+    bpy.app.timers.register(_meshy_import_timer, first_interval=3.0)
     _print("REGISTER OK")
 
 def unregister():
