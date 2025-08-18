@@ -8,23 +8,69 @@ bl_info = {
     "description": "XML-RPC server + Voice launcher with diagnostics, operator Safety Gate, and Meshy text→3D import (API only)",
 }
 
-# at top of addon file (e.g., __init__.py or rpc_bridge.py)
-import os
-from . import __package__  # if needed for relative import
-from ..stb_core.config import load_config if __package__ else None  # adjust path if addon layout differs
-import bpy, threading, queue, time, os, subprocess, sys, socket, shutil, json, re, textwrap, tempfile
+# --- bootstrap: locate a parent folder that contains 'stb_core' and add it to sys.path
+import os, sys
+HERE = os.path.abspath(os.path.dirname(__file__))
+
+def _find_repo_root(start_dir: str, target: str = "stb_core", max_up: int = 6):
+    cur = start_dir
+    for _ in range(max_up):
+        if os.path.isdir(os.path.join(cur, target)):
+            return cur
+        parent = os.path.dirname(cur)
+        if parent == cur:
+            break
+        cur = parent
+    return None
+
+REPO_ROOT = _find_repo_root(HERE)
+if not REPO_ROOT:
+    raise ImportError(
+        f"Could not locate 'stb_core' within 6 parent folders of {HERE}. "
+        "Ensure your structure is: <repo>/(addon, stb_core, config)"
+    )
+
+if REPO_ROOT not in sys.path:
+    sys.path.insert(0, REPO_ROOT)
+
+from stb_core.config import load_config
+CFG = load_config(REPO_ROOT)
+# ------------------------------------------------------------------------------
+
+import bpy, threading, queue, time, subprocess, sys as _sys, socket, shutil, json, re, textwrap, tempfile
 import urllib.request, urllib.error
 from xmlrpc.server import SimpleXMLRPCServer, SimpleXMLRPCRequestHandler
 
-# Default/fallback Meshy API key (user-provided)
-MESHY_API_KEY_DEFAULT = "msy_RtHUDJezqJJG7KlQK0UNosTVemaIMGEmqh6C"
+# Optional Progress panel
+try:
+    from addon import ui_progress
+    _HAS_UI_PROGRESS = True
+except Exception as e:
+    print(f"[STB] ui_progress not available: {e}")
+    _HAS_UI_PROGRESS = False
+
+# Safe command executor hook
+from addon.command_exec import execute_command as _execute_command
+
+def rpc_execute(cmd_dict):
+    """
+    XML-RPC method: accepts a dict and routes through safety + executor.
+    NOTE: registration happens inside _server_loop (not at import time).
+    """
+    try:
+        return _execute_command(cmd_dict, CFG)
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+# Default/fallback Meshy API key (leave empty; use Add-on Prefs or env)
+MESHY_API_KEY_DEFAULT = ""
 
 # ====== CONFIG ======
 DEFAULT_VOICE_SCRIPT = os.path.join(os.path.dirname(__file__), "voice_to_blender.py")
 DEFAULT_PYTHON_EXE   = ""
 
 HOST = "127.0.0.1"
-PORT = 8765
+PORT = 8785
 
 API_BASE = "https://api.meshy.ai/v2"
 MESHY_TEXT_TO_3D = f"{API_BASE}/text-to-3d"
@@ -420,7 +466,6 @@ def _meshy_import_timer():
     secs = max(1.0, float(getattr(prefs, "meshy_poll_seconds", 4))) if ok and prefs else 4.0
     return secs
 
-
 def _meshy_worker(prompt, do_refine=True, should_remesh=True, pro_flag=None):
     """Background thread: Meshy preview -> optional refine -> download GLB -> enqueue path."""
     try:
@@ -431,7 +476,7 @@ def _meshy_worker(prompt, do_refine=True, should_remesh=True, pro_flag=None):
         endpoint = (getattr(prefs, 'meshy_text_endpoint', '') if (ok and prefs) else '') or MESHY_TEXT_TO_3D
         use_pro = bool(pro_flag) or (bool(getattr(prefs, 'meshy_use_pro', True)) if ok and prefs else True)
         pro_single = bool(getattr(prefs, 'meshy_pro_single_pass', False)) if (ok and prefs) else False
-        ai_model = "meshy-5" if use_pro else "meshy-5"  # default meshy-5 anyway; keep explicit for clarity
+        ai_model = "meshy-5" if use_pro else "meshy-5"
         _print(f"[Meshy] route → {'PRO' if use_pro else 'STD'} @ {endpoint} (model={ai_model})")
 
         # 1) Start preview
@@ -521,6 +566,8 @@ def _ensure_link_to_sandbox_selected():
             except Exception:
                 pass
 
+# NOTE: _PRIMS must exist elsewhere in your file for handle_voice_command() to add primitives.
+
 def handle_voice_command(text):
     pro_flag = None
     t = (text or '').strip().lower()
@@ -590,6 +637,11 @@ def _server_loop():
         ) as server:
             _SERVER = server
 
+            # Introspection (system.listMethods, etc.) + multicall (optional)
+            server.register_introspection_functions()
+            server.register_multicall_functions()
+
+            # ----- define handlers -----
             def ping():
                 return "pong"
 
@@ -613,29 +665,44 @@ def _server_loop():
                 }
 
             def voice_handle(text):
-                """Handle a natural-language command (primitive or Meshy)."""
                 try:
                     msg = handle_voice_command(text)
                     return {"ok": True, "message": msg}
                 except Exception as e:
                     return {"ok": False, "error": str(e)}
 
+            # ----- REGISTER METHODS (including 'execute') -----
             server.register_function(ping, "ping")
             server.register_function(enqueue_op, "enqueue_op")
             server.register_function(enqueue_op_safe, "enqueue_op_safe")
             server.register_function(safety_info, "safety_info")
             server.register_function(voice_handle, "voice_handle")
+            server.register_function(rpc_execute, "execute")  # <- the important one
 
+            # Log what's really registered (helps catch stale servers)
+            try:
+                methods = server.system_listMethods()
+            except Exception:
+                methods = ["(introspection disabled)"]
             _SERVER_RUNNING = True
             _print(f"XML-RPC listening on http://{HOST}:{PORT}/RPC2")
+            _print("Registered methods:", methods)
+
+            # Main loop
             while _SERVER_RUNNING:
                 server.handle_request()
+
+    except OSError as e:
+        # e.g., address already in use
+        _print(f"Server bind error on {HOST}:{PORT}: {e}")
+        _set_error(f"Server bind error on {HOST}:{PORT}: {e}")
     except Exception as e:
         _print("Server loop error:", e)
         _set_error(f"Server error: {e!r}")
     finally:
         _SERVER_RUNNING = False
         _print("Server loop ended")
+
 
 def _start_server_thread():
     global _SERVER_THREAD, _SERVER_RUNNING
@@ -773,7 +840,6 @@ def _drain_task_queue():
     return 0.5 if _SERVER_RUNNING else None
 
 # ====== ADD-ON PREFERENCES ======
-
 class RPCBRIDGE_AddonPrefs(bpy.types.AddonPreferences):
     bl_idname = __name__
     voice_script: bpy.props.StringProperty(name="Voice Script Path", subtype='FILE_PATH', default=DEFAULT_VOICE_SCRIPT)
@@ -833,7 +899,6 @@ class RPCBRIDGE_AddonPrefs(bpy.types.AddonPreferences):
         layout.prop(self, "meshy_pro_single_pass")
 
 # ====== PROPS ======
-
 def ensure_props():
     wm = bpy.types.WindowManager
     if not hasattr(wm, "rpc_server_running"):
@@ -1009,8 +1074,6 @@ class RPCBRIDGE_PT_panel(bpy.types.Panel):
             for line in wm.rpc_last_error.splitlines():
                 box.label(text=line)
 
-
-
 class VOICE_OT_Handle(bpy.types.Operator):
     """Route a natural-language command to primitives/Meshy"""
     bl_idname = "voice.handle"
@@ -1037,27 +1100,45 @@ _CLASSES = (
     RPCBRIDGE_OT_console,
     RPCBRIDGE_OT_validate,
     RPCBRIDGE_PT_panel,
-    VOICE_OT_Handle,)
+    VOICE_OT_Handle,
+)
 
 def register():
     ensure_props()
     for cls in _CLASSES:
         try:
             bpy.utils.register_class(cls)
-        except Exception:
-            pass
-    # kick off Meshy import timer so it runs even if server is off
+        except Exception as e:
+            print(f"[STB] failed to register {getattr(cls, '__name__', cls)}: {e}")
+
+    # Register the progress panel (does NOT start any timers by itself)
+    if _HAS_UI_PROGRESS:
+        try:
+            ui_progress.register()
+        except Exception as e:
+            print(f"[STB] ui_progress.register() failed: {e}")
+
+    # keep your existing Meshy import timer (unrelated to the progress UI)
     bpy.app.timers.register(_meshy_import_timer, first_interval=3.0)
     _print("REGISTER OK")
 
 def unregister():
     _stop_voice_process()
     _stop_server_thread()
+
+    # Unregister the progress panel first so it can stop its own timer if running
+    if _HAS_UI_PROGRESS:
+        try:
+            ui_progress.unregister()
+        except Exception as e:
+            print(f"[STB] ui_progress.unregister() failed: {e}")
+
     for cls in reversed(_CLASSES):
         try:
             bpy.utils.unregister_class(cls)
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"[STB] failed to unregister {getattr(cls, '__name__', cls)}: {e}")
+
     _print("UNREGISTER OK")
 
 if __name__ == "__main__":
