@@ -186,6 +186,80 @@ FILENAME_RE = re.compile(
     r'(fbx|obj|gltf|glb|stl|ply|usd|dae|abc|svg)(?:\s+file)?\b',
     re.IGNORECASE
 )
+# Add this alongside FILENAME_RE
+BASE_ONLY_RE = re.compile(
+    r'\bimport(?:\s+the)?\s+([A-Za-z0-9_\- ]+?)\s+(?:file\s+)?(?:from|in|into|at)\b',
+    re.IGNORECASE
+)
+
+def _io_cmd_import(utterance: str):
+    t = utterance.strip()
+    _dbg(f"import: raw='{t}'")
+
+    # 1) Full explicit path still wins
+    m_path = PATH_RE.search(t)
+    _dbg(f"PATH_RE -> {m_path.group(0) if m_path else None}")
+    if m_path:
+        p = _normalize_path(m_path.group(0))
+        ext = pathlib.Path(p).suffix.lower().lstrip(".")
+        fmt = _pick_format_from_text(t, ext)
+        _dbg(f"explicit path p='{p}', ext='{ext}', fmt='{fmt}'")
+        if fmt in IMPORT_MAP:
+            op, file_kw = IMPORT_MAP[fmt]
+            return {"op": op, "kwargs": {file_kw: p}}
+
+    # 2) Known folder: from/in/into/at (my) downloads/documents/desktop/models
+    folder_match = KNOWN_FOLDER_RE.search(t)
+    _dbg(f"KNOWN_FOLDER_RE -> {folder_match.group(0) if folder_match else None}")
+    folder = _known_folder(folder_match.group(1)) if folder_match else ""
+
+    # 3) Filename with explicit ext (tolerates "dot fbx"/"fbx file")
+    fname_match = FILENAME_RE.search(t)
+    spoken_base, ext = "", ""
+    if fname_match:
+        spoken_base = fname_match.group(1).strip()
+        ext = fname_match.group(2).lower()
+    _dbg(f"FILENAME_RE -> base='{spoken_base}' ext='{ext}'")
+
+    # 4) “named foo.ext” legacy
+    if not (spoken_base and ext):
+        m_named = re.search(r'\bnamed\s+([A-Za-z0-9_\-\. ]+)\.(fbx|obj|gltf|glb|stl|ply|usd|dae|abc|svg)\b', t, re.IGNORECASE)
+        if m_named:
+            spoken_base = m_named.group(1).strip()
+            ext = m_named.group(2).lower()
+            _dbg(f"named -> base='{spoken_base}' ext='{ext}'")
+
+    # 5) Base-only phrase: “import the X from my downloads folder”
+    if not (spoken_base and ext):
+        b = BASE_ONLY_RE.search(t)
+        if b:
+            spoken_base = b.group(1).strip()
+            _dbg(f"BASE_ONLY_RE -> base='{spoken_base}' (no ext)")
+
+    # 6) Resolve inside folder
+    if folder and spoken_base:
+        if ext:
+            # ext was spoken -> find best within that ext
+            final_path, score = _find_best_match(folder, spoken_base, ext)
+            _dbg(f"folder+file (ext) -> chosen='{final_path}' score={score:.2f}")
+            if final_path:
+                fmt = _pick_format_from_text(t, ext)
+                if fmt in IMPORT_MAP:
+                    op, file_kw = IMPORT_MAP[fmt]
+                    return {"op": op, "kwargs": {file_kw: _normalize_path(final_path)}}
+        else:
+            # no ext spoken -> best across ALL supported extensions
+            final_path, best_ext, score = _find_best_match_any_ext(folder, spoken_base, SUPPORTED_EXTS)
+            _dbg(f"folder+file (any ext) -> chosen='{final_path}' ext='{best_ext}' score={score:.2f}")
+            if final_path and best_ext:
+                fmt = best_ext
+                if fmt in IMPORT_MAP:
+                    op, file_kw = IMPORT_MAP[fmt]
+                    return {"op": op, "kwargs": {file_kw: _normalize_path(final_path)}}
+
+    _dbg("import: no match")
+    return None
+
 
 import difflib
 
