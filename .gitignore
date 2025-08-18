@@ -1,0 +1,29 @@
+# Python cache
+__pycache__/
+*.pyc
+
+# Blender
+*.blend1
+*.blend2
+*.blend@
+*.blend?
+*.autosave
+*.blend.lock
+
+# Logs
+logs/
+*.log
+
+# OS cruft
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# IDE/editor
+.vscode/
+.idea/
+*.swp
+
+# Env & local secrets
+.env
+.env.*
