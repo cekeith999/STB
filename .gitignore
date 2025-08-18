@@ -27,3 +27,6 @@ desktop.ini
 # Env & local secrets
 .env
 .env.*
+
+
+artifacts/
