@@ -8,41 +8,13 @@ bl_info = {
     "description": "XML-RPC server + Voice launcher with diagnostics, operator Safety Gate, and Meshy text→3D import (API only)",
 }
 
-# --- bootstrap: locate a parent folder that contains 'stb_core' and add it to sys.path
-import os, sys
-
-HERE = os.path.abspath(os.path.dirname(__file__))
-
-def _find_repo_root(start_dir: str, target: str = "stb_core", max_up: int = 6):
-    cur = start_dir
-    for _ in range(max_up):
-        if os.path.isdir(os.path.join(cur, target)):
-            return cur
-        parent = os.path.dirname(cur)
-        if parent == cur:
-            break
-        cur = parent
-    return None
-
-REPO_ROOT = _find_repo_root(HERE)
-if not REPO_ROOT:
-    raise ImportError(
-        f"Could not locate 'stb_core' within 6 parent folders of {HERE}. "
-        "Ensure your structure is: <repo>/(addon, stb_core, config)"
-    )
-
-if REPO_ROOT not in sys.path:
-    sys.path.insert(0, REPO_ROOT)
-
-from stb_core.config import load_config
-CFG = load_config(REPO_ROOT)
-# ------------------------------------------------------------------------------
-
-import bpy, threading, queue, time, subprocess, sys as _sys, socket, shutil, json, re, textwrap, tempfile
+# at top of addon file (e.g., __init__.py or rpc_bridge.py)
+import os
+from . import __package__  # if needed for relative import
+from ..stb_core.config import load_config if __package__ else None  # adjust path if addon layout differs
+import bpy, threading, queue, time, os, subprocess, sys, socket, shutil, json, re, textwrap, tempfile
 import urllib.request, urllib.error
 from xmlrpc.server import SimpleXMLRPCServer, SimpleXMLRPCRequestHandler
-
-
 
 # Default/fallback Meshy API key (user-provided)
 MESHY_API_KEY_DEFAULT = "msy_RtHUDJezqJJG7KlQK0UNosTVemaIMGEmqh6C"

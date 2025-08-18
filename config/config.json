@@ -1,0 +1,10 @@
+{
+  "profile": "dev",
+  "active_provider": "meshy",
+  "providers": {
+    "meshy": { "api_key_env": "MESHY_API_KEY", "base_url": "https://api.meshy.ai", "model": "v5" }
+  },
+  "pipeline": { "timeout_s": 900, "poll_interval_s": 3 },
+  "safety":  { "allow_file_ops": false, "whitelist_ops": ["ADD_MESH", "IMPORT", "TRANSFORM", "RENDER", "SET_MATERIAL", "SET_CAMERA"] },
+  "logging": { "level": "INFO", "to_file": true, "path": "logs/stb.log" }
+}
