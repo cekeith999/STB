@@ -12,6 +12,7 @@ import numpy as np
 import sounddevice as sd
 import xmlrpc.client
 from datetime import datetime
+import traceback  # keep tracebacks visible instead of killing process
 
 # ========= CONFIG (portable paths) =========
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
@@ -31,6 +32,10 @@ WHISPER_LANG  = os.getenv("WHISPER_LANG", "en")
 RPC_URL = "http://127.0.0.1:8765/RPC2"
 # ==========================================
 
+# Feature flags / verbosity
+ENABLE_GPT_FALLBACK = False  # set True later when you're done debugging
+VERBOSE_DEBUG = True         # debug prints for import matcher
+
 # Mic settings
 SAMPLE_RATE  = 16000
 BLOCK_SEC    = 0.2
@@ -49,6 +54,12 @@ _log_paths_once()
 rpc = xmlrpc.client.ServerProxy(RPC_URL, allow_none=True)
 
 # ------------------ Helpers ------------------
+
+def _dbg(*args):
+    if VERBOSE_DEBUG:
+        print("[VOICE-IO]", *args)
+        sys.stdout.flush()
+
 def rms_int16(block: np.ndarray) -> float:
     return float(np.sqrt(np.mean(block.astype(np.int32)**2)))
 
@@ -87,6 +98,7 @@ def _deg2rad(v):
         return None
 
 # ------------------ Recorder ------------------
+
 def record_until_silence():
     print("🎙️ Speak command…")
     frames, spoken_sec, silence_sec = [], 0.0, 0.0
@@ -118,6 +130,7 @@ def record_until_silence():
     return wav_path
 
 # ------------------ Transcription (Python CLI wrapper) ------------------
+
 def _extract_json(lines):
     """Scan backwards for the first JSON-looking line and parse it."""
     for ln in reversed(lines):
@@ -168,12 +181,12 @@ def transcribe(wav_path: str) -> str | None:
 
     return (data.get("text") or "").strip()
 
-# ================== NEW: Voice I/O (Import / Export) ==================
-# Regex to grab paths like C:\foo\bar.fbx or /some/path/file.obj
-PATH_RE = re.compile(r'([A-Za-z]:\\[^"\n]+|\b[A-Za-z]:/[^"\n]+|/[^"\n]+)', re.IGNORECASE)
+# ================== Voice I/O (robust import) ==================
 
-# "from my downloads folder" or "in desktop"
-# Replace existing KNOWN_FOLDER_RE and FILENAME_RE with these:
+# Paths like C:\foo\bar.fbx or /some/path/file.obj
+PATH_RE = re.compile(r'([A-Za-z]:\\[^"\n]+|\b[A-Za-z]:/[^"\n]+|\/(?:[^"\'\n]+))', re.IGNORECASE)
+
+# “from my downloads folder”, “from downloads”, “in desktop”, “at documents”
 KNOWN_FOLDER_RE = re.compile(
     r'\b(?:from|in|into|at)\s+(?:the\s+)?(?:my\s+)?'
     r'(desktop|download|downloads|documents|docs|pictures|models)'
@@ -181,160 +194,40 @@ KNOWN_FOLDER_RE = re.compile(
     re.IGNORECASE
 )
 
-FILENAME_RE = re.compile(
+# Literal filename with dot ext (strongest): "etherealGuardian.fbx"
+FILENAME_DOT_RE = re.compile(
+    r'\b([A-Za-z0-9_\-\. ]+?)\.(fbx|obj|gltf|glb|stl|ply|usd|dae|abc|svg)\b',
+    re.IGNORECASE
+)
+
+# Spoken ext: "ethereal guardian fbx", "chair dot obj", "showroom glb file"
+FILENAME_WORD_RE = re.compile(
     r'\b([A-Za-z0-9_\- ]+?)\s*(?:dot\s*)?'
     r'(fbx|obj|gltf|glb|stl|ply|usd|dae|abc|svg)(?:\s+file)?\b',
     re.IGNORECASE
 )
-# Add this alongside FILENAME_RE
+
+# Names like: called ethereal guardian / named "ethereal guardian"
+CALLED_NAME_RE = re.compile(
+    r"\b(?:called|named|titled)\s+(?:the\s+)?(.+?)(?=\s+(?:it(?:'s)?|that|which|who|in|on|at|from|into|to|and|but)\b|$)",
+    re.IGNORECASE
+)
+QUOTED_NAME_RE = re.compile(r'"([^"]{2,})\'|\'([^\']]{2,})\'')  # will be corrected below if needed
+# Fix QUOTED_NAME_RE to a safe version (some editors mangle backslashes)
+QUOTED_NAME_RE = re.compile(r'"([^"]{2,})"|\'([^\']{2,})\'')
+
+# Base-only: "import ethereal guardian from downloads"
 BASE_ONLY_RE = re.compile(
-    r'\bimport(?:\s+the)?\s+([A-Za-z0-9_\- ]+?)\s+(?:file\s+)?(?:from|in|into|at)\b',
+    r'\bimport|^port\b',  # we’ll handle extraction separately; this just flags intent
     re.IGNORECASE
 )
 
-def _io_cmd_import(utterance: str):
-    t = utterance.strip()
-    _dbg(f"import: raw='{t}'")
+SUPPORTED_EXTS = ["fbx","obj","gltf","glb","stl","ply","usd","dae","abc","svg"]
 
-    # 1) Full explicit path still wins
-    m_path = PATH_RE.search(t)
-    _dbg(f"PATH_RE -> {m_path.group(0) if m_path else None}")
-    if m_path:
-        p = _normalize_path(m_path.group(0))
-        ext = pathlib.Path(p).suffix.lower().lstrip(".")
-        fmt = _pick_format_from_text(t, ext)
-        _dbg(f"explicit path p='{p}', ext='{ext}', fmt='{fmt}'")
-        if fmt in IMPORT_MAP:
-            op, file_kw = IMPORT_MAP[fmt]
-            return {"op": op, "kwargs": {file_kw: p}}
+# Minimum similarity required when fuzzy-matching filenames in a folder
+MIN_MATCH_SCORE = 0.72
 
-    # 2) Known folder: from/in/into/at (my) downloads/documents/desktop/models
-    folder_match = KNOWN_FOLDER_RE.search(t)
-    _dbg(f"KNOWN_FOLDER_RE -> {folder_match.group(0) if folder_match else None}")
-    folder = _known_folder(folder_match.group(1)) if folder_match else ""
-
-    # 3) Filename with explicit ext (tolerates "dot fbx"/"fbx file")
-    fname_match = FILENAME_RE.search(t)
-    spoken_base, ext = "", ""
-    if fname_match:
-        spoken_base = fname_match.group(1).strip()
-        ext = fname_match.group(2).lower()
-    _dbg(f"FILENAME_RE -> base='{spoken_base}' ext='{ext}'")
-
-    # 4) “named foo.ext” legacy
-    if not (spoken_base and ext):
-        m_named = re.search(r'\bnamed\s+([A-Za-z0-9_\-\. ]+)\.(fbx|obj|gltf|glb|stl|ply|usd|dae|abc|svg)\b', t, re.IGNORECASE)
-        if m_named:
-            spoken_base = m_named.group(1).strip()
-            ext = m_named.group(2).lower()
-            _dbg(f"named -> base='{spoken_base}' ext='{ext}'")
-
-    # 5) Base-only phrase: “import the X from my downloads folder”
-    if not (spoken_base and ext):
-        b = BASE_ONLY_RE.search(t)
-        if b:
-            spoken_base = b.group(1).strip()
-            _dbg(f"BASE_ONLY_RE -> base='{spoken_base}' (no ext)")
-
-    # 6) Resolve inside folder
-    if folder and spoken_base:
-        if ext:
-            # ext was spoken -> find best within that ext
-            final_path, score = _find_best_match(folder, spoken_base, ext)
-            _dbg(f"folder+file (ext) -> chosen='{final_path}' score={score:.2f}")
-            if final_path:
-                fmt = _pick_format_from_text(t, ext)
-                if fmt in IMPORT_MAP:
-                    op, file_kw = IMPORT_MAP[fmt]
-                    return {"op": op, "kwargs": {file_kw: _normalize_path(final_path)}}
-        else:
-            # no ext spoken -> best across ALL supported extensions
-            final_path, best_ext, score = _find_best_match_any_ext(folder, spoken_base, SUPPORTED_EXTS)
-            _dbg(f"folder+file (any ext) -> chosen='{final_path}' ext='{best_ext}' score={score:.2f}")
-            if final_path and best_ext:
-                fmt = best_ext
-                if fmt in IMPORT_MAP:
-                    op, file_kw = IMPORT_MAP[fmt]
-                    return {"op": op, "kwargs": {file_kw: _normalize_path(final_path)}}
-
-    _dbg("import: no match")
-    return None
-
-
-import difflib
-
-def _norm_name(s: str) -> str:
-    # Lowercase and strip any non-alphanum so "Ethereal_guardian-124" -> "etherealguardian124"
-    return re.sub(r'[^a-z0-9]+', '', s.lower())
-
-def _find_best_match(folder: str, spoken_base: str, ext: str) -> str | None:
-    """Return full path to best matching file in folder by ext, or None."""
-    if not folder or not os.path.isdir(folder):
-        return None
-    try:
-        candidates = [f for f in os.listdir(folder) if f.lower().endswith("." + ext.lower())]
-    except Exception:
-        return None
-    if not candidates:
-        return None
-
-    spoken_norm = _norm_name(spoken_base)
-    if not spoken_norm:
-        return None
-
-    # 1) Exact (case-insensitive)
-    exact_name = f"{spoken_base}.{ext}".lower()
-    for f in candidates:
-        if f.lower() == exact_name:
-            return os.path.join(folder, f)
-
-    # 2) Exact ignoring punctuation
-    for f in candidates:
-        if _norm_name(os.path.splitext(f)[0]) == spoken_norm:
-            return os.path.join(folder, f)
-
-    # 3) Fuzzy best score with a small subsequence bonus
-    best, best_score = None, 0.0
-    for f in candidates:
-        base = os.path.splitext(f)[0]
-        base_norm = _norm_name(base)
-        score = difflib.SequenceMatcher(None, base_norm, spoken_norm).ratio()
-        if spoken_norm in base_norm or base_norm in spoken_norm:
-            score += 0.15  # subsequence bonus
-        if score > best_score:
-            best, best_score = f, score
-
-    # Reasonable threshold; tweak if needed
-    if best and best_score >= 0.55:
-        return os.path.join(folder, best)
-    return None
-
-
-# Add this tiny logger helper near PATH_RE:
-def _dbg(msg): print(f"[VOICE-IO] {msg}")
-
-
-def _known_folder(name: str) -> str:
-    import pathlib as _pl
-    n = (name or "").strip().lower()
-    home = _pl.Path.home()
-    table = {
-        "desktop": home / "Desktop",
-        "downloads": home / "Downloads",
-        "documents": home / "Documents",
-        "docs": home / "Documents",
-        "pictures": home / "Pictures",
-        "models": home / "Documents" / "3D Models",
-    }
-    return str(table.get(n, ""))
-
-def _normalize_path(raw: str) -> str:
-    raw = raw.strip().strip('"').strip("'")
-    raw = raw.replace(" / ", "/")
-    raw = os.path.expandvars(os.path.expanduser(raw))
-    return os.path.normpath(raw)
-
-# Supported formats
+# Simple import map (operator, keyword)
 IMPORT_MAP = {
     "fbx":  ("import_scene.fbx",  "filepath"),
     "obj":  ("import_scene.obj",  "filepath"),
@@ -342,38 +235,137 @@ IMPORT_MAP = {
     "glb":  ("import_scene.gltf", "filepath"),
     "stl":  ("import_mesh.stl",   "filepath"),
     "ply":  ("import_mesh.ply",   "filepath"),
-    "usd":  ("import_scene.usd",  "filepath"),
-    "dae":  ("wm.collada_import", "filepath"),
-    "abc":  ("wm.alembic_import", "filepath"),
+    "usd":  ("wm.usd_import",     "filepath"),
+    "dae":  ("import_scene.dae",  "filepath"),
+    "abc":  ("import_scene.abc",  "filepath"),
     "svg":  ("import_curve.svg",  "filepath"),
 }
 
-EXPORT_MAP = {
-    "fbx":  ("export_scene.fbx",  "filepath"),
-    "obj":  ("export_scene.obj",  "filepath"),
-    "gltf": ("export_scene.gltf", "filepath"),
-    "glb":  ("export_scene.gltf", "filepath"),
-    "stl":  ("export_mesh.stl",   "filepath"),
-    "ply":  ("export_mesh.ply",   "filepath"),
-    "usd":  ("wm.usd_export",     "filepath"),
-    "dae":  ("wm.collada_export", "filepath"),
-    "abc":  ("wm.alembic_export", "filepath"),
-}
+def _known_folder(name: str) -> str:
+    n = (name or "").strip().lower()
+    home = pathlib.Path.home()
+    table = {
+        "desktop":  home / "Desktop",
+        "download": home / "Downloads",
+        "downloads":home / "Downloads",
+        "documents":home / "Documents",
+        "docs":     home / "Documents",
+        "pictures": home / "Pictures",
+        "models":   home / "Documents" / "3D Models",
+    }
+    return str(table.get(n, ""))
+
+def _normalize_path(raw: str) -> str:
+    raw = raw.strip().strip('"').strip("'").replace(" / ", "/")
+    return os.path.normpath(os.path.expandvars(os.path.expanduser(raw)))
+
+def _norm_name(s: str) -> str:
+    return re.sub(r'[^a-z0-9]+', '', s.lower())
+
+def _score_names(a: str, b: str) -> float:
+    import difflib
+    return difflib.SequenceMatcher(None, a, b).ratio()
+
+def _find_best_match(folder: str, spoken_base: str, ext: str):
+    if not folder or not os.path.isdir(folder):
+        return (None, 0.0)
+    try:
+        candidates = [f for f in os.listdir(folder) if f.lower().endswith("." + ext.lower())]
+    except Exception:
+        return (None, 0.0)
+    if not candidates:
+        return (None, 0.0)
+
+    spoken_norm = _norm_name(spoken_base)
+    best, best_score = None, 0.0
+
+    exact_name = f"{spoken_base}.{ext}".lower()
+    for f in candidates:
+        if f.lower() == exact_name:
+            return (os.path.join(folder, f), 1.0)
+
+    for f in candidates:
+        base_norm = _norm_name(os.path.splitext(f)[0])
+        score = _score_names(base_norm, spoken_norm)
+        if spoken_norm and (spoken_norm in base_norm or base_norm in spoken_norm):
+            score += 0.15
+        if score > best_score:
+            best, best_score = f, score
+    if best and best_score >= MIN_MATCH_SCORE:
+        return (os.path.join(folder, best), best_score)
+    _dbg(f"reject: best fuzzy match score {best_score:.2f} < {MIN_MATCH_SCORE}")
+    return (None, best_score)
+
+def _find_best_match_any_ext(folder: str, spoken_base: str, allowed_exts=SUPPORTED_EXTS):
+    best_path, best_ext, best_score = None, None, 0.0
+    for ext in allowed_exts:
+        p, s = _find_best_match(folder, spoken_base, ext)
+        if s > best_score:
+            best_path, best_ext, best_score = p, ext, s
+    if best_path and best_score >= MIN_MATCH_SCORE:
+        return (best_path, best_ext, best_score)
+    _dbg(f"reject-any: best fuzzy match score {best_score:.2f} < {MIN_MATCH_SCORE}")
+    return (None, None, best_score)
+
+def _extract_base_only(text: str) -> str:
+    """
+    Extracts the base name between 'import'/'port' and 'from/in/into/at'.
+    e.g., 'import the ethereal guardian from my downloads folder'
+          -> 'the ethereal guardian' -> 'ethereal guardian'
+    """
+    m = re.search(
+        r'(?:\bimport\b|^port\b)\s+(?:the\s+)?(.+?)\s+(?:file\s+)?(?:from|in|into|at)\b',
+        text, re.IGNORECASE)
+    if not m:
+        return ""
+    base = m.group(1).strip()
+    # Trim trailing filler like "folder"
+    base = re.sub(r'\bfolder\b$', '', base, flags=re.IGNORECASE).strip()
+    return base
 
 def _pick_format_from_text(text: str, fallback_ext: str = "") -> str:
     t = text.lower()
-    for ext in set(list(IMPORT_MAP.keys()) + list(EXPORT_MAP.keys())):
+    for ext in SUPPORTED_EXTS:
         if re.search(rf'\b{ext}\b', t):
             return ext
-    if fallback_ext:
-        return fallback_ext.lower().lstrip(".")
-    return ""
+    return fallback_ext.lower()
 
 def _io_cmd_import(utterance: str):
     t = utterance.strip()
     _dbg(f"import: raw='{t}'")
 
-    # 1) Explicit path wins
+    # Normalize common filler to avoid leading fragments from contractions
+    t = re.sub("[’]", "'", t)  # smart quotes → straight
+    t = re.sub(r"\b(?:so\s+)?there(?:'|’)s\s+a\s+file\s+(?:called|named|titled)\b",
+               "called", t, flags=re.IGNORECASE)
+    t = re.sub(r"\bit's\b", "it is", t, flags=re.IGNORECASE)
+    t = re.sub(r"\bits\b",  "it is", t, flags=re.IGNORECASE)
+    _dbg(f"import: normalized='{t}'")
+
+    # Treat transcripts that start with 'port ' as 'import '
+    if t.lower().startswith("port "):
+        t = "import " + t[5:]
+        _dbg("import: normalized leading 'port' -> 'import'")
+
+    # 0) Try to capture explicit names via quotes or called/named
+    name = None
+    q = QUOTED_NAME_RE.search(t)
+    if q:
+        name = (q.group(1) or q.group(2) or "").strip()
+    else:
+        m_called = CALLED_NAME_RE.search(t)
+        if m_called:
+            name = (m_called.group(1) or "").strip()
+    if name:
+        # "ethereal something" -> keep "ethereal"
+        name = re.split(r"\bsomething\b", name, flags=re.IGNORECASE)[0].strip()
+        # Remove contraction fragments like leading "s " from "there's"
+        name = re.sub(r"^(?:s|t)\s+", "", name)
+        # Stop at common delimiters (safety)
+        name = re.split(r"\b(?:it|it is|that's|that|which|who|in|on|at|from|into|to|and|but)\b", name, 1)[0].strip()
+        _dbg(f"NAME_CAPTURE -> '{name}'")
+
+    # 1) Full explicit path
     m_path = PATH_RE.search(t)
     _dbg(f"PATH_RE -> {m_path.group(0) if m_path else None}")
     if m_path:
@@ -385,143 +377,80 @@ def _io_cmd_import(utterance: str):
             op, file_kw = IMPORT_MAP[fmt]
             return {"op": op, "kwargs": {file_kw: p}}
 
-    # 2) Known folder (from/in/into my downloads/documents/desktop/models)
+    # 2) Known folder
     folder_match = KNOWN_FOLDER_RE.search(t)
     _dbg(f"KNOWN_FOLDER_RE -> {folder_match.group(0) if folder_match else None}")
     folder = _known_folder(folder_match.group(1)) if folder_match else ""
 
-    # 3) Extract spoken base + ext (tolerates "dot fbx / fbx file")
-    fname_match = FILENAME_RE.search(t)
-    spoken_base, ext = "", ""
-    if fname_match:
-        spoken_base = fname_match.group(1).strip()
-        ext = fname_match.group(2).lower()
-    _dbg(f"FILENAME_RE -> base='{spoken_base}' ext='{ext}'")
-
-    # 4) Legacy "named foo.ext"
-    if not spoken_base or not ext:
-        m_named = re.search(
-            r'\bnamed\s+([A-Za-z0-9_\-\. ]+)\.(fbx|obj|gltf|glb|stl|ply|usd|dae|abc|svg)\b',
-            t, re.IGNORECASE
-        )
-        if m_named:
-            spoken_base = m_named.group(1).strip()
-            ext = m_named.group(2).lower()
-            _dbg(f"named -> base='{spoken_base}' ext='{ext}'")
-
-    # 5) If folder + base+ext: fuzzy find file inside folder
-    if folder and spoken_base and ext:
-        # Remove spaces in the reconstructed filename guess but prefer fuzzy match:
-        guess_path = os.path.join(folder, f"{spoken_base.replace(' ', '')}.{ext}")
-        # Try fuzzy match first
-        best = _find_best_match(folder, spoken_base, ext)
-        final_path = best or guess_path
-        _dbg(f"folder+file -> chosen='{final_path}' (best='{best}')")
-
-        fmt = _pick_format_from_text(t, ext)
-        if fmt in IMPORT_MAP:
-            op, file_kw = IMPORT_MAP[fmt]
+    # If we have a captured name and folder, try that first across any ext
+    if folder and name and len(_norm_name(name)) >= 3:
+        final_path, best_ext, score = _find_best_match_any_ext(folder, name, SUPPORTED_EXTS)
+        _dbg(f"folder+captured-name -> chosen='{final_path}' ext='{best_ext}' score={score:.2f}")
+        if final_path and best_ext in IMPORT_MAP:
+            op, file_kw = IMPORT_MAP[best_ext]
             return {"op": op, "kwargs": {file_kw: _normalize_path(final_path)}}
+
+    # 3) Filename with literal dot
+    m_dot = FILENAME_DOT_RE.search(t)
+    if m_dot:
+        spoken_base = m_dot.group(1).strip()
+        ext = m_dot.group(2).lower()
+        _dbg(f"FILENAME_DOT_RE -> base='{spoken_base}' ext='{ext}'")
+        if folder:
+            final_path, score = _find_best_match(folder, spoken_base, ext)
+            _dbg(f"folder+file (dot ext) -> chosen='{final_path}' score={score:.2f}")
+            if final_path and ext in IMPORT_MAP:
+                op, file_kw = IMPORT_MAP[ext]
+                return {"op": op, "kwargs": {file_kw: _normalize_path(final_path)}}
+
+    # 4) Filename with spoken ext (e.g., "ethereal guardian fbx")
+    m_word = FILENAME_WORD_RE.search(t)
+    if m_word:
+        spoken_base = m_word.group(1).strip()
+        ext = m_word.group(2).lower()
+        # Filter out obviously garbage bases (common filler)
+        garbage_patterns = [
+            r"^but it is an$", r"^it is an$", r"^it is a$", r"^its an$", r"^it's an$", r"^an$",
+            r"^s an$", r"^s a$", r"^a file$", r"^file$", r"^the file$", r"^an fbx$", r"^fbx$"
+        ]
+        garbage = any(re.match(pat, spoken_base.lower()) for pat in garbage_patterns)
+        if garbage or len(_norm_name(spoken_base)) < 3:
+            _dbg(f"FILENAME_WORD_RE rejected base='{spoken_base}' (garbage or too short)")
+        else:
+            _dbg(f"FILENAME_WORD_RE -> base='{spoken_base}' ext='{ext}'")
+            if folder:
+                final_path, score = _find_best_match(folder, spoken_base, ext)
+                _dbg(f"folder+file (word ext) -> chosen='{final_path}' score={score:.2f}")
+                if final_path and ext in IMPORT_MAP:
+                    op, file_kw = IMPORT_MAP[ext]
+                    return {"op": op, "kwargs": {file_kw: _normalize_path(final_path)}}
+
+    # 5) Base-only → best across ALL extensions
+    if folder:
+        base_only = _extract_base_only(t) or (name or "")
+        _dbg(f"BASE_ONLY -> '{base_only}'")
+        if base_only and len(_norm_name(base_only)) >= 3:
+            final_path, best_ext, score = _find_best_match_any_ext(folder, base_only, SUPPORTED_EXTS)
+            _dbg(f"folder+file (any ext) -> chosen='{final_path}' ext='{best_ext}' score={score:.2f}")
+            if final_path and best_ext in IMPORT_MAP:
+                op, file_kw = IMPORT_MAP[best_ext]
+                return {"op": op, "kwargs": {file_kw: _normalize_path(final_path)}}
 
     _dbg("import: no match")
     return None
 
-
-
-def _io_cmd_export(utterance: str):
-    tl = utterance.lower().strip()
-    if not tl.startswith("export"):
-        return None
-
-    is_batch = "batch" in tl
-
-    use_selection = True
-    if re.search(r'\b(scene|everything|all)\b', tl, re.IGNORECASE):
-        use_selection = False
-
-    fmt = _pick_format_from_text(tl)
-    if not fmt or fmt not in EXPORT_MAP:
-        return None
-
-    dest = ""
-    m_path = PATH_RE.search(utterance)
-    if m_path:
-        dest = m_path.group(0)
-    if not dest:
-        m_known = re.search(r'\bto\s+([A-Za-z ]+)', utterance, re.IGNORECASE)
-        if m_known:
-            maybe = _known_folder(m_known.group(1))
-            if maybe:
-                dest = maybe
-
-    name = None
-    m_named = re.search(r'\bnamed\s+([A-Za-z0-9_\-\. ]+)', utterance, re.IGNORECASE)
-    if m_named:
-        name = m_named.group(1).strip()
-
-    if is_batch:
-        if not dest:
-            return None
-        out_dir = _normalize_path(dest)
-        return {"op": "iohub.batch_export_selected_hint",
-                "kwargs": {"directory": out_dir, "format": fmt}}
-
-    if not dest:
-        return None
-    dest = _normalize_path(dest)
-    if os.path.isdir(dest):
-        if not name:
-            stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            base = "scene"
-            ext = "glb" if fmt == "gltf" else fmt
-            name = f"{base}_{stamp}.{ext}"
-        out_path = os.path.join(dest, name)
-    else:
-        out_path = dest
-
-    op, file_kw = EXPORT_MAP[fmt]
-    kwargs = {file_kw: out_path}
-    apply_mods = not re.search(r'\bno modifiers\b', tl)
-
-    if fmt == "fbx":
-        kwargs.update({"use_selection": use_selection,
-                       "use_mesh_modifiers": apply_mods,
-                       "add_leaf_bones": False,
-                       "apply_unit_scale": True})
-    elif fmt in ("obj",):
-        kwargs.update({"use_selection": use_selection,
-                       "apply_modifiers": apply_mods})
-    elif fmt in ("gltf", "glb"):
-        kwargs.update({"export_selected": use_selection,
-                       "export_apply": apply_mods})
-    elif fmt in ("stl",):
-        kwargs.update({"use_selection": use_selection,
-                       "use_mesh_modifiers": apply_mods})
-    elif fmt in ("ply",):
-        kwargs.update({"use_selection": use_selection,
-                       "use_normals": True,
-                       "use_uv_coords": True})
-    elif fmt in ("usd",):
-        kwargs.update({"selected_objects_only": use_selection})
-    elif fmt in ("dae",):
-        kwargs.update({"selected": use_selection,
-                       "apply_modifiers": apply_mods})
-    elif fmt in ("abc",):
-        kwargs.update({"selected": use_selection})
-
-    return {"op": op, "kwargs": kwargs}
-
 def try_io_rules(text: str):
+    """High-priority import/export style commands before local geometry rules."""
     if not text:
         return None
-    tl = text.strip().lower()
-    if tl.startswith("import"):
+    # Import intent keywords
+    if re.search(r"\b(import|port)\b", text, re.IGNORECASE) or \
+       re.search(r"\bcalled\b|\bnamed\b|\btitled\b|\"|'", text):
         return _io_cmd_import(text)
-    if tl.startswith("export"):
-        return _io_cmd_export(text)
+    # (Future) export intents could be added here.
     return None
-# ================== /NEW Voice I/O ==================
 
+# ================== /Voice I/O (robust import) ==================
 
 # ------------------ Local Intent (offline) ------------------
 MESH_PRIMS = {
@@ -618,7 +547,7 @@ def try_local_rules(text: str):
         return {"op": "transform.resize", "kwargs": {"value": (1.2, 1.2, 1.2)}}
     if _match_any_phrase(tl, ["scale down", "smaller", "decrease size"]):
         return {"op": "transform.resize", "kwargs": {"value": (0.8, 0.8, 0.8)}}
-    m = re.search(r"(scale|resize)\s+(?:to\s+)?(\d+(\.\d+)?)", tl)
+    m = re.search(r"(scale|resize)\s+(?:to\s+)?(\d+(?:\.\d+)?)", tl)
     if m:
         s = float(m.group(2))
         return {"op": "transform.resize", "kwargs": {"value": (s, s, s)}}
@@ -663,7 +592,12 @@ def try_local_rules(text: str):
     return None
 
 # ------------------ GPT Fallback ------------------
+
 def gpt_to_json(transcript: str):
+    # allow disabling while debugging
+    if not ENABLE_GPT_FALLBACK:
+        return None
+
     if not OPENAI_API_KEY:
         print("⚠️ OPENAI_API_KEY not set; skipping GPT fallback.")
         return None
@@ -711,22 +645,28 @@ def gpt_to_json(transcript: str):
         return None
 
 # ------------------ RPC send ------------------
+
 def send_to_blender(cmd: dict):
     if not isinstance(cmd, dict):
-        print("⚠️ command is not a dict:", cmd); return
+        print("⚠️ command is not a dict:", cmd); sys.stdout.flush(); return
     op = cmd.get("op"); kwargs = cmd.get("kwargs", {}) or {}
     if not op or not isinstance(op, str):
-        print("⚠️ Missing/invalid 'op' in command:", cmd); return
+        print("⚠️ Missing/invalid 'op' in command:", cmd); sys.stdout.flush(); return
     try:
-        print(f"➡️ enqueue {op} {kwargs}")
+        print(f"➡️ enqueue {op} {kwargs}"); sys.stdout.flush()
+        # NOTE: If your bridge exposes a different method name, swap below accordingly,
+        # e.g. rpc.enqueue_op or rpc.enqueue
         res = rpc.enqueue_op_safe(op, kwargs)
-        print("✅ RPC:", res)
+        print("✅ RPC:", res); sys.stdout.flush()
     except Exception as e:
         print("❌ RPC failed:", e)
+        traceback.print_exc()
+        # Do not raise; keep loop alive
 
 # ------------------ Main loop ------------------
+
 if __name__ == "__main__":
-    print("Voice → Whisper → (Local rules / GPT) → Blender via Safety Gate (Ctrl+C to exit)")
+    print("Voice → Whisper → (IO rules / Local rules / GPT) → Blender via Safety Gate (Ctrl+C to exit)")
     try:
         print("ping:", rpc.ping())
     except Exception as e:
@@ -737,11 +677,18 @@ if __name__ == "__main__":
             wav = record_until_silence()
             text = transcribe(wav)
             if not text:
-                print("⚠️ No transcription.")
+                print("⚠️ No transcription."); sys.stdout.flush()
                 continue
-            print("📝 Transcript ->", text)
+            print("📝 Transcript ->", text); sys.stdout.flush()
 
-            cmd = try_io_rules(text) or try_local_rules(text) or gpt_to_json(text)
+            # import/export first
+            cmd = try_io_rules(text)
+
+            # Local rules
+            cmd = cmd or try_local_rules(text)
+
+            # GPT fallback (currently disabled via flag)
+            cmd = cmd or gpt_to_json(text)
 
             if cmd:
                 if isinstance(cmd, list):
@@ -751,10 +698,16 @@ if __name__ == "__main__":
                 else:
                     send_to_blender(cmd)
             else:
-                print("🤷 No command derived for:", text)
+                print("🤷 No command derived for:", text); sys.stdout.flush()
 
             time.sleep(0.2)
 
         except KeyboardInterrupt:
             print("\nBye.")
             sys.exit(0)
+        except Exception as e:
+            print("💥 Loop error:", e)
+            traceback.print_exc()
+            # Don’t die; keep the panel/process alive
+            time.sleep(0.3)
+            continue
