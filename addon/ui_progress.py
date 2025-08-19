@@ -92,7 +92,7 @@ class STB_PT_Progress(bpy.types.Panel):
     bl_idname = "STB_PT_Progress"
     bl_space_type = 'VIEW_3D'
     bl_region_type = 'UI'
-    bl_category = "RPC"   # <- change from "SpeechToBlender" to "RPC"
+    bl_category = "STB"   # <- change from "SpeechToBlender" to "STB"
 
 
     def draw(self, context):

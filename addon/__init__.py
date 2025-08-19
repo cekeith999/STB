@@ -1032,7 +1032,7 @@ class RPCBRIDGE_PT_panel(bpy.types.Panel):
     bl_idname = "RPCBRIDGE_PT_panel"
     bl_space_type = "VIEW_3D"
     bl_region_type = "UI"
-    bl_category = "RPC"  # Sidebar tab label
+    bl_category = "STB"  # Sidebar tab label
     def draw(self, context):
         wm = context.window_manager
         layout = self.layout
