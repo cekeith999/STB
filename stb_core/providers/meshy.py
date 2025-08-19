@@ -3,7 +3,7 @@
 
 from typing import Dict, Any, List, Optional, Tuple
 import os, json, urllib.request, urllib.error, urllib.parse, tempfile, pathlib, shutil
-import threading, time, collections
+import threading, time, collections, re
 import bpy
 
 Json = Dict[str, Any]
@@ -37,22 +37,56 @@ def _normalize_import(objects: List[bpy.types.Object]) -> None:
         return
     bpy.ops.object.select_all(action='DESELECT')
     for o in objects:
-        try: o.select_set(True)
-        except: pass
+        try:
+            o.select_set(True)
+        except Exception:
+            pass
     try:
         bpy.context.view_layer.objects.active = objects[0]
-    except:
+    except Exception:
         pass
     # apply rotation then scale; origin to bounds
-    try: bpy.ops.object.transform_apply(location=False, rotation=True, scale=False)
-    except: pass
-    try: bpy.ops.object.transform_apply(location=False, rotation=False, scale=True)
-    except: pass
-    try: bpy.ops.object.origin_set(type='ORIGIN_GEOMETRY', center='BOUNDS')
-    except: pass
+    try:
+        bpy.ops.object.transform_apply(location=False, rotation=True, scale=False)
+    except Exception:
+        pass
+    try:
+        bpy.ops.object.transform_apply(location=False, rotation=False, scale=True)
+    except Exception:
+        pass
+    try:
+        bpy.ops.object.origin_set(type='ORIGIN_GEOMETRY', center='BOUNDS')
+    except Exception:
+        pass
     for o in objects:
-        try: o.select_set(False)
-        except: pass
+        try:
+            o.select_set(False)
+        except Exception:
+            pass
+
+# ---------------- Naming de-dupe helpers ----------------
+
+def _unique_name(base: str, used: set[str]) -> str:
+    """Return a unique name by appending _2, _3, ... (avoids Blender's .001 style)."""
+    if base not in used:
+        return base
+    m = re.match(r"^(.*)_(\d+)$", base)
+    root = m.group(1) if m else base
+    n = int(m.group(2)) if m else 1
+    while True:
+        n += 1
+        cand = f"{root}_{n}"
+        if cand not in used:
+            return cand
+
+def _dedupe_object_names(objs: List[bpy.types.Object]) -> None:
+    """Ensure imported objects don't collide with existing names."""
+    used = {o.name for o in bpy.data.objects}
+    for o in objs:
+        new_name = _unique_name(o.name, used)
+        if new_name != o.name:
+            o.name = new_name
+        used.add(o.name)
 
 # ---------------- HTTP + provider ----------------
 
@@ -123,8 +157,10 @@ class MeshyProvider:
             with urllib.request.urlopen(req, timeout=120) as r:
                 return json.loads(r.read().decode("utf-8"))
         except urllib.error.HTTPError as e:
-            try: err = e.read().decode("utf-8")
-            except Exception: err = str(e)
+            try:
+                err = e.read().decode("utf-8")
+            except Exception:
+                err = str(e)
             raise RuntimeError(f"HTTP {e.code} {method} {path}: {err}") from None
         except urllib.error.URLError as e:
             raise RuntimeError(f"Network error {method} {path}: {e}") from None
@@ -180,7 +216,8 @@ class MeshyProvider:
             possible.extend([res.get(k) for k in ("id", "task_id", "job_id", "taskId", "jobId")])
         for cand in possible:
             if isinstance(cand, str) and len(cand) >= 8:
-                job_id = cand; break
+                job_id = cand
+                break
         if not job_id:
             raise RuntimeError(f"submit() returned no job id. Raw: {data}")
         return str(job_id)
@@ -197,7 +234,8 @@ class MeshyProvider:
             for parent in ("data", "result", "output"):
                 sub = raw.get(parent)
                 if isinstance(sub, dict) and "progress" in sub:
-                    prog = sub["progress"]; break
+                    prog = sub["progress"]
+                    break
 
         if isinstance(prog, float) and 0.0 <= prog <= 1.0:
             progress = int(round(prog * 100))
@@ -206,11 +244,11 @@ class MeshyProvider:
         else:
             progress = 100 if "succeed" in state_l or "complete" in state_l else 0
 
-        if any(k in state_l for k in ("succeed","complete","done","success")):
+        if any(k in state_l for k in ("succeed", "complete", "done", "success")):
             norm_state = "succeeded"
-        elif any(k in state_l for k in ("fail","error","cancel")):
+        elif any(k in state_l for k in ("fail", "error", "cancel")):
             norm_state = "failed"
-        elif any(k in state_l for k in ("queue","pend","start","run","proc")):
+        elif any(k in state_l for k in ("queue", "pend", "start", "run", "proc")):
             norm_state = "running"
         else:
             norm_state = state_l or "unknown"
@@ -224,26 +262,30 @@ class MeshyProvider:
         urls: List[str] = []
         for k in ("model_url", "mesh_url", "output_url", "url"):
             u = raw.get(k)
-            if isinstance(u, str): urls.append(u)
+            if isinstance(u, str):
+                urls.append(u)
 
         model_urls = raw.get("model_urls")
         if isinstance(model_urls, dict):
             for _, v in model_urls.items():
-                if isinstance(v, str): urls.append(v)
+                if isinstance(v, str):
+                    urls.append(v)
 
         files_list = raw.get("files")
         if isinstance(files_list, list):
             for item in files_list:
                 if isinstance(item, dict):
                     u = item.get("url") or item.get("href") or item.get("download_url")
-                    if isinstance(u, str): urls.append(u)
+                    if isinstance(u, str):
+                        urls.append(u)
 
         for parent in ("result", "data", "output", "asset", "assets"):
             sub = raw.get(parent)
             if isinstance(sub, dict):
                 for k in ("model_url", "mesh_url", "output_url", "url"):
                     u = sub.get(k)
-                    if isinstance(u, str): urls.append(u)
+                    if isinstance(u, str):
+                        urls.append(u)
                 for _, val in sub.items():
                     if isinstance(val, list):
                         for it in val:
@@ -254,15 +296,17 @@ class MeshyProvider:
         seen, dedup = set(), []
         for u in urls:
             if u not in seen:
-                seen.add(u); dedup.append(u)
+                seen.add(u)
+                dedup.append(u)
 
         files: List[Json] = []
         for u in dedup:
             fmt = None
             low = u.lower()
-            for ext in ("fbx","obj","glb","gltf","zip","usdz"):
+            for ext in ("fbx", "obj", "glb", "gltf", "zip", "usdz"):
                 if low.endswith("." + ext) or f".{ext}?" in low:
-                    fmt = ext; break
+                    fmt = ext
+                    break
             files.append({"url": u, "format": fmt})
 
         return {"files": files, "meta": raw}
@@ -270,7 +314,8 @@ class MeshyProvider:
     # ---------------- Download + Import (sync) ----------------
 
     def _pick_best_file(self, files: List[Json]) -> Optional[Json]:
-        if not files: return None
+        if not files:
+            return None
         bucket = {}
         for f in files:
             fmt = (f.get("format") or "").lower()
@@ -306,7 +351,7 @@ class MeshyProvider:
                     bpy.ops.wm.obj_import(filepath=str(path)); used = "wm.obj_import"
                 except Exception:
                     bpy.ops.import_scene.obj(filepath=str(path)); used = "import_scene.obj"
-            elif ext in {"usd","usda","usdc","usdz"}:
+            elif ext in {"usd", "usda", "usdc", "usdz"}:
                 bpy.ops.wm.usd_import(filepath=str(path)); used = "wm.usd_import"
             else:
                 raise RuntimeError(f"Unsupported extension: .{ext}")
@@ -314,6 +359,7 @@ class MeshyProvider:
             raise RuntimeError(f"Import failed for {path.name} via {ext}: {e}")
 
         new_objs = route_new_imports_to_meshy(before)
+        _dedupe_object_names(new_objs)  # <-- naming de-dupe
         _normalize_import(new_objs)
         return new_objs, used
 
