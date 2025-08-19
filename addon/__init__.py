@@ -1,10 +1,10 @@
 bl_info = {
-    "name": "Blender RPC Bridge (RPC tab, voice controls) – with Safety Gate + Meshy",
+    "name": "Blender STB Tool (RPC Server tab, voice controls, progress bar) – with Safety Gate + Meshy",
     "author": "you",
     "version": (0, 7, 0),
     "blender": (3, 6, 0),
     "category": "System",
-    "location": "3D View > N-panel > RPC",
+    "location": "3D View > N-panel > STB",
     "description": "XML-RPC server + Voice launcher with diagnostics, operator Safety Gate, and Meshy text→3D import (API only)",
 }
 
@@ -1028,11 +1028,11 @@ class RPCBRIDGE_OT_validate(bpy.types.Operator):
 
 # ====== PANELS ======
 class RPCBRIDGE_PT_panel(bpy.types.Panel):
-    bl_label = "Blender RPC Bridge"
+    bl_label = "Speech To Blender"
     bl_idname = "RPCBRIDGE_PT_panel"
     bl_space_type = "VIEW_3D"
     bl_region_type = "UI"
-    bl_category = "RPC"
+    bl_category = "RPC"  # Sidebar tab label
     def draw(self, context):
         wm = context.window_manager
         layout = self.layout
@@ -1103,6 +1103,28 @@ _CLASSES = (
     VOICE_OT_Handle,
 )
 
+class STB_PT_MeshyStatus(bpy.types.Panel):
+    bl_label = "Meshy Status"
+    bl_idname = "STB_PT_meshy_status"
+    bl_space_type = 'VIEW_3D'
+    bl_region_type = 'UI'
+    bl_category = 'STB'  # Sidebar tab label
+
+    def draw(self, context):
+        layout = self.layout
+        wm = context.window_manager
+        status = wm.get("meshy_status", "Idle")
+        row = layout.row()
+        row.label(text=f"{status}")
+
+def _ensure_status_key():
+    try:
+        wm = bpy.context.window_manager
+        if "meshy_status" not in wm:
+            wm["meshy_status"] = "Idle"
+    except Exception:
+        pass
+
 def register():
     ensure_props()
     for cls in _CLASSES:
@@ -1118,9 +1140,20 @@ def register():
         except Exception as e:
             print(f"[STB] ui_progress.register() failed: {e}")
 
+    # --- Meshy Status panel (always-on readout) ---
+    try:
+        _ensure_status_key()  # make sure wm["meshy_status"] exists
+    except Exception as e:
+        print(f"[STB] _ensure_status_key() failed: {e}")
+    try:
+        bpy.utils.register_class(STB_PT_MeshyStatus)
+    except Exception as e:
+        print(f"[STB] failed to register STB_PT_MeshyStatus: {e}")
+
     # keep your existing Meshy import timer (unrelated to the progress UI)
     bpy.app.timers.register(_meshy_import_timer, first_interval=3.0)
     _print("REGISTER OK")
+
 
 def unregister():
     _stop_voice_process()
@@ -1133,6 +1166,12 @@ def unregister():
         except Exception as e:
             print(f"[STB] ui_progress.unregister() failed: {e}")
 
+    # --- Meshy Status panel ---
+    try:
+        bpy.utils.unregister_class(STB_PT_MeshyStatus)
+    except Exception as e:
+        print(f"[STB] failed to unregister STB_PT_MeshyStatus: {e}")
+
     for cls in reversed(_CLASSES):
         try:
             bpy.utils.unregister_class(cls)
@@ -1141,5 +1180,7 @@ def unregister():
 
     _print("UNREGISTER OK")
 
+
 if __name__ == "__main__":
     register()
+
