@@ -1,22 +1,15 @@
 bl_info = {
-    "name": "Blender STB Tool (RPC Server tab, voice controls, progress bar) – with Safety Gate + Meshy",
+    "name": "Blender RPC Bridge (RPC tab, voice controls) – with Safety Gate + Meshy",
     "author": "you",
     "version": (0, 7, 0),
     "blender": (3, 6, 0),
     "category": "System",
-    "location": "3D View > N-panel > STB",
+    "location": "3D View > N-panel > RPC",
     "description": "XML-RPC server + Voice launcher with diagnostics, operator Safety Gate, and Meshy text→3D import (API only)",
 }
 
 # --- bootstrap: locate a parent folder that contains 'stb_core' and add it to sys.path
 import os, sys
-import bpy
-from bpy.props import StringProperty, EnumProperty
-
-# Add-on root key, e.g. "SpeechToBlender"
-ADDON_ROOT = "SpeechToBlender"
-
-
 
 HERE = os.path.abspath(os.path.dirname(__file__))
 
@@ -41,10 +34,6 @@ if not REPO_ROOT:
 if REPO_ROOT not in sys.path:
     sys.path.insert(0, REPO_ROOT)
 
-
-
-
-from stb_core.providers import meshy as meshy_mod
 from stb_core.config import load_config
 CFG = load_config(REPO_ROOT)
 # ------------------------------------------------------------------------------
@@ -53,36 +42,17 @@ import bpy, threading, queue, time, subprocess, sys as _sys, socket, shutil, jso
 import urllib.request, urllib.error
 from xmlrpc.server import SimpleXMLRPCServer, SimpleXMLRPCRequestHandler
 
-# Optional Progress panel
-try:
-    from addon import ui_progress
-    _HAS_UI_PROGRESS = True
-except Exception as e:
-    print(f"[STB] ui_progress not available: {e}")
-    _HAS_UI_PROGRESS = False
 
-# Safe command executor hook
-from addon.command_exec import execute_command as _execute_command
 
-def rpc_execute(cmd_dict):
-    """
-    XML-RPC method: accepts a dict and routes through safety + executor.
-    NOTE: registration happens inside _server_loop (not at import time).
-    """
-    try:
-        return _execute_command(cmd_dict, CFG)
-    except Exception as e:
-        return {"ok": False, "error": str(e)}
-
-# Default/fallback Meshy API key (leave empty; use Add-on Prefs or env)
-MESHY_API_KEY_DEFAULT = ""
+# Default/fallback Meshy API key (user-provided)
+MESHY_API_KEY_DEFAULT = "msy_RtHUDJezqJJG7KlQK0UNosTVemaIMGEmqh6C"
 
 # ====== CONFIG ======
 DEFAULT_VOICE_SCRIPT = os.path.join(os.path.dirname(__file__), "voice_to_blender.py")
 DEFAULT_PYTHON_EXE   = ""
 
 HOST = "127.0.0.1"
-PORT = 8785
+PORT = 8765
 
 API_BASE = "https://api.meshy.ai/v2"
 MESHY_TEXT_TO_3D = f"{API_BASE}/text-to-3d"
@@ -113,24 +83,13 @@ def _port_in_use(host, port):
         return s.connect_ex((host, port)) == 0
 
 def _get_addon_prefs():
-    """
-    Return (prefs, True) for this add-on, searching by the real add-on key first,
-    then falling back to legacy/__name__ if present. On failure: (None, False).
-    """
     try:
-        addons = bpy.context.preferences.addons
-        # Preferred: top-level package folder name (e.g. "SpeechToBlender")
-        key = ADDON_ROOT
-        if key in addons:
-            return addons[key].preferences, True
-        # Fallback: legacy mistakes (e.g. "addon")
-        legacy = __name__
-        if legacy in addons:
-            return addons[legacy].preferences, True
+        modname = __name__
+        if modname in bpy.context.preferences.addons:
+            return bpy.context.preferences.addons[modname].preferences, True
     except Exception:
         pass
     return None, False
-
 
 def _get_effective_voice_path():
     prefs, ok = _get_addon_prefs()
@@ -489,6 +448,7 @@ def _meshy_import_timer():
     secs = max(1.0, float(getattr(prefs, "meshy_poll_seconds", 4))) if ok and prefs else 4.0
     return secs
 
+
 def _meshy_worker(prompt, do_refine=True, should_remesh=True, pro_flag=None):
     """Background thread: Meshy preview -> optional refine -> download GLB -> enqueue path."""
     try:
@@ -499,7 +459,7 @@ def _meshy_worker(prompt, do_refine=True, should_remesh=True, pro_flag=None):
         endpoint = (getattr(prefs, 'meshy_text_endpoint', '') if (ok and prefs) else '') or MESHY_TEXT_TO_3D
         use_pro = bool(pro_flag) or (bool(getattr(prefs, 'meshy_use_pro', True)) if ok and prefs else True)
         pro_single = bool(getattr(prefs, 'meshy_pro_single_pass', False)) if (ok and prefs) else False
-        ai_model = "meshy-5" if use_pro else "meshy-5"
+        ai_model = "meshy-5" if use_pro else "meshy-5"  # default meshy-5 anyway; keep explicit for clarity
         _print(f"[Meshy] route → {'PRO' if use_pro else 'STD'} @ {endpoint} (model={ai_model})")
 
         # 1) Start preview
@@ -589,8 +549,6 @@ def _ensure_link_to_sandbox_selected():
             except Exception:
                 pass
 
-# NOTE: _PRIMS must exist elsewhere in your file for handle_voice_command() to add primitives.
-
 def handle_voice_command(text):
     pro_flag = None
     t = (text or '').strip().lower()
@@ -660,11 +618,6 @@ def _server_loop():
         ) as server:
             _SERVER = server
 
-            # Introspection (system.listMethods, etc.) + multicall (optional)
-            server.register_introspection_functions()
-            server.register_multicall_functions()
-
-            # ----- define handlers -----
             def ping():
                 return "pong"
 
@@ -688,44 +641,29 @@ def _server_loop():
                 }
 
             def voice_handle(text):
+                """Handle a natural-language command (primitive or Meshy)."""
                 try:
                     msg = handle_voice_command(text)
                     return {"ok": True, "message": msg}
                 except Exception as e:
                     return {"ok": False, "error": str(e)}
 
-            # ----- REGISTER METHODS (including 'execute') -----
             server.register_function(ping, "ping")
             server.register_function(enqueue_op, "enqueue_op")
             server.register_function(enqueue_op_safe, "enqueue_op_safe")
             server.register_function(safety_info, "safety_info")
             server.register_function(voice_handle, "voice_handle")
-            server.register_function(rpc_execute, "execute")  # <- the important one
 
-            # Log what's really registered (helps catch stale servers)
-            try:
-                methods = server.system_listMethods()
-            except Exception:
-                methods = ["(introspection disabled)"]
             _SERVER_RUNNING = True
             _print(f"XML-RPC listening on http://{HOST}:{PORT}/RPC2")
-            _print("Registered methods:", methods)
-
-            # Main loop
             while _SERVER_RUNNING:
                 server.handle_request()
-
-    except OSError as e:
-        # e.g., address already in use
-        _print(f"Server bind error on {HOST}:{PORT}: {e}")
-        _set_error(f"Server bind error on {HOST}:{PORT}: {e}")
     except Exception as e:
         _print("Server loop error:", e)
         _set_error(f"Server error: {e!r}")
     finally:
         _SERVER_RUNNING = False
         _print("Server loop ended")
-
 
 def _start_server_thread():
     global _SERVER_THREAD, _SERVER_RUNNING
@@ -863,6 +801,7 @@ def _drain_task_queue():
     return 0.5 if _SERVER_RUNNING else None
 
 # ====== ADD-ON PREFERENCES ======
+
 class RPCBRIDGE_AddonPrefs(bpy.types.AddonPreferences):
     bl_idname = __name__
     voice_script: bpy.props.StringProperty(name="Voice Script Path", subtype='FILE_PATH', default=DEFAULT_VOICE_SCRIPT)
@@ -922,6 +861,7 @@ class RPCBRIDGE_AddonPrefs(bpy.types.AddonPreferences):
         layout.prop(self, "meshy_pro_single_pass")
 
 # ====== PROPS ======
+
 def ensure_props():
     wm = bpy.types.WindowManager
     if not hasattr(wm, "rpc_server_running"):
@@ -1051,11 +991,11 @@ class RPCBRIDGE_OT_validate(bpy.types.Operator):
 
 # ====== PANELS ======
 class RPCBRIDGE_PT_panel(bpy.types.Panel):
-    bl_label = "Speech To Blender"
+    bl_label = "Blender RPC Bridge"
     bl_idname = "RPCBRIDGE_PT_panel"
     bl_space_type = "VIEW_3D"
     bl_region_type = "UI"
-    bl_category = "STB"  # Sidebar tab label
+    bl_category = "RPC"
     def draw(self, context):
         wm = context.window_manager
         layout = self.layout
@@ -1097,6 +1037,8 @@ class RPCBRIDGE_PT_panel(bpy.types.Panel):
             for line in wm.rpc_last_error.splitlines():
                 box.label(text=line)
 
+
+
 class VOICE_OT_Handle(bpy.types.Operator):
     """Route a natural-language command to primitives/Meshy"""
     bl_idname = "voice.handle"
@@ -1123,255 +1065,28 @@ _CLASSES = (
     RPCBRIDGE_OT_console,
     RPCBRIDGE_OT_validate,
     RPCBRIDGE_PT_panel,
-    VOICE_OT_Handle,
-)
-
-class STB_AddonPreferences(bpy.types.AddonPreferences):
-    # IMPORTANT: this must equal your add-on module name.
-    # Your project imports this file as `import addon`, so:
-    bl_idname = ADDON_ROOT
-
-    meshy_base_url: StringProperty(
-        name="Meshy Base URL",
-        default="https://api.meshy.ai"
-    )
-    meshy_model: EnumProperty(
-        name="Meshy Model",
-        items=[('v5', 'v5 (Pro)', ''), ('v4', 'v4 (Legacy)', '')],
-        default='v5'
-    )
-    meshy_mode: EnumProperty(
-        name="Generation Mode",
-        items=[('preview', 'Preview (fast)', ''), ('standard', 'Standard', '')],
-        default='preview'
-    )
-    meshy_formats: StringProperty(
-        name="Preferred Formats (comma)",
-        description="Comma-separated priority list, e.g. glb,fbx,obj",
-        default="glb,fbx,obj"
-    )
-
-    def draw(self, context):
-        layout = self.layout
-        box = layout.box()
-        box.label(text="Meshy")
-        box.prop(self, "meshy_base_url")
-        box.prop(self, "meshy_model")
-        box.prop(self, "meshy_mode")
-        box.prop(self, "meshy_formats")
-        layout.label(text="API key is read from environment variable: MESHY_API_KEY", icon='KEYINGSET')
-
-
-
-
-
-
-
-class STB_PT_MeshyStatus(bpy.types.Panel):
-    bl_label = "Meshy Status"
-    bl_idname = "STB_PT_meshy_status"
-    bl_space_type = 'VIEW_3D'
-    bl_region_type = 'UI'
-    bl_category = 'STB'  # Sidebar tab label
-
-    def draw(self, context):
-        layout = self.layout
-        wm = context.window_manager
-        status = wm.get("meshy_status", "Idle")
-        row = layout.row()
-        row.label(text=f"{status}")
-
-# --- Meshy: one-click operator ---
-class STB_OT_MeshyGenerate(bpy.types.Operator):
-    bl_idname = "stb.meshy_generate"
-    bl_label  = "Generate with Meshy"
-    bl_description = "Submit a Meshy Text-to-3D job and auto-import when ready (non-blocking)"
-    bl_options = {'REGISTER', 'INTERNAL'}
-
-    def execute(self, context):
-        import os
-        wm = context.window_manager
-        prompt = getattr(wm, "stb_meshy_prompt", "").strip()
-        if not prompt:
-            self.report({'WARNING'}, "Prompt is empty.")
-            return {'CANCELLED'}
-
-        # Use the *top-level* add-on key (folder name) to fetch prefs
-        
-        addons = bpy.context.preferences.addons
-        prefs = getattr(addons.get(ADDON_ROOT), "preferences", None)
-
-        # Optional: feed env var from prefs so MeshyProvider sees a key
-        api_key = getattr(prefs, "meshy_api_key", "") if prefs else ""
-        if api_key:
-            os.environ["MESHY_API_KEY"] = api_key
-
-        base_url = getattr(prefs, "meshy_base_url", "https://api.meshy.ai")
-        model    = getattr(prefs, "meshy_model", "v5")
-        mode     = getattr(prefs, "meshy_mode", "preview")
-        fmts_csv = getattr(prefs, "meshy_formats", "glb,fbx,obj")
-        dl_pref  = [s.strip().lower() for s in fmts_csv.split(",") if s.strip()]
-
-        from stb_core.providers import meshy as meshy_mod
-        prov = meshy_mod.MeshyProvider({
-            "api_key_env": "MESHY_API_KEY",
-            "base_url": base_url,
-            "model": model,
-            "dl_format_preference": dl_pref,
-            "endpoints": {
-                "text2mesh": ["/openapi/v2/text-to-3d"],
-                "img2mesh":  ["/openapi/v2/image-to-3d"],
-                "task": ["/openapi/v2/text-to-3d/{job_id}", "/openapi/v2/image-to-3d/{job_id}"]
-            }
-        })
-
-        try:
-            meshy_mod.meshy_submit_and_import_async(
-                prov, capability="text2mesh", mode=mode, title="STB Generate", prompt=prompt
-            )
-            self.report({'INFO'}, f"Submitted Meshy job: “{prompt[:48]}”")
-        except Exception as e:
-            msg = getattr(prov, "friendly_error", lambda x: str(x))(e)
-            self.report({'ERROR'}, msg)
-            return {'CANCELLED'}
-
-        return {'FINISHED'}
-
-
-class STB_PT_MeshyTools(bpy.types.Panel):
-    bl_label = "Meshy Tools"
-    bl_idname = "STB_PT_MeshyTools"
-    bl_space_type = 'VIEW_3D'
-    bl_region_type = 'UI'
-    bl_category = 'STB'   # keep everything under your STB tab
-
-    def draw(self, context):
-        layout = self.layout
-        wm = context.window_manager
-        layout.prop(wm, "stb_meshy_prompt", text="Prompt")
-        layout.operator("stb.meshy_generate", icon='PLAY')
-
-def _ensure_status_key():
-    try:
-        wm = bpy.context.window_manager
-        if "meshy_status" not in wm:
-            wm["meshy_status"] = "Idle"
-    except Exception:
-        pass
+    VOICE_OT_Handle,)
 
 def register():
     ensure_props()
     for cls in _CLASSES:
         try:
             bpy.utils.register_class(cls)
-        except Exception as e:
-            print(f"[STB] failed to register {getattr(cls, '__name__', cls)}: {e}")
-
-    # Register the progress panel (does NOT start any timers by itself)
-    if _HAS_UI_PROGRESS:
-        try:
-            ui_progress.register()
-        except Exception as e:
-            print(f"[STB] ui_progress.register() failed: {e}")
-
-    # --- Meshy: Add-on Preferences (for base URL, model, mode, formats) ---
-    try:
-        bpy.utils.register_class(STB_AddonPreferences)
-    except Exception as e:
-        print(f"[STB] failed to register STB_AddonPreferences: {e}")
-
-    # --- Meshy Status panel (always-on readout) ---
-    try:
-        _ensure_status_key()  # make sure wm["meshy_status"] exists
-    except Exception as e:
-        print(f"[STB] _ensure_status_key() failed: {e}")
-    try:
-        bpy.utils.register_class(STB_PT_MeshyStatus)
-    except Exception as e:
-        print(f"[STB] failed to register STB_PT_MeshyStatus: {e}")
-
-    # --- Meshy one-click operator + tools panel ---
-    # Prompt property
-    try:
-        if not hasattr(bpy.types.WindowManager, "stb_meshy_prompt"):
-            bpy.types.WindowManager.stb_meshy_prompt = bpy.props.StringProperty(
-                name="Meshy Prompt",
-                default="simple low-poly test object"
-            )
-            bpy.utils.register_class(STB_OT_MeshyGenerate)   # <-- ensure this line exists
-            bpy.utils.register_class(STB_PT_MeshyTools)
-    except Exception as e:
-        print(f"[STB] failed to add WindowManager.stb_meshy_prompt: {e}")
-
-    # Operator + Panel
-    try:
-        bpy.utils.register_class(STB_OT_MeshyGenerate)
-    except Exception as e:
-        print(f"[STB] failed to register STB_OT_MeshyGenerate: {e}")
-    try:
-        bpy.utils.register_class(STB_PT_MeshyTools)
-    except Exception as e:
-        print(f"[STB] failed to register STB_PT_MeshyTools: {e}")
-
-    # keep your existing Meshy import timer (unrelated to the progress UI)
+        except Exception:
+            pass
+    # kick off Meshy import timer so it runs even if server is off
     bpy.app.timers.register(_meshy_import_timer, first_interval=3.0)
     _print("REGISTER OK")
-
 
 def unregister():
     _stop_voice_process()
     _stop_server_thread()
-
-    # Unregister the progress panel first so it can stop its own timer if running
-    if _HAS_UI_PROGRESS:
-        try:
-            ui_progress.unregister()
-        except Exception as e:
-            print(f"[STB] ui_progress.unregister() failed: {e}")
-
-    # --- Meshy one-click operator + tools panel ---
-    try:
-        bpy.utils.unregister_class(STB_PT_MeshyTools)
-    except Exception as e:
-        print(f"[STB] failed to unregister STB_PT_MeshyTools: {e}")
-    try:
-        bpy.utils.unregister_class(STB_OT_MeshyGenerate)
-    except Exception as e:
-        print(f"[STB] failed to unregister STB_OT_MeshyGenerate: {e}")
-    try:
-        del bpy.types.WindowManager.stb_meshy_prompt
-    except Exception:
-        pass
-
-    # --- Meshy Status panel ---
-    try:
-        bpy.utils.unregister_class(STB_PT_MeshyStatus)
-    except Exception as e:
-        print(f"[STB] failed to unregister STB_PT_MeshyStatus: {e}")
-
-    # --- Meshy Add-on Preferences ---
-    try:
-        bpy.utils.unregister_class(STB_AddonPreferences)
-    except Exception as e:
-        print(f"[STB] failed to unregister STB_AddonPreferences: {e}")
-
     for cls in reversed(_CLASSES):
         try:
             bpy.utils.unregister_class(cls)
-        except Exception as e:
-            print(f"[STB] failed to unregister {getattr(cls, '__name__', cls)}: {e}")
-    for cls in (STB_PT_MeshyTools, STB_OT_MeshyGenerate, STB_AddonPreferences):
-        try:
-            bpy.utils.unregister_class(cls)
-        except Exception as e:
-            print("[STB] failed to unregister", getattr(cls, "__name__", cls), e)
-    try:
-        del bpy.types.WindowManager.stb_meshy_prompt
-    except Exception:
-        pass
+        except Exception:
+            pass
     _print("UNREGISTER OK")
-
 
 if __name__ == "__main__":
     register()
-

@@ -108,6 +108,8 @@ class MeshyProvider:
           "dl_format_preference": ["glb","fbx","obj","usdz"]
         }
         """
+        self._last_request = ""
+
         self._cfg: Dict[str, Any] = cfg or {}
         self._key_env: str = self._cfg.get("api_key_env", "MESHY_API_KEY")
         self._key: Optional[str] = os.environ.get(self._key_env)
@@ -117,22 +119,22 @@ class MeshyProvider:
         self._base: str = (self._cfg.get("base_url") or "https://api.meshy.ai").rstrip("/")
         self._model: str = self._cfg.get("model", "v5")
 
-        eps = self._cfg.get("endpoints") or {}
-        self._eps_text2mesh: List[str] = list(eps.get("text2mesh") or [
+        eps = self._cfg.get("endpoints") or []
+        self._eps_text2mesh: List[str] = list((self._cfg.get("endpoints") or {}).get("text2mesh") or [
             "/openapi/v2/text-to-3d",
             "/openapi/v1/text-to-3d",
             "/v2/text-to-3d",
             "/v1/text-to-3d",
             "/text-to-3d",
         ])
-        self._eps_img2mesh: List[str] = list(eps.get("img2mesh") or [
+        self._eps_img2mesh: List[str] = list((self._cfg.get("endpoints") or {}).get("img2mesh") or [
             "/openapi/v2/image-to-3d",
             "/openapi/v1/image-to-3d",
             "/v2/image-to-3d",
             "/v1/image-to-3d",
             "/image-to-3d",
         ])
-        self._eps_task: List[str] = list(eps.get("task") or [
+        self._eps_task: List[str] = list((self._cfg.get("endpoints") or {}).get("task") or [
             "/openapi/v2/text-to-3d/{job_id}",
             "/openapi/v2/image-to-3d/{job_id}",
             "/openapi/v1/text-to-3d/{job_id}",
@@ -150,6 +152,7 @@ class MeshyProvider:
 
     def _req(self, path: str, method: str = "GET", data: Optional[Json] = None) -> Json:
         url = self._build_url(path)
+        self._last_request = f"{method} {url}"
         headers = {"Authorization": f"Bearer {self._key}", "Content-Type": "application/json"}
         body = json.dumps(data).encode("utf-8") if data is not None else None
         req = urllib.request.Request(url, data=body, method=method, headers=headers)
@@ -164,6 +167,21 @@ class MeshyProvider:
             raise RuntimeError(f"HTTP {e.code} {method} {path}: {err}") from None
         except urllib.error.URLError as e:
             raise RuntimeError(f"Network error {method} {path}: {e}") from None
+
+    def friendly_error(self, e: Exception) -> str:
+        msg = str(e)
+        low = msg.lower()
+        if "http 401" in low or "http 403" in low:
+            return f"Authorization failed — check MESHY_API_KEY. [{self._last_request}]"
+        if "http 404" in low:
+            return f"Endpoint not found — check your routes (/openapi/v2/...). [{self._last_request}]"
+        if "timeout" in low or "timed out" in low or "network error" in low:
+            return f"Network timeout contacting Meshy. [{self._last_request}]"
+        if "no downloadable files" in low:
+            return "Job finished but returned no downloadable files."
+        if "unsupported extension" in low:
+            return "Downloaded format isn’t supported by this Blender build."
+        return f"{msg} [{self._last_request}]"
 
     def _try_post(self, candidates: List[str], payload: Json) -> Json:
         last_err = None
@@ -359,7 +377,7 @@ class MeshyProvider:
             raise RuntimeError(f"Import failed for {path.name} via {ext}: {e}")
 
         new_objs = route_new_imports_to_meshy(before)
-        _dedupe_object_names(new_objs)  # <-- naming de-dupe
+        _dedupe_object_names(new_objs)
         _normalize_import(new_objs)
         return new_objs, used
 
@@ -457,7 +475,7 @@ def _bg_worker_submit_and_import(provider: MeshyProvider, payload: Json):
         _schedule_on_main(_safe_import_path, provider, local)
         _set_status("Done")
     except Exception as e:
-        _set_status(f"Error: {e}")
+        _set_status(f"Error: {provider.friendly_error(e)}")
         print("[Meshy Async] Error:", e)
 
 def meshy_submit_and_import_async(provider: MeshyProvider, capability="text2mesh", **kwargs):
