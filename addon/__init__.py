@@ -14,7 +14,8 @@ import bpy
 from bpy.props import StringProperty, EnumProperty
 
 # Add-on root key, e.g. "SpeechToBlender"
-ADDON_ROOT = "SpeechToBlender"
+ADDON_ROOT = (__package__ or __name__).split(".")[0]  # resolves to "SpeechToBlender"
+
 
 
 
@@ -119,7 +120,7 @@ def _get_addon_prefs():
     """
     try:
         addons = bpy.context.preferences.addons
-        # Preferred: top-level package folder name (e.g. "SpeechToBlender")
+        # Preferred: top-level package folder name (e.g. "Speech To Blender")
         key = ADDON_ROOT
         if key in addons:
             return addons[key].preferences, True
