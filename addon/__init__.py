@@ -45,7 +45,6 @@ if REPO_ROOT not in sys.path:
 
 
 
-from stb_core.providers import meshy as meshy_mod
 from stb_core.config import load_config
 CFG = load_config(REPO_ROOT)
 # ------------------------------------------------------------------------------
@@ -864,63 +863,6 @@ def _drain_task_queue():
     return 0.5 if _SERVER_RUNNING else None
 
 # ====== ADD-ON PREFERENCES ======
-class RPCBRIDGE_AddonPrefs(bpy.types.AddonPreferences):
-    bl_idname = __name__
-    voice_script: bpy.props.StringProperty(name="Voice Script Path", subtype='FILE_PATH', default=DEFAULT_VOICE_SCRIPT)
-    safety_strict_mode: bpy.props.BoolProperty(name="Safety Strict Mode", description="When ON, only operators matching the allow-list are permitted; OFF lets anything not explicitly denied through", default=True)
-    allow_import_export: bpy.props.BoolProperty(name="Allow Import/Export Operators", default=True, description="If OFF, blocks import_scene.* / export_scene.*")
-    allow_view3d_menus: bpy.props.BoolProperty(name="Allow Menu Calls", default=False, description="If ON, unblocks wm.call_menu style ops (still UI-only)")
-    safety_extra_allow: bpy.props.StringProperty(name="Extra Allow Regex (one per line)", description="Advanced: add regex lines like ^pose\. or ^sequencer\.", subtype='NONE', default="")
-    safety_extra_deny: bpy.props.StringProperty(name="Extra Deny Regex (one per line)", description="Advanced: add regex lines; deny always wins", subtype='NONE', default="")
-    # Meshy prefs
-    meshy_api_key: bpy.props.StringProperty(name="Meshy API Key", subtype='PASSWORD', description="msy-...", default="")
-    meshy_poll_seconds: bpy.props.IntProperty(name="Meshy importer poll (sec)", default=4, min=2, max=30)
-
-    # Meshy (advanced)
-    meshy_use_pro: bpy.props.BoolProperty(
-        name="Use Meshy Pro",
-        description="Route Text→3D calls to the Pro endpoint/model",
-        default=True
-    )
-    meshy_text_endpoint: bpy.props.StringProperty(
-        name="Text-to-3D Endpoint",
-        description="Standard Text→3D endpoint",
-        default=f"{API_BASE}/text-to-3d"
-    )
-    meshy_pro_endpoint: bpy.props.StringProperty(
-        name="Pro Text-to-3D Endpoint",
-        description="Pro Text→3D endpoint (override here if Meshy provides a different path)",
-        default=f"{API_BASE}/text-to-3d-pro"
-    )
-    meshy_pro_single_pass: bpy.props.BoolProperty(
-        name="Pro: Single-pass (no refine)",
-        description="Some Pro routes return final assets without a separate refine step",
-        default=True
-    )
-
-    def draw(self, context):
-        layout = self.layout
-        layout.label(text="Paths")
-        layout.prop(self, "voice_script")
-        layout.separator()
-        layout.label(text="Safety Gate")
-        layout.prop(self, "safety_strict_mode")
-        layout.prop(self, "allow_import_export")
-        layout.prop(self, "allow_view3d_menus")
-        col = layout.column()
-        col.prop(self, "safety_extra_allow")
-        col.prop(self, "safety_extra_deny")
-        layout.separator()
-        layout.label(text="Meshy")
-        layout.prop(self, "meshy_api_key")
-        layout.prop(self, "meshy_poll_seconds")
-
-        layout.separator()
-        layout.label(text="Meshy (Pro)", icon='FUND')
-        layout.prop(self, "meshy_use_pro")
-        layout.prop(self, "meshy_text_endpoint")
-        layout.prop(self, "meshy_pro_endpoint")
-        layout.prop(self, "meshy_pro_single_pass")
 
 # ====== PROPS ======
 def ensure_props():
@@ -1118,7 +1060,6 @@ class VOICE_OT_Handle(bpy.types.Operator):
 
 # ====== REGISTER ======
 _CLASSES = (
-    RPCBRIDGE_AddonPrefs,
     RPCBRIDGE_OT_server_toggle,
     RPCBRIDGE_OT_voice_toggle,
     RPCBRIDGE_OT_console,
@@ -1127,40 +1068,6 @@ _CLASSES = (
     VOICE_OT_Handle,
 )
 
-class STB_AddonPreferences(bpy.types.AddonPreferences):
-    # IMPORTANT: this must equal your add-on module name.
-    # Your project imports this file as `import addon`, so:
-    bl_idname = ADDON_ROOT
-
-    meshy_base_url: StringProperty(
-        name="Meshy Base URL",
-        default="https://api.meshy.ai"
-    )
-    meshy_model: EnumProperty(
-        name="Meshy Model",
-        items=[('v5', 'v5 (Pro)', ''), ('v4', 'v4 (Legacy)', '')],
-        default='v5'
-    )
-    meshy_mode: EnumProperty(
-        name="Generation Mode",
-        items=[('preview', 'Preview (fast)', ''), ('standard', 'Standard', '')],
-        default='preview'
-    )
-    meshy_formats: StringProperty(
-        name="Preferred Formats (comma)",
-        description="Comma-separated priority list, e.g. glb,fbx,obj",
-        default="glb,fbx,obj"
-    )
-
-    def draw(self, context):
-        layout = self.layout
-        box = layout.box()
-        box.label(text="Meshy")
-        box.prop(self, "meshy_base_url")
-        box.prop(self, "meshy_model")
-        box.prop(self, "meshy_mode")
-        box.prop(self, "meshy_formats")
-        layout.label(text="API key is read from environment variable: MESHY_API_KEY", icon='KEYINGSET')
 
 
 
@@ -1276,10 +1183,6 @@ def register():
             print(f"[STB] ui_progress.register() failed: {e}")
 
     # --- Meshy: Add-on Preferences (for base URL, model, mode, formats) ---
-    try:
-        bpy.utils.register_class(STB_AddonPreferences)
-    except Exception as e:
-        print(f"[STB] failed to register STB_AddonPreferences: {e}")
 
     # --- Meshy Status panel (always-on readout) ---
     try:
@@ -1351,21 +1254,13 @@ def unregister():
         print(f"[STB] failed to unregister STB_PT_MeshyStatus: {e}")
 
     # --- Meshy Add-on Preferences ---
-    try:
-        bpy.utils.unregister_class(STB_AddonPreferences)
-    except Exception as e:
-        print(f"[STB] failed to unregister STB_AddonPreferences: {e}")
 
     for cls in reversed(_CLASSES):
         try:
             bpy.utils.unregister_class(cls)
         except Exception as e:
             print(f"[STB] failed to unregister {getattr(cls, '__name__', cls)}: {e}")
-    for cls in (STB_PT_MeshyTools, STB_OT_MeshyGenerate, STB_AddonPreferences):
-        try:
-            bpy.utils.unregister_class(cls)
-        except Exception as e:
-            print("[STB] failed to unregister", getattr(cls, "__name__", cls), e)
+
     try:
         del bpy.types.WindowManager.stb_meshy_prompt
     except Exception:

@@ -1,0 +1,16 @@
+feat/fix(scope): short title
+
+Why:
+- 
+
+What changed:
+- 
+
+Impact:
+- 
+
+Safety:
+- lazy imports preserved; no network at import; single prefs intact
+
+Verification:
+- Reload snippet run; addon enabled; operator visible; smoke test passed

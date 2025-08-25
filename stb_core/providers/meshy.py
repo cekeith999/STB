@@ -101,9 +101,9 @@ class MeshyProvider:
           "base_url": "https://api.meshy.ai",
           "model": "v5",
           "endpoints": {
-            "text2mesh": ["/openapi/v2/text-to-3d"],
-            "img2mesh":  ["/openapi/v2/image-to-3d"],
-            "task": ["/openapi/v2/text-to-3d/{job_id}", "/openapi/v2/image-to-3d/{job_id}"]
+            "text2mesh": [...],
+            "img2mesh":  [...],
+            "task": [...]
           },
           "dl_format_preference": ["glb","fbx","obj","usdz"]
         }
@@ -111,37 +111,61 @@ class MeshyProvider:
         self._last_request = ""
 
         self._cfg: Dict[str, Any] = cfg or {}
+
+        # API key: prefs override env
         self._key_env: str = self._cfg.get("api_key_env", "MESHY_API_KEY")
-        self._key: Optional[str] = os.environ.get(self._key_env)
+        self._key: Optional[str] = self._cfg.get("api_key") or os.environ.get(self._key_env)
         if not self._key:
-            raise RuntimeError(f"Environment variable {self._key_env} is not set.")
+            raise RuntimeError(f"No Meshy API key provided (prefs) and env var {self._key_env} is not set.")
 
         self._base: str = (self._cfg.get("base_url") or "https://api.meshy.ai").rstrip("/")
         self._model: str = self._cfg.get("model", "v5")
 
-        eps = self._cfg.get("endpoints") or []
+        # Endpoint candidates (robust across Meshy versions/tenants)
         self._eps_text2mesh: List[str] = list((self._cfg.get("endpoints") or {}).get("text2mesh") or [
+            # Common current
+            "/openapi/v3/text-to-3d",
             "/openapi/v2/text-to-3d",
             "/openapi/v1/text-to-3d",
+            # Older/simple
+            "/v3/text-to-3d",
             "/v2/text-to-3d",
             "/v1/text-to-3d",
             "/text-to-3d",
+            # Some tenants expose under /api
+            "/api/v3/text-to-3d",
+            "/api/v2/text-to-3d",
+            "/api/v1/text-to-3d",
         ])
+
         self._eps_img2mesh: List[str] = list((self._cfg.get("endpoints") or {}).get("img2mesh") or [
+            "/openapi/v3/image-to-3d",
             "/openapi/v2/image-to-3d",
             "/openapi/v1/image-to-3d",
+            "/v3/image-to-3d",
             "/v2/image-to-3d",
             "/v1/image-to-3d",
             "/image-to-3d",
+            "/api/v3/image-to-3d",
+            "/api/v2/image-to-3d",
+            "/api/v1/image-to-3d",
         ])
+
         self._eps_task: List[str] = list((self._cfg.get("endpoints") or {}).get("task") or [
+            # v3/v2 task/status shapes first
+            "/openapi/v3/text-to-3d/{job_id}",
+            "/openapi/v3/image-to-3d/{job_id}",
             "/openapi/v2/text-to-3d/{job_id}",
             "/openapi/v2/image-to-3d/{job_id}",
             "/openapi/v1/text-to-3d/{job_id}",
             "/openapi/v1/image-to-3d/{job_id}",
+            "/v3/tasks/{job_id}",
             "/v2/tasks/{job_id}",
             "/v1/tasks/{job_id}",
             "/tasks/{job_id}",
+            "/api/v3/tasks/{job_id}",
+            "/api/v2/tasks/{job_id}",
+            "/api/v1/tasks/{job_id}",
         ])
 
         self._dl_pref: List[str] = list(self._cfg.get("dl_format_preference") or ["glb", "fbx", "obj", "usdz"])
@@ -169,12 +193,11 @@ class MeshyProvider:
             raise RuntimeError(f"Network error {method} {path}: {e}") from None
 
     def friendly_error(self, e: Exception) -> str:
-        msg = str(e)
-        low = msg.lower()
+        msg = str(e); low = msg.lower()
         if "http 401" in low or "http 403" in low:
-            return f"Authorization failed — check MESHY_API_KEY. [{self._last_request}]"
+            return f"Authorization failed — check MESHY_API_KEY (or addon prefs). [{self._last_request}]"
         if "http 404" in low:
-            return f"Endpoint not found — check your routes (/openapi/v2/...). [{self._last_request}]"
+            return f"Endpoint not found — try /openapi/v3 or /openapi/v2 family. [{self._last_request}]"
         if "timeout" in low or "timed out" in low or "network error" in low:
             return f"Network timeout contacting Meshy. [{self._last_request}]"
         if "no downloadable files" in low:
@@ -184,22 +207,24 @@ class MeshyProvider:
         return f"{msg} [{self._last_request}]"
 
     def _try_post(self, candidates: List[str], payload: Json) -> Json:
-        last_err = None
+        tried, last_err = [], None
         for path in candidates:
+            tried.append(path)
             try:
                 return self._req(path, "POST", payload)
             except Exception as e:
                 last_err = e
-        raise RuntimeError(f"All submit endpoints failed: {last_err}")
+        raise RuntimeError(f"All submit endpoints failed: {last_err} | tried={tried}")
 
     def _try_get(self, candidates: List[str]) -> Json:
-        last_err = None
+        tried, last_err = [], None
         for path in candidates:
+            tried.append(path)
             try:
                 return self._req(path, "GET", None)
             except Exception as e:
                 last_err = e
-        raise RuntimeError(f"All status endpoints failed: {last_err}")
+        raise RuntimeError(f"All status endpoints failed: {last_err} | tried={tried}")
 
     # ---- Provider interface ----
     def supports(self, capability: str) -> bool:
@@ -209,15 +234,19 @@ class MeshyProvider:
         cap = (payload.get("capability") or "").lower()
         if cap in ("text2mesh", "text-to-3d", "text_to_3d"):
             candidates = self._eps_text2mesh
-            body = {"mode": payload.get("mode", "preview"),
-                    "title": payload.get("title") or "STB Text2Mesh",
-                    "prompt": payload.get("prompt", "")}
+            body = {
+                "mode": payload.get("mode", "preview"),
+                "title": payload.get("title") or "STB Text2Mesh",
+                "prompt": payload.get("prompt", "")
+            }
         elif cap in ("img2mesh", "image-to-3d", "image_to_3d"):
             candidates = self._eps_img2mesh
-            body = {"mode": payload.get("mode", "preview"),
-                    "title": payload.get("title") or "STB Img2Mesh",
-                    "image_url": payload.get("image_url") or payload.get("url", ""),
-                    "prompt": payload.get("prompt", "")}
+            body = {
+                "mode": payload.get("mode", "preview"),
+                "title": payload.get("title") or "STB Img2Mesh",
+                "image_url": payload.get("image_url") or payload.get("url", ""),
+                "prompt": payload.get("prompt", "")
+            }
         else:
             raise ValueError(f"Unsupported capability for Meshy: {cap}")
 
@@ -396,6 +425,94 @@ class MeshyProvider:
             "chosen_format": best.get("format"),
             "collection": ensure_meshy_collection().name,
         }
+
+
+def generate_from_prompt(context, prompt: str, cfg: dict | None = None):
+    """
+    Thin convenience wrapper used by the top-level operator.
+    Builds a MeshyProvider from prefs/env and submits an async text2mesh job,
+    then returns a small dict for UI logging.
+    """
+    cfg = dict(cfg or {})
+
+    # Normalize formats into provider's download preference order
+    fmts = cfg.get("formats") or "glb,fbx,obj"
+    if isinstance(fmts, str):
+        dl_pref = [f.strip().lower() for f in fmts.split(",") if f.strip()]
+    else:
+        dl_pref = [str(f).strip().lower() for f in (fmts or [])]
+
+    provider_cfg = {
+        # direct API key from prefs takes priority over env
+        "api_key": cfg.get("api_key", ""),
+        "api_key_env": cfg.get("api_key_env", "MESHY_API_KEY"),
+        "base_url": cfg.get("base_url", "https://api.meshy.ai"),
+        "model": cfg.get("model", "v5"),
+
+        # Keep explicit endpoint candidates here too for belt-and-suspenders robustness.
+        "endpoints": {
+            "text2mesh": [
+                "/openapi/v3/text-to-3d",
+                "/openapi/v2/text-to-3d",
+                "/openapi/v1/text-to-3d",
+                "/v3/text-to-3d",
+                "/v2/text-to-3d",
+                "/v1/text-to-3d",
+                "/text-to-3d",
+                "/api/v3/text-to-3d",
+                "/api/v2/text-to-3d",
+                "/api/v1/text-to-3d",
+            ],
+            "img2mesh": [
+                "/openapi/v3/image-to-3d",
+                "/openapi/v2/image-to-3d",
+                "/openapi/v1/image-to-3d",
+                "/v3/image-to-3d",
+                "/v2/image-to-3d",
+                "/v1/image-to-3d",
+                "/image-to-3d",
+                "/api/v3/image-to-3d",
+                "/api/v2/image-to-3d",
+                "/api/v1/image-to-3d",
+            ],
+            "task": [
+                "/openapi/v3/text-to-3d/{job_id}",
+                "/openapi/v3/image-to-3d/{job_id}",
+                "/openapi/v2/text-to-3d/{job_id}",
+                "/openapi/v2/image-to-3d/{job_id}",
+                "/openapi/v1/text-to-3d/{job_id}",
+                "/openapi/v1/image-to-3d/{job_id}",
+                "/v3/tasks/{job_id}",
+                "/v2/tasks/{job_id}",
+                "/v1/tasks/{job_id}",
+                "/tasks/{job_id}",
+                "/api/v3/tasks/{job_id}",
+                "/api/v2/tasks/{job_id}",
+                "/api/v1/tasks/{job_id}",
+            ],
+        },
+
+        "dl_format_preference": dl_pref or ["glb", "fbx", "obj", "usdz"],
+    }
+
+    provider = MeshyProvider(provider_cfg)
+
+    # Mode is sent in the payload that submit() builds
+    mode = cfg.get("mode", "standard")
+    title = cfg.get("title", "STB Text2Mesh")
+
+    # Non-blocking end-to-end: submit → poll → download → import
+    meshy_submit_and_import_async(
+        provider,
+        capability="text2mesh",
+        mode=mode,
+        title=title,
+        prompt=prompt,
+    )
+
+    # Status panel will update via the timer pump already running
+    return {"submitted": True, "mode": mode, "model": provider._model}
+
 
 # ---------------- Async (non-blocking) support ----------------
 

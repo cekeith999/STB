@@ -1,0 +1,230 @@
+So it started by me remembering that i’ve used blenders script / internal console to add objects into my scene. Then, realizing that that script and console run off of python, as well as blenders addons, AND that ai runs with python code, i thought “why haven’t i seen a blender - ai tool or use case.” the only use case i saw was using external tools like gemini 2.0 to create files to run within blenders console, but that was 7 months ago (today is august 15 2025) and i havnet seen anything since. 
+
+So , I started with gpt 5. I had it try to give me code to recreate an image of grass down to the smallest details like the grain of grass, but it failed. 
+
+Then i asked it “ok is it possible for you to interact with my blender scene live, basically using your agent feature, to build this object? because the code you give may work in theory, but when i use it, it is nowhere near the input image i gave you”
+
+It said no.
+
+Then there was a bunch of back and forth discourse, about trouble shooting getting this grass picture made. Short story, unsuccessful.
+
+Then i came back the next day (today august 15th 2025) and asked “ok now, im thinking of making a workflow or something similar, that lets me control blender using my voice or text, which interacts with blender using the python console or run text scripts. i would also want it to be able to see blender. something like google ai studio could work well as it can see my screen, but i dont know about interacting with it”
+
+This bitch ass, mean ass, fuck ass gpt said : Short version: stop trying to “remote-control” Blender by mashing random scripts into the console. Build a tiny local RPC bridge inside Blender that:
+listens on localhost
+
+
+executes a small set of safe commands on Blender’s main thread
+
+
+can return a live viewport screenshot (so your AI can “see”)
+
+
+you drive it from voice/text (Google AI Studio, whatever) by sending JSON commands.
+
+
+Below is a drop-in Blender add-on that does exactly that using only the Python standard library (XML-RPC + queues). No extra packages, no UI hacks, no deadlocks.
+…
+
+	IM LIKE WHO TF ARE YOU TALKING TO LIKE THAT (though i told it to be blunt and insensitive)
+
+Then it gave me a long list of steps, talking about RPC bridges nd stuff.
+
+I asked it to explain RPC bridges and the steps… it said:  What a “local RPC bridge” is
+RPC = Remote Procedure Call. You expose a few functions (e.g., add_cube, run_op, screenshot) on a tiny server. Another program calls those functions like normal code—even though they’re running inside Blender.
+
+
+Local = bound to 127.0.0.1 only. It’s on your machine, not the internet.
+
+
+Bridge = glue between your voice/text agent and Blender. The agent doesn’t jam random scripts into the console; it calls clean, whitelisted functions.
+
+
+Think of it as a little phone line into Blender: “add a cube”, “render me a viewport screenshot”, “run this allowed operator”.
+
+What the add-on I gave you does
+Starts a tiny XML-RPC server inside Blender on 127.0.0.1:8765.
+
+
+Exposes a few safe endpoints:
+
+
+add_cube(size, loc) — demo control
+
+
+run_op(op_id, kwargs) — run whitelisted bpy.ops.* (you decide the list)
+
+
+screenshot() — returns a base64 PNG of the active 3D view (so your AI can “see”)
+
+
+list_objects() — returns object names (example of read-only queries)
+
+
+Executes everything on Blender’s main thread (mandatory) using a queue + timer. No thread-unsafe bpy calls.
+So now im like , “from the speech to text, to llm parser step, do i have to copy and paste anythign into ai studio?, and in this case actually, why would i use ai studio? could i use something else more effective at that step?”
+
+Then gpt: You wouldn’t have to copy/paste anything into AI Studio unless you were using it purely as the “brain” for turning your transcript into commands.
+The Speech-to-Text → LLM parser step can be handled by any LLM endpoint that:
+Accepts your STT transcript as input.
+
+
+Returns clean, structured JSON with the operation name + parameters you want to call in Blender.
+
+
+AI Studio is just one possible choice for that LLM.
+ Reasons you might choose it:
+You want Google’s multimodal model (Gemini) that can also look at the screenshot from Blender and reason about what’s in frame.
+
+
+It’s already integrated with your Google account and has low setup friction.
+
+
+You don’t mind running it in the browser with your data on Google’s cloud.
+
+
+Reasons you might skip it and use something else:
+You want local/offline parsing (e.g., Ollama running a small instruct model).
+
+
+You want OpenAI API or Anthropic Claude because they’re better at strict JSON or code generation.
+
+
+You want direct integration into your script without needing to open a web UI.
+
+
+You want full automation without manual copy/paste into a web page.
+
+
+
+More effective options for the parser step:
+OpenAI GPT-4o / GPT-4 Turbo — very good at tool-call JSON formatting.
+
+
+Claude 3.5 Sonnet — great at following schema instructions.
+
+
+Local models via Ollama or LM Studio (LLaMA 3, Mistral, Command R+) — good if you want offline privacy.
+
+
+LangChain or LlamaIndex orchestrating your STT → LLM → RPC calls in one Python process.
+
+
+So now im thinking, hmm… i want this to run offline, or locally, and i know i can use an api key to make it happen so i dont have to use gemini online…so how would that look?
+
+I then told gpt that i wanted to use my api key, and it gave me this workflow: 
+Mic → Whisper STT → GPT-4o → Blender RPC
+
+From there, i got to work. I first worked on the Mic using OpenAIs Whisper - i believe their speech to text software. But it talked about RPC again so i asked what is it. I found out that an RPC is basically a local server blender can host itself. Pretty cool.
+
+So, to work with the whisper files, i downloaded the tiny whisper file to make sure this ran, and could run fast.
+
+Ran the code to download from git or huggingface, i dont remember. Then, had it explain the steps to me again to make sure i understood what i was doing. Building the mic, building the pathway to get the transcription, then send it to OpenAI with my api, then back to blender with the RPC.
+
+So after downloading all the files, whispers, tiny, and running some tests, . i asked “what would that mic capture look like, ideally. i would have it running and i just talk and it hears me, clips the audio, transcribes, and sends to 4o. but how would it go from stt whisper, to 4o?”it said: Exactly — ideally it’s a hot mic loop
+
+I asked “ok where would that initial mic capture loop run though, and how does it run the whisper afterwards” it said: The mic capture loop wouldn’t run inside Blender — it would run as a separate Python process on your machine, because:
+Blender’s embedded Python is not great at running real-time audio/VAD loops (it’s blocking and tied to the UI thread).
+
+
+If we keep it separate, you can start/stop voice control without touching Blender’s UI.
+
+
+It’s easier to talk to external programs like whisper.cpp from a normal Python runtime.
+
+
+Now,  it said to run it through my terminal. Its the python file that runs, which runs everything else. So, when i run it through terminal, it activates the mic, transcribe, api, then blender.
+
+After getting whisper (the speech to text) working, the next step was to take the transcript and send it to 4o with an api call. Using another voice to blender python file.
+
+After installing the python dependencies and creating the files, i had a working voice to blender workflow
+
+Then after a lot of troubleshooting and debugging. I ran the files in my terminal. Spoke. And a cube was made.
+
+
+
+
+Next came improvements. Because it worked, i wanted it to work well. Making it so that i can add anything, which is just a few lines of code being changed. And, so that i can zip it, and run it on other computers.
+
+To zip it, i have to add python files (exe, and .py) along with a lot of other files like init___.py, readmes, and everything else made locally, to that one file so that the entire process is portable. I am almost done making it portable.
+
+
+
+
+Aug 16, 2025
+
+Today i was really just trying to integrate the meshy api into the pipeline, so you can generate abstract models. It works for the most part, but i am running into trouble. The models generated are low quality. I want them to be meshy v5 quality. So i joined the discord to ask about my problem. Will be back soon.
+
+
+Aug 17, 2025
+
+So today meshy is still on hold. But i added import export capabilities. I havent tested export capabilities yet though. I will do so tomorrow before starting. Then i will work (probably for a while i suspect, because this is getting into agentic modes i believe) but work on adding edit mode functionality.
+
+August 18, 2025.
+
+Apparently, the tool didnt have the foundation to be easily built on in the future , with other models, workflows, etc. so i am going through this 10 step process to make it scalable easily:
+1) Config & Secrets (no more hard-coded anything)
+One config file the addon and voice script can both read. Use pure-stdlib JSON/TOML so it works inside Blender.
+
+
+Per-provider blocks so you can drop in more API keys and switches without editing code.
+
+
+Profiles: "dev" | "prod" | "mock" to flip behavior fast.
+2) Providers: a tiny plugin interface
+Abstract every external model behind the same interface. Adding Meshy, “Another3D,” OpenAI, Stability, local server… becomes a one-file drop.
+3) Commands: a single schema, many verbs
+Keep natural language on the voice side; on the Blender side normalize into a small set of safe, typed commands. That makes expansion easy and safety enforceable.
+4) Pipeline: one orchestrator to rule them all
+Make a small state machine so every request follows the same life cycle: PARSE → VALIDATE → DISPATCH(provider) → POLL → FETCH → POSTPROCESS → IMPORT.
+5) Process boundaries that won’t fight you
+Addon (inside Blender): thin UI, command executor, importers, safety guard.
+
+
+Worker (outside Blender): voice I/O, LLM parsing, provider calls, long polls.
+
+
+Talk over XML-RPC or HTTP. You already have XML-RPC; that’s fine. If you ever swap to HTTP, use stdlib http.server to avoid packaging headaches.
+6) Diagnostics you’ll actually use
+Unified logger (stdlib logging) that prefixes each line with PID, component, and a short request id. Log to file and console.
+
+
+Progress callbacks: feed provider progress back to the UI panel. You already wanted this — wire on_progress to a simple shared file or socket that the addon reads on a timer to update a progress bar.
+
+
+Human-readable failures: wrap provider errors so Blender’s console shows: Provider=meshy • op=text2mesh • 404 NoMatchingRoute • tip=check endpoint /v1/text-to-3d.
+
+
+7) Tests & mocks that unblock you when APIs flake
+Tiny unit tests for: command parsing, safety gate, provider adapters (mock HTTP with canned JSON), and importer paths.
+
+
+A mock provider that pretends to run and spits out a known .fbx from tests/fixtures/. Flip profile="mock" to demo end-to-end without internet.
+
+
+
+August 24th, 2025
+
+Been working on it for the past few days. adding the foundational architecture has been a task to say the least. but right now, i am working on transferring to Cursor to do the coding work, instead of going back and forth between GPT and the code.
+
+Still have to do:
+
+8) Safety rail that scales with capability
+Your earlier “only add cube” restriction becomes a policy not a hack.
+9) Version the public contract (future-you will thank present-you)
+Add "api_version": "0.2" to every message between processes.
+
+
+Reject mismatches loudly. This keeps refactors from silently breaking voice control.
+
+
+10) Adding a new model tomorrow = 1 file + 3 lines
+Create stb_core/providers/another3d.py implementing the 4 methods.
+
+
+Register it in registry.py.
+
+
+Add a block in config.json and point "active_provider": "another3d" (or select per-task).
+
+
