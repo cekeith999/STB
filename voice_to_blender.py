@@ -15,7 +15,74 @@ from datetime import datetime
 import traceback  # keep tracebacks visible instead of killing process
 
 # ========= CONFIG (portable paths) =========
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
+def _get_openai_api_key():
+    """Get OpenAI API key from cache, RPC (preferences), or environment variable (fallback)."""
+    global _CACHED_API_KEY, _CACHE_VALID
+    
+    # Use cached key if available and valid
+    if _CACHE_VALID and _CACHED_API_KEY:
+        if VERBOSE_DEBUG:
+            print(f"[DEBUG] Using cached API key: length={len(_CACHED_API_KEY)}, preview={_CACHED_API_KEY[:15]}...")
+        return _CACHED_API_KEY
+    
+    # Try RPC (from Blender preferences) first - this is the preferred source
+    try:
+        key = rpc.get_openai_api_key()
+        if VERBOSE_DEBUG:
+            print(f"[DEBUG] RPC returned key: length={len(key) if key else 0}, preview={key[:15] if key and len(key) > 15 else (key if key else 'None')}...")
+        
+        if key and key.strip():
+            key = key.strip()
+            # Remove any hidden whitespace characters (newlines, tabs, etc.)
+            key = ''.join(key.split())
+            # Remove non-printable characters
+            key = ''.join(c for c in key if c.isprintable())
+            if key:
+                # Cache the key
+                _CACHED_API_KEY = key
+                _CACHE_VALID = True
+                if VERBOSE_DEBUG:
+                    print(f"[DEBUG] ✅ Cached RPC key from preferences: length={len(key)}, preview={key[:15]}...")
+                return key
+        elif VERBOSE_DEBUG:
+            print(f"[DEBUG] RPC returned empty or invalid key")
+    except Exception as e:
+        if VERBOSE_DEBUG:
+            print(f"[DEBUG] RPC call failed: {e}")
+            import traceback
+            traceback.print_exc()
+        pass  # RPC not available or method doesn't exist
+    
+    # Fall back to environment variable only if RPC/preferences key is not available
+    env_key = os.getenv("OPENAI_API_KEY", "").strip()
+    if env_key:
+        # Clean environment variable key
+        env_key = ''.join(env_key.split())
+        env_key = ''.join(c for c in env_key if c.isprintable())
+        if env_key:
+            # Cache the env key too
+            _CACHED_API_KEY = env_key
+            _CACHE_VALID = True
+            if VERBOSE_DEBUG:
+                print(f"[DEBUG] ✅ Cached environment variable key (fallback): length={len(env_key)}, preview={env_key[:15]}...")
+            return env_key
+        elif VERBOSE_DEBUG:
+            print(f"[DEBUG] Environment variable key is empty after cleaning")
+    
+    return ""
+
+
+def _clear_api_key_cache():
+    """Clear the cached API key (call when RPC stops)."""
+    global _CACHED_API_KEY, _CACHE_VALID
+    _CACHED_API_KEY = None
+    _CACHE_VALID = False
+    if VERBOSE_DEBUG:
+        print("[DEBUG] Cleared API key cache")
+
+# Cached API key (set when RPC is available, cleared when RPC stops)
+_CACHED_API_KEY = None
+_CACHE_VALID = False
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -33,8 +100,8 @@ RPC_URL = "http://127.0.0.1:8765/RPC2"
 # ==========================================
 
 # Feature flags / verbosity
-ENABLE_GPT_FALLBACK = False  # set True later when you're done debugging
-VERBOSE_DEBUG = True         # debug prints for import matcher
+ENABLE_GPT_FALLBACK = True   # GPT-4o fallback for natural language understanding
+VERBOSE_DEBUG = False        # debug prints for import matcher (set True for debugging)
 
 # Mic settings
 SAMPLE_RATE  = 16000
@@ -68,6 +135,16 @@ def _parse_number(s):
         return float(s)
     except Exception:
         return None
+
+def _word_to_number(word):
+    """Convert word numbers to integers."""
+    word_map = {
+        "zero": 0, "one": 1, "two": 2, "three": 3, "four": 4, "five": 5,
+        "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10,
+        "eleven": 11, "twelve": 12, "thirteen": 13, "fourteen": 14, "fifteen": 15,
+        "sixteen": 16, "seventeen": 17, "eighteen": 18, "nineteen": 19, "twenty": 20
+    }
+    return word_map.get(word.lower(), None)
 
 def _extract_value_after(words, *keys, default=None):
     t = " ".join(words)
@@ -513,13 +590,46 @@ def _extract_common_kwargs(words):
     return kwargs
 
 def _maybe_quantity(text):
+    """Extract quantity from text, handling both digits and word numbers."""
+    # Try digits first
     m = re.search(r"\b(add|spawn|create)\s+(\d+)\b", text.lower())
     if m:
         try:
             return int(m.group(2))
         except Exception:
-            return 1
+            pass
+    
+    # Try word numbers
+    words = text.lower().split()
+    word_map = {
+        "zero": 0, "one": 1, "two": 2, "three": 3, "four": 4, "five": 5,
+        "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10,
+        "eleven": 11, "twelve": 12, "thirteen": 13, "fourteen": 14, "fifteen": 15,
+        "sixteen": 16, "seventeen": 17, "eighteen": 18, "nineteen": 19, "twenty": 20
+    }
+    
+    for i, word in enumerate(words):
+        if word in ("add", "spawn", "create") and i + 1 < len(words):
+            next_word = words[i + 1]
+            if next_word in word_map:
+                return word_map[next_word]
+    
     return 1
+
+def _split_multiple_commands(text: str):
+    """Split text into multiple commands on 'and', 'then', commas, etc."""
+    # Split on common conjunctions
+    separators = [r"\s+and\s+", r"\s+then\s+", r",\s+", r"\.\s+"]
+    parts = [text]
+    for sep in separators:
+        new_parts = []
+        for part in parts:
+            new_parts.extend(re.split(sep, part, flags=re.IGNORECASE))
+        parts = [p.strip() for p in new_parts if p.strip()]
+        if len(parts) > 1:
+            break  # Use first separator that splits
+    return parts if len(parts) > 1 else [text]
+
 
 def try_local_rules(text: str):
     t = (text or "").strip()
@@ -528,14 +638,28 @@ def try_local_rules(text: str):
     tl = t.lower()
     words = tl.split()
 
+    # Deselect commands - check BEFORE select all (more specific)
+    deselect_patterns = [
+        "deselect all", "clear selection", "deselect everything",
+        "unselect all", "clear all selection"
+    ]
+    if _match_any_phrase(tl, deselect_patterns):
+        return {"op": "object.select_all", "kwargs": {"action": "DESELECT"}}
+    
+    # Select all - check after deselect
     if _match_any_phrase(tl, ["select all"]):
         return {"op": "object.select_all", "kwargs": {"action": "SELECT"}}
-    if _match_any_phrase(tl, ["deselect all", "clear selection"]):
-        return {"op": "object.select_all", "kwargs": {"action": "DESELECT"}}
     if _match_any_phrase(tl, ["frame selected", "focus selected", "zoom to selected"]):
         return {"op": "view3d.view_selected", "kwargs": {}}
 
-    if _match_any_phrase(tl, ["delete selected", "delete object", "remove object", "erase object"]):
+    # Delete commands - more natural language variants
+    delete_patterns = [
+        "delete selected", "delete object", "remove object", "erase object",
+        "delete all", "delete everything", "remove all", "erase all",
+        "delete all objects", "delete all selected", "remove all objects",
+        "delete all of the objects", "delete all the objects", "remove all selected"
+    ]
+    if _match_any_phrase(tl, delete_patterns):
         return {"op": "object.delete", "kwargs": {}}
     if _match_any_phrase(tl, ["duplicate", "duplicate object", "copy object", "make a copy"]):
         return {"op": "object.duplicate_move", "kwargs": {}}
@@ -563,9 +687,70 @@ def try_local_rules(text: str):
         return {"op": "collection.create", "kwargs": {"name": nm}}
 
     if _match_any_phrase(tl, ["add", "make", "create", "spawn", "insert"]):
+        # Handle multiple object types in one command (e.g., "add 10 cubes and 10 spheres")
+        commands = []
+        
+        def make_add_cmd(template, qty=1):
+            op, param_map = template
+            base_kwargs = _extract_common_kwargs(words)
+            kwargs = dict(base_kwargs)
+            if "size" in kwargs:
+                for k, alias in param_map.items():
+                    if alias == "size":
+                        kwargs[k] = kwargs.pop("size")
+                        break
+            return [{"op": op, "kwargs": kwargs} for _ in range(qty)]
+        
+        # Check for multiple object types with quantities
+        # Pattern: "add X cubes and Y spheres"
+        multi_pattern = re.search(r"add\s+(\d+|one|two|three|four|five|six|seven|eight|nine|ten)\s+(\w+)(?:\s+and\s+(\d+|one|two|three|four|five|six|seven|eight|nine|ten)\s+(\w+))?", tl)
+        if multi_pattern:
+            # Extract first object type and quantity
+            qty1_word = multi_pattern.group(1)
+            obj1 = multi_pattern.group(2)
+            qty1 = _word_to_number(qty1_word) if _word_to_number(qty1_word) is not None else int(qty1_word) if qty1_word.isdigit() else 1
+            
+            # Helper to match object names (handles plurals)
+            def match_obj_name(obj_word, key):
+                obj_lower = obj_word.lower()
+                key_lower = key.lower()
+                if obj_lower in key_lower or key_lower in obj_lower:
+                    return True
+                # Handle plurals
+                if obj_lower.endswith("s") and obj_lower[:-1] in key_lower:
+                    return True
+                if not obj_lower.endswith("s") and (obj_lower + "s") in key_lower:
+                    return True
+                # Handle "sphere" vs "uv sphere"
+                if "sphere" in obj_lower and "sphere" in key_lower:
+                    return True
+                return False
+            
+            # Check all primitives for matches
+            all_prims = {**MESH_PRIMS, **CURVE_PRIMS, **LIGHTS, **CAMERA}
+            for key, template in all_prims.items():
+                if match_obj_name(obj1, key):
+                    commands.extend(make_add_cmd(template, qty1))
+                    break
+            
+            # Extract second object type and quantity if present
+            if multi_pattern.group(3) and multi_pattern.group(4):
+                qty2_word = multi_pattern.group(3)
+                obj2 = multi_pattern.group(4)
+                qty2 = _word_to_number(qty2_word) if _word_to_number(qty2_word) is not None else int(qty2_word) if qty2_word.isdigit() else 1
+                
+                for key, template in all_prims.items():
+                    if match_obj_name(obj2, key):
+                        commands.extend(make_add_cmd(template, qty2))
+                        break
+            
+            if commands:
+                return commands if len(commands) > 1 else commands[0]
+        
+        # Single object type (original logic)
         qty = _maybe_quantity(tl)
-
-        def make_add_cmd(template):
+        
+        def make_add_cmd_single(template):
             op, param_map = template
             base_kwargs = _extract_common_kwargs(words)
             kwargs = dict(base_kwargs)
@@ -576,18 +761,34 @@ def try_local_rules(text: str):
                         break
             return {"op": op, "kwargs": kwargs}
 
+        # Helper to check if key matches (handles plurals)
+        def key_matches(key, text):
+            if key in text:
+                return True
+            # Check plural/singular variants
+            if key.endswith("s") and key[:-1] in text:
+                return True
+            if not key.endswith("s") and (key + "s") in text:
+                return True
+            # Handle multi-word keys (e.g., "uv sphere" matches "uv spheres")
+            if " " in key:
+                base = key.rsplit(" ", 1)[0]
+                if base in text and ("sphere" in text or "spheres" in text):
+                    return True
+            return False
+
         for key, template in MESH_PRIMS.items():
-            if key in tl:
-                return [make_add_cmd(template) for _ in range(qty)] if qty > 1 else make_add_cmd(template)
+            if key_matches(key, tl):
+                return [make_add_cmd_single(template) for _ in range(qty)] if qty > 1 else make_add_cmd_single(template)
         for key, template in CURVE_PRIMS.items():
-            if key in tl or (key == "text" and "text" in tl):
-                return [make_add_cmd(template) for _ in range(qty)] if qty > 1 else make_add_cmd(template)
+            if key_matches(key, tl) or (key == "text" and "text" in tl):
+                return [make_add_cmd_single(template) for _ in range(qty)] if qty > 1 else make_add_cmd_single(template)
         for key, template in LIGHTS.items():
-            if key in tl:
-                return [make_add_cmd(template) for _ in range(qty)] if qty > 1 else make_add_cmd(template)
+            if key_matches(key, tl):
+                return [make_add_cmd_single(template) for _ in range(qty)] if qty > 1 else make_add_cmd_single(template)
         for key, template in CAMERA.items():
-            if key in tl:
-                return [make_add_cmd(template) for _ in range(qty)] if qty > 1 else make_add_cmd(template)
+            if key_matches(key, tl):
+                return [make_add_cmd_single(template) for _ in range(qty)] if qty > 1 else make_add_cmd_single(template)
 
     return None
 
@@ -598,9 +799,22 @@ def gpt_to_json(transcript: str):
     if not ENABLE_GPT_FALLBACK:
         return None
 
-    if not OPENAI_API_KEY:
-        print("⚠️ OPENAI_API_KEY not set; skipping GPT fallback.")
+    # Get API key (may have been updated via RPC)
+    api_key = _get_openai_api_key()
+    if not api_key:
+        # Only print warning once per session to avoid spam
+        if not hasattr(gpt_to_json, "_warned"):
+            print("⚠️ OpenAI API key not set; skipping GPT fallback.")
+            gpt_to_json._warned = True
         return None
+    
+    # Validate key format
+    api_key = api_key.strip()
+    if not api_key.startswith("sk-") and not api_key.startswith("sk-proj-"):
+        if not hasattr(gpt_to_json, "_format_warned"):
+            print(f"⚠️ OpenAI API key format looks invalid (got: {api_key[:10]}...). Keys should start with 'sk-' or 'sk-proj-'")
+            gpt_to_json._format_warned = True
+    
     try:
         from openai import OpenAI
     except Exception:
@@ -619,7 +833,50 @@ def gpt_to_json(transcript: str):
 
     print("🧠 GPT mapping…")
     try:
-        client = OpenAI(api_key=OPENAI_API_KEY)
+        api_key = _get_openai_api_key().strip()
+        
+        # Validate key is present
+        if not api_key:
+            print("⚠️ GPT error: API key is empty")
+            return None
+        
+        # Debug: show key length and first/last few chars (for troubleshooting)
+        if VERBOSE_DEBUG:
+            key_len = len(api_key)
+            key_start = api_key[:10] if key_len > 10 else api_key
+            key_end = api_key[-4:] if key_len > 4 else ""
+            print(f"[DEBUG] Using API key: length={key_len}, starts with: {key_start}..., ends with: ...{key_end}")
+            
+            # Check for hidden/non-printable characters
+            non_printable = [c for c in api_key if not c.isprintable()]
+            if non_printable:
+                print(f"[DEBUG] ⚠️ Key contains {len(non_printable)} non-printable characters: {[ord(c) for c in non_printable[:5]]}")
+                # Clean the key
+                api_key = ''.join(c for c in api_key if c.isprintable())
+                print(f"[DEBUG] Cleaned key length: {len(api_key)}")
+            
+            # Check for non-ASCII
+            non_ascii = [c for c in api_key if ord(c) > 127]
+            if non_ascii:
+                print(f"[DEBUG] ⚠️ Key contains non-ASCII characters: {[ord(c) for c in non_ascii[:5]]}")
+            
+            # Show raw representation
+            print(f"[DEBUG] Key repr (first 30): {repr(api_key[:30])}")
+            print(f"[DEBUG] Key repr (last 30): {repr(api_key[-30:])}")
+        
+        # Key validation test removed for performance - the actual GPT call will validate the key
+        # if VERBOSE_DEBUG:
+        #     try:
+        #         test_client = OpenAI(api_key=api_key)
+        #         # Try a minimal test call
+        #         test_models = test_client.models.list()
+        #         print(f"[DEBUG] ✅ Key validation test passed - {len(list(test_models))} models accessible")
+        #     except Exception as test_e:
+        #         print(f"[DEBUG] ❌ Key validation test failed: {test_e}")
+        #         # Continue anyway to see the actual error
+        
+        # Create client with explicit key
+        client = OpenAI(api_key=api_key)
         resp = client.chat.completions.create(
             model="gpt-4o",
             messages=[{"role":"system","content":system},{"role":"user","content":user}],
@@ -641,7 +898,21 @@ def gpt_to_json(transcript: str):
         print("⚠️ GPT returned JSON but missing 'op':", str(out)[:500])
         return None
     except Exception as e:
-        print("⚠️ GPT error:", e)
+        error_msg = str(e)
+        # Check for common API key errors
+        if "Invalid API key" in error_msg or "401" in error_msg or "unauthorized" in error_msg.lower():
+            print(f"⚠️ GPT error: Invalid API key. Please check your OpenAI API key in Blender preferences.")
+            print(f"   Key preview: {api_key[:10]}..." if len(api_key) > 10 else f"   Key: {api_key}")
+            print(f"   Key length: {len(api_key)} characters")
+            print(f"   Troubleshooting:")
+            print(f"   1. Verify the key is correct in OpenAI dashboard: https://platform.openai.com/api-keys")
+            print(f"   2. Check if the key has been revoked or expired")
+            print(f"   3. Ensure the key has 'gpt-4o' model access")
+            print(f"   4. For project keys (sk-proj-), verify project billing is active")
+        elif "429" in error_msg or "rate limit" in error_msg.lower():
+            print(f"⚠️ GPT error: Rate limit exceeded. Please try again later.")
+        else:
+            print(f"⚠️ GPT error: {error_msg}")
         return None
 
 # ------------------ RPC send ------------------
@@ -669,8 +940,23 @@ if __name__ == "__main__":
     print("Voice → Whisper → (IO rules / Local rules / GPT) → Blender via Safety Gate (Ctrl+C to exit)")
     try:
         print("ping:", rpc.ping())
+        # Get OpenAI API key from RPC (Blender preferences) - this will cache it
+        api_key = _get_openai_api_key()
+        if api_key:
+            # Show first few chars for verification (keys start with "sk-")
+            key_preview = api_key[:7] + "..." if len(api_key) > 7 else api_key
+            print(f"✅ OpenAI API key loaded and cached ({key_preview})")
+            # Validate format
+            if not api_key.startswith("sk-") and not api_key.startswith("sk-proj-"):
+                print(f"⚠️ Warning: API key format looks unusual (should start with 'sk-' or 'sk-proj-')")
+        elif ENABLE_GPT_FALLBACK:
+            print("⚠️ OpenAI API key not set in preferences or environment; GPT fallback disabled")
     except Exception as e:
         print("⚠️ Could not reach Blender RPC at", RPC_URL, ":", e)
+        # Try environment variable as fallback
+        api_key = _get_openai_api_key()  # Will try env var
+        if api_key and ENABLE_GPT_FALLBACK:
+            print("✅ Using OpenAI API key from environment variable (cached)")
 
     while True:
         try:
@@ -681,26 +967,34 @@ if __name__ == "__main__":
                 continue
             print("📝 Transcript ->", text); sys.stdout.flush()
 
-            # import/export first
-            cmd = try_io_rules(text)
-
-            # Local rules
-            cmd = cmd or try_local_rules(text)
-
-            # GPT fallback (currently disabled via flag)
-            cmd = cmd or gpt_to_json(text)
-
-            if cmd:
-                if isinstance(cmd, list):
-                    for single in cmd:
-                        send_to_blender(single)
-                        time.sleep(0.05)
-                else:
-                    send_to_blender(cmd)
+            # Split into multiple commands if needed
+            command_parts = _split_multiple_commands(text)
+            
+            all_commands = []
+            for part in command_parts:
+                # import/export first
+                cmd = try_io_rules(part)
+                
+                # Local rules
+                cmd = cmd or try_local_rules(part)
+                
+                # GPT fallback (currently disabled via flag)
+                cmd = cmd or gpt_to_json(part)
+                
+                if cmd:
+                    if isinstance(cmd, list):
+                        all_commands.extend(cmd)
+                    else:
+                        all_commands.append(cmd)
+            
+            if all_commands:
+                for single in all_commands:
+                    send_to_blender(single)
+                    time.sleep(0.01)  # Small delay between commands (reduced from 0.05)
             else:
                 print("🤷 No command derived for:", text); sys.stdout.flush()
 
-            time.sleep(0.2)
+            time.sleep(0.05)  # Reduced from 0.2 for faster response
 
         except KeyboardInterrupt:
             print("\nBye.")
@@ -709,5 +1003,5 @@ if __name__ == "__main__":
             print("💥 Loop error:", e)
             traceback.print_exc()
             # Don’t die; keep the panel/process alive
-            time.sleep(0.3)
+            time.sleep(0.1)  # Reduced from 0.3 for faster response
             continue

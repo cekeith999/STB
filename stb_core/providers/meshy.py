@@ -121,51 +121,30 @@ class MeshyProvider:
         self._base: str = (self._cfg.get("base_url") or "https://api.meshy.ai").rstrip("/")
         self._model: str = self._cfg.get("model", "v5")
 
-        # Endpoint candidates (robust across Meshy versions/tenants)
-        self._eps_text2mesh: List[str] = list((self._cfg.get("endpoints") or {}).get("text2mesh") or [
-            # Common current
-            "/openapi/v3/text-to-3d",
+        # Simple endpoint lists like the working version
+        eps = self._cfg.get("endpoints") or {}
+        self._eps_text2mesh: List[str] = list(eps.get("text2mesh") or [
             "/openapi/v2/text-to-3d",
             "/openapi/v1/text-to-3d",
-            # Older/simple
-            "/v3/text-to-3d",
             "/v2/text-to-3d",
             "/v1/text-to-3d",
             "/text-to-3d",
-            # Some tenants expose under /api
-            "/api/v3/text-to-3d",
-            "/api/v2/text-to-3d",
-            "/api/v1/text-to-3d",
         ])
-
-        self._eps_img2mesh: List[str] = list((self._cfg.get("endpoints") or {}).get("img2mesh") or [
-            "/openapi/v3/image-to-3d",
+        self._eps_img2mesh: List[str] = list(eps.get("img2mesh") or [
             "/openapi/v2/image-to-3d",
             "/openapi/v1/image-to-3d",
-            "/v3/image-to-3d",
             "/v2/image-to-3d",
             "/v1/image-to-3d",
             "/image-to-3d",
-            "/api/v3/image-to-3d",
-            "/api/v2/image-to-3d",
-            "/api/v1/image-to-3d",
         ])
-
-        self._eps_task: List[str] = list((self._cfg.get("endpoints") or {}).get("task") or [
-            # v3/v2 task/status shapes first
-            "/openapi/v3/text-to-3d/{job_id}",
-            "/openapi/v3/image-to-3d/{job_id}",
+        self._eps_task: List[str] = list(eps.get("task") or [
             "/openapi/v2/text-to-3d/{job_id}",
             "/openapi/v2/image-to-3d/{job_id}",
             "/openapi/v1/text-to-3d/{job_id}",
             "/openapi/v1/image-to-3d/{job_id}",
-            "/v3/tasks/{job_id}",
             "/v2/tasks/{job_id}",
             "/v1/tasks/{job_id}",
             "/tasks/{job_id}",
-            "/api/v3/tasks/{job_id}",
-            "/api/v2/tasks/{job_id}",
-            "/api/v1/tasks/{job_id}",
         ])
 
         self._dl_pref: List[str] = list(self._cfg.get("dl_format_preference") or ["glb", "fbx", "obj", "usdz"])
@@ -197,13 +176,13 @@ class MeshyProvider:
         if "http 401" in low or "http 403" in low:
             return f"Authorization failed — check MESHY_API_KEY (or addon prefs). [{self._last_request}]"
         if "http 404" in low:
-            return f"Endpoint not found — try /openapi/v3 or /openapi/v2 family. [{self._last_request}]"
+            return f"Endpoint not found — try /openapi/v2 family. [{self._last_request}]"
         if "timeout" in low or "timed out" in low or "network error" in low:
             return f"Network timeout contacting Meshy. [{self._last_request}]"
         if "no downloadable files" in low:
             return "Job finished but returned no downloadable files."
         if "unsupported extension" in low:
-            return "Downloaded format isn’t supported by this Blender build."
+            return "Downloaded format isn't supported by this Blender build."
         return f"{msg} [{self._last_request}]"
 
     def _try_post(self, candidates: List[str], payload: Json) -> Json:
@@ -233,19 +212,23 @@ class MeshyProvider:
     def submit(self, payload: Json) -> str:
         cap = (payload.get("capability") or "").lower()
         if cap in ("text2mesh", "text-to-3d", "text_to_3d"):
+            # Prepend discovered routes if available
             candidates = self._eps_text2mesh
             body = {
                 "mode": payload.get("mode", "preview"),
-                "title": payload.get("title") or "STB Text2Mesh",
-                "prompt": payload.get("prompt", "")
+                "prompt": payload.get("prompt", ""),
+                "ai_model": payload.get("ai_model", "meshy-5"),
+                "should_remesh": payload.get("should_remesh", True)
             }
         elif cap in ("img2mesh", "image-to-3d", "image_to_3d"):
+            # Prepend discovered routes if available
             candidates = self._eps_img2mesh
             body = {
                 "mode": payload.get("mode", "preview"),
-                "title": payload.get("title") or "STB Img2Mesh",
                 "image_url": payload.get("image_url") or payload.get("url", ""),
-                "prompt": payload.get("prompt", "")
+                "prompt": payload.get("prompt", ""),
+                "ai_model": payload.get("ai_model", "meshy-5"),
+                "should_remesh": payload.get("should_remesh", True)
             }
         else:
             raise ValueError(f"Unsupported capability for Meshy: {cap}")
@@ -270,6 +253,7 @@ class MeshyProvider:
         return str(job_id)
 
     def status(self, job_id: str) -> Json:
+        # Prepend discovered routes if available
         paths = [p.format(job_id=job_id) for p in self._eps_task]
         raw = self._try_get(paths)
 
@@ -303,6 +287,7 @@ class MeshyProvider:
         return {"state": norm_state, "progress": progress, "raw": raw}
 
     def fetch_result(self, job_id: str) -> Json:
+        # Prepend discovered routes if available
         paths = [p.format(job_id=job_id) for p in self._eps_task]
         raw = self._try_get(paths)
 
@@ -452,43 +437,27 @@ def generate_from_prompt(context, prompt: str, cfg: dict | None = None):
         # Keep explicit endpoint candidates here too for belt-and-suspenders robustness.
         "endpoints": {
             "text2mesh": [
-                "/openapi/v3/text-to-3d",
                 "/openapi/v2/text-to-3d",
                 "/openapi/v1/text-to-3d",
-                "/v3/text-to-3d",
                 "/v2/text-to-3d",
                 "/v1/text-to-3d",
                 "/text-to-3d",
-                "/api/v3/text-to-3d",
-                "/api/v2/text-to-3d",
-                "/api/v1/text-to-3d",
             ],
             "img2mesh": [
-                "/openapi/v3/image-to-3d",
                 "/openapi/v2/image-to-3d",
                 "/openapi/v1/image-to-3d",
-                "/v3/image-to-3d",
                 "/v2/image-to-3d",
                 "/v1/image-to-3d",
                 "/image-to-3d",
-                "/api/v3/image-to-3d",
-                "/api/v2/image-to-3d",
-                "/api/v1/image-to-3d",
             ],
             "task": [
-                "/openapi/v3/text-to-3d/{job_id}",
-                "/openapi/v3/image-to-3d/{job_id}",
                 "/openapi/v2/text-to-3d/{job_id}",
                 "/openapi/v2/image-to-3d/{job_id}",
                 "/openapi/v1/text-to-3d/{job_id}",
                 "/openapi/v1/image-to-3d/{job_id}",
-                "/v3/tasks/{job_id}",
                 "/v2/tasks/{job_id}",
                 "/v1/tasks/{job_id}",
                 "/tasks/{job_id}",
-                "/api/v3/tasks/{job_id}",
-                "/api/v2/tasks/{job_id}",
-                "/api/v1/tasks/{job_id}",
             ],
         },
 
@@ -499,15 +468,15 @@ def generate_from_prompt(context, prompt: str, cfg: dict | None = None):
 
     # Mode is sent in the payload that submit() builds
     mode = cfg.get("mode", "standard")
-    title = cfg.get("title", "STB Text2Mesh")
 
     # Non-blocking end-to-end: submit → poll → download → import
     meshy_submit_and_import_async(
         provider,
         capability="text2mesh",
         mode=mode,
-        title=title,
         prompt=prompt,
+        ai_model="meshy-5",
+        should_remesh=True
     )
 
     # Status panel will update via the timer pump already running
@@ -611,5 +580,5 @@ def meshy_submit_and_import_async(provider: MeshyProvider, capability="text2mesh
     t.start()
     return t
 
-# Start the main-thread pump automatically so the status panel updates without “forcing” it.
+# Start the main-thread pump automatically so the status panel updates without "forcing" it.
 _ensure_pump_running()

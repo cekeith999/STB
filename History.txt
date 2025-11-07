@@ -227,4 +227,64 @@ Register it in registry.py.
 
 Add a block in config.json and point "active_provider": "another3d" (or select per-task).
 
+Its october 31st, 2025. And i havent touched this in a minute, i have a lot going on right now, but i will be putting time into this every friday. 
+Where i remember, its a speech to blender addon, that allows for a few functions to use your local computers microphone, openais speech to text software to transcribe, then send that transcription (i believe wrapped in a standard llm script) to gpt formatted in json with an api, then it returns a bpy script with your request, then runs the script automatically within blender. The bridge between blender and everything else, is an RPC bridge. RPC = Remote Procedure Call. You expose a few functions (e.g., add_cube, run_op, screenshot) on a tiny server. Another program calls those functions like normal code—even though they’re running inside Blender.
+
+Where my thoughts are right now, is that i want a method of integrating an ai model to blender / 3d softwares, it doesn't have to be a completely new model but it should be able to interact with your scene in any way possible. Blender is a good benchmark, as i know how to use it, and it covers a wide range of 3d capabilities and workflows. I imagine, for newcomers, they can jump into blender and have the "assistant" next to them, possibly first thing to do is ask them what they'd like to do. If they have previous experience within 3d and or blender, then they can choose a hands off approach to assisting, but if they are a new newcomer with no experience, then help guide along the way to achieving a goal. It would be able to have these functionalities:
+Agent: complete projects start to finish for you. Build scene, models, sculpt, animate, and have capabilities to even build out complete geo node systems, rigging and character animations, as well as realistic shaders.
+Teacher: Works with you to accomplish the project, rather than doing it solely for you. Kind of like a middle ground between a standard question and answer llm, and an agentic workflow. Especially if you are working to learn.
+Simple Assistant: Lowest level of this, as it would essentially be a call and response. This includes: STB (ask for something, get it returned), one shot prompting (prompt for a thing.
+Partnership: this has a model being able to work in the background with you to build a scene, hit you up when it has a question. This could utilize NVIDIA Omniverse as it allows for multiple people to work together on one file at the same time. Like a google doc. But, do you need Omniverse to do this? But even with this, you could then have multiple agents working together, holy fuck you could have a fucking team of agents working on your scenes, building an entire production just from a good fucking prompt. But again do you need NVIDIA Omniverse to do this? This reminds me of Grok 4 Super, as you can have 1 high level agent, guiding 4 lower level agents all for one task (creating a movie). This immediately feels like a combination of agent and the ability to talk live to an agent. 
+Ok so this is where I am, and now is to get back on track, flesh out the high level idea. And focus on a low level objective. 
+
+
+Ok so I think after consulting the council (gpt, gemini and claude), the MVP for this is Speech To Blender. I think I should get it working again, smoothly, video it. Then figure out next steps.
+
+
+
+When you get in it, stay consistent, the motivation will come.
+
+
+
+
+Thoughts: so I think a problem I may run into, is getting correct context for the task at hand. It may have to keep track of all the changes, and predict what the scene is going to look like, to help it suit the next request better. So almost keeping a log of all the changes as they're made, then assessing the scene and etc, and developing context of what's being made. And possible next steps
+
+
+November 7, 2025 - 14:15
+
+Today we focused on getting the voice command functionality working smoothly and improving performance. Major changes:
+
+1. Fixed voice command parsing issues:
+   - Added word-to-number conversion (e.g., "three" → 3) to handle spoken numbers
+   - Improved natural language matching for delete commands ("delete all" now works, not just "delete selected")
+   - Added multi-command parsing - commands can now be split on "and", "then", commas, etc. (e.g., "select all and delete" executes both commands)
+   - Fixed plural matching for object types ("spheres" now matches "sphere")
+   - Fixed deselect command priority (checks deselect before select to avoid false matches)
+
+2. Enabled GPT fallback for natural language understanding:
+   - Set ENABLE_GPT_FALLBACK = True
+   - GPT-4o now handles commands when local rules don't match
+   - Works with improved local rules for better coverage
+
+3. Added OpenAI API key management to Blender preferences:
+   - Created split fields (Part 1 and Part 2) to work around Blender's ~127-character StringProperty limit
+   - Full 164-character project keys (sk-proj-*) can now be stored by splitting into two fields
+   - Automatic combination of parts when retrieving the key
+   - UI shows combined key length and validation feedback
+   - Added RPC method to retrieve key from preferences
+
+4. Bundled openai package and added auto-install:
+   - Created requirements.txt documenting dependencies
+   - Added auto-install function that checks and installs openai if missing
+   - Package is pre-installed in stb_runtime for distribution
+   - Created BUNDLING.md documentation
+
+5. Performance optimizations:
+   - Removed unnecessary key validation test (saved ~500ms-2s per GPT call)
+   - Added API key caching to avoid repeated RPC calls (saved ~20-100ms per call)
+   - Reduced sleep delays: 0.2s → 0.05s, 0.05s → 0.01s, 0.3s → 0.1s (saved ~150-250ms per command)
+   - Disabled verbose debug mode (VERBOSE_DEBUG = False) for cleaner, faster output
+   - Total performance improvement: ~670ms-2.35s faster per command
+
+The voice workflow is now much more responsive and handles natural language commands better. The split API key fields solve the Blender storage limitation, and caching eliminates redundant RPC calls.
 
