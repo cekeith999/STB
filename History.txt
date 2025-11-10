@@ -330,3 +330,114 @@ Super Mode is planned as a 5-phase implementation:
 - Phase 5: Edit Mode Commands (loop cuts, subdivide, select by region)
 
 The foundation is now in place for context-aware AI modeling that can understand mesh geometry, vertex positions, and choose the best Blender operations to achieve desired effects.
+
+---
+
+## Super Mode: Architecture & Design Philosophy
+
+### The Core Problem
+
+Traditional voice-to-Blender workflows are limited to simple, pre-defined commands ("add cube", "delete selected"). They can't handle complex, context-dependent modeling tasks like:
+- "Make this look more like an Amazon Echo Dot" (requires understanding mesh topology, vertex patterns, and reference knowledge)
+- "Add edge loops around the middle section" (requires understanding current geometry and choosing the right Blender operation)
+- "Smooth out the corners but keep the overall shape" (requires mesh analysis and multi-step operations)
+
+Super Mode addresses this by combining:
+1. **Real-time mesh context** - Understanding the current state of the 3D scene
+2. **Reference knowledge** - Leveraging training data from models that understand common 3D object structures
+3. **Intelligent operation selection** - GPT choosing the best Blender operations to achieve desired effects
+4. **Multi-step reasoning** - Breaking complex requests into sequential operations
+
+### Models & Datasets
+
+**Speech-to-Text: faster-whisper (small model)**
+- **Why faster-whisper**: Faster inference than OpenAI's Whisper API, runs locally (privacy), no API costs for STT
+- **Why "small" model**: Balance between accuracy (~95% for clear speech) and speed (~200-500ms transcription). "tiny" is too inaccurate, "base/medium" adds latency without significant gains for English
+- **Language**: English-only for now (WHISPER_LANG="en") - can expand later
+- **Dataset**: Trained on Common Voice, LibriSpeech, and other public speech datasets
+- **Trade-off**: Local STT means no cloud dependency, but requires bundling the model (~500MB for small)
+
+**Natural Language Understanding: GPT-4o**
+- **Why GPT-4o**: 
+  - Superior reasoning for complex, multi-step commands
+  - Excellent at understanding context and intent
+  - Strong JSON generation (critical for our structured command format)
+  - Multimodal capabilities (future: can analyze viewport screenshots)
+  - Fast response time (~1-3s) compared to GPT-4 Turbo
+- **Why not GPT-3.5**: Less reliable for complex commands, weaker reasoning
+- **Why not Claude/Sonnet**: GPT-4o has better tool-use JSON formatting, more consistent output
+- **Why not local models (Ollama/Llama)**: Current local models lack the reasoning depth needed for complex 3D operations. Future: could use local model for simple commands, GPT-4o for Super Mode
+- **Temperature**: 0 (deterministic) - we need consistent, reliable command generation
+- **Dataset**: Trained on internet-scale data including code, technical documentation, and 3D modeling concepts
+
+**Future: Mesh Analysis & Reference Knowledge**
+- **Phase 2-3 will add**:
+  - Mesh geometry extraction (vertex positions, edge topology, face data)
+  - Shape analysis (detecting common patterns: cylinders, spheres, complex organic shapes)
+  - Reference knowledge base (common vertex patterns for objects like Echo Dot, phone, etc.)
+- **Why this matters**: GPT-4o has general knowledge about 3D objects, but doesn't know YOUR specific mesh. We need to feed it:
+  1. Current mesh state (vertices, edges, faces)
+  2. Target object context ("this should be an Echo Dot")
+  3. Desired transformation ("make it smoother")
+- **Training data considerations**: GPT-4o was trained on text/code, not raw mesh data. We bridge this by:
+  - Converting mesh to structured text descriptions
+  - Using GPT's understanding of geometric concepts
+  - Providing operation examples in prompts
+
+### Architecture Decisions
+
+**Hybrid Local + Cloud Approach**
+- **Local**: STT (faster-whisper), simple command parsing (regex rules), safety gate
+- **Cloud**: Complex NLU (GPT-4o), future mesh analysis (could be local with specialized model)
+- **Why**: Best of both worlds - fast, private for simple commands; powerful AI for complex tasks
+
+**Two-Tier Command Processing**
+1. **Normal Mode**: Fast path - local rules → GPT fallback (simple commands)
+2. **Super Mode**: Enhanced path - local rules → GPT with mesh context → complex operations
+- **Why separate modes**: Super Mode adds latency (mesh analysis, richer prompts). Users should opt-in for complex tasks.
+
+**RPC Bridge Architecture**
+- **Why XML-RPC**: Simple, stdlib-only, works inside Blender's Python environment
+- **Why not HTTP/REST**: More complex, requires additional dependencies
+- **Why not WebSocket**: Overkill for request/response pattern, adds complexity
+- **Safety Gate**: Whitelist approach - only safe operators allowed. Prevents dangerous operations (file deletion, addon disabling, etc.)
+
+**Undo Grouping Strategy**
+- **Problem**: Multiple Blender operations from one voice command should be one undo step
+- **Solution**: `bpy.ops.ed.undo_push(message="Voice Command")` after each command batch
+- **Why**: User expects "Ctrl+Z" to undo their voice command, not individual operations
+
+### Why Not Alternative Approaches?
+
+**Why not pure local models?**
+- Current local LLMs (Llama 3, Mistral) lack the reasoning depth for complex 3D operations
+- Future: Could use local model for simple commands, GPT-4o for Super Mode (hybrid)
+
+**Why not specialized 3D AI models?**
+- No general-purpose 3D modeling AI exists yet (Shape-E, Point-E are generation-only)
+- GPT-4o's general reasoning + our mesh context bridge is more flexible
+
+**Why not rule-based system?**
+- Rules work for simple commands ("add cube") but don't scale to complex requests
+- GPT provides flexibility and natural language understanding
+
+**Why not agentic workflow (autonomous agent)?**
+- Too risky for Blender operations (could make unintended changes)
+- User should maintain control - voice commands are explicit instructions, not autonomous agents
+
+### Future Considerations
+
+**Phase 2-5 will explore**:
+- Mesh geometry extraction and analysis
+- Reference knowledge integration (common object patterns)
+- Edit mode operations (loop cuts, subdivide, vertex manipulation)
+- Modifier-based operations (subdivision surface, bevel, etc.)
+- Multi-object operations (coordinated changes across scene)
+
+**Potential improvements**:
+- Local model fallback for simple Super Mode commands (reduce API costs)
+- Specialized mesh analysis model (trained on 3D geometry)
+- Viewport screenshot analysis (GPT-4o vision for visual feedback)
+- Learning from user corrections (fine-tuning on successful operations)
+
+The goal is to make Super Mode feel like working with an expert 3D artist who understands both your intent and the technical details of Blender operations.
