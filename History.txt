@@ -441,3 +441,193 @@ Super Mode addresses this by combining:
 - Learning from user corrections (fine-tuning on successful operations)
 
 The goal is to make Super Mode feel like working with an expert 3D artist who understands both your intent and the technical details of Blender operations.
+
+---
+
+## Intelligent Operation Selection: How It Works
+
+### Multi-Tier Selection Pipeline
+
+The system uses a cascading approach to select the best Blender operation for each voice command:
+
+**Tier 1: I/O Rules (Fastest - ~1ms)**
+- Handles file import/export commands
+- Pattern matching: "import [filepath]", "export [filepath]"
+- Direct mapping to Blender import operators (STL, PLY, FBX, OBJ, GLTF, USD)
+- Auto-enables required Blender add-ons if missing (e.g., `io_mesh_stl` for STL imports)
+
+**Tier 2: Local Rules (Fast - ~5-10ms)**
+- Regex-based pattern matching for common commands
+- Handles ~50+ common operations without API calls
+- Examples:
+  - "add cube" → `mesh.primitive_cube_add`
+  - "delete selected" → `object.delete`
+  - "select all" → `object.select_all(action="SELECT")`
+  - "move by 1 2 3" → `transform.translate(value=(1,2,3))`
+  - "scale up" → `transform.resize(value=(1.2,1.2,1.2))`
+- Supports word numbers ("add three cubes" → quantity=3)
+- Handles plural forms ("spheres" matches "sphere")
+- Multi-command parsing ("add cube and add sphere" → two operations)
+
+**Tier 3: GPT-4o Fallback (Slower - ~1-3s)**
+- Used when local rules don't match
+- GPT-4o analyzes natural language and selects appropriate Blender operations
+- Returns structured JSON: `{"op": "module.operator", "kwargs": {...}}`
+- Can return multiple operations as a JSON array for complex commands
+
+### How GPT-4o Selects Operations
+
+**System Prompt (Current Implementation)**
+```
+You are a Blender automation agent.
+Output ONLY raw JSON (no prose, no code fences).
+Each command must be of the form: {"op":"<module.op>","kwargs":{}}.
+If multiple steps are implied, output a JSON array of such dicts.
+Prefer creative operators (object/mesh/curve/transform/material/node/render).
+Never use file/quit/addon/script/image.save operators.
+```
+
+**User Prompt**
+```
+Instruction: [voice command transcript]
+Return JSON only.
+```
+
+**GPT's Decision Process:**
+1. **Intent Recognition**: Understands what the user wants to achieve
+   - "Make this smoother" → subdivision surface or bevel operations
+   - "Add detail to the edges" → edge loops or bevel
+   - "Create a rounded corner" → bevel or proportional editing
+
+2. **Operation Mapping**: Maps intent to Blender operators
+   - Uses GPT-4o's training knowledge of Blender's operator system
+   - Understands operator naming conventions (`mesh.primitive_cube_add`, `object.modifier_add`)
+   - Knows which operators are appropriate for different contexts
+
+3. **Parameter Extraction**: Extracts values from natural language
+   - "Move 2 meters up" → `transform.translate(value=(0,0,2))`
+   - "Rotate 45 degrees on X" → `transform.rotate(value=(0.785,0,0))` (radians)
+   - "Scale to 1.5" → `transform.resize(value=(1.5,1.5,1.5))`
+
+4. **Multi-Step Reasoning**: Breaks complex commands into sequences
+   - "Add a cube and move it up" → `[{"op":"mesh.primitive_cube_add"}, {"op":"transform.translate","kwargs":{"value":(0,0,1)}}]`
+   - "Create a sphere, scale it, and add a material" → array of 3 operations
+
+5. **Context Awareness** (Future - Phase 2-3):
+   - Will analyze current mesh state (vertex count, topology, modifiers)
+   - Will consider target object context ("this should be an Echo Dot")
+   - Will choose operations based on current Blender mode (Object/Edit/Sculpt)
+
+**Example GPT Selections:**
+- "Add a torus with major radius 2" → `{"op":"mesh.primitive_torus_add","kwargs":{"major_radius":2}}`
+- "Subdivide the selected mesh" → `{"op":"mesh.subdivide","kwargs":{}}`
+- "Add a bevel modifier" → `{"op":"object.modifier_add","kwargs":{"type":"BEVEL"}}`
+- "Delete all objects" → `{"op":"object.select_all","kwargs":{"action":"SELECT"}}, {"op":"object.delete"}`
+
+### Safety Gate Validation
+
+Before any operation executes, it passes through a safety gate:
+
+**Blacklist (Dangerous Operators - Always Blocked)**
+- `file.quit` - Quitting Blender
+- `wm.quit_blender` - Quitting Blender
+- `script.reload` - Reloading scripts
+- `preferences.addon_disable` - Disabling add-ons
+- `preferences.addon_remove` - Removing add-ons
+
+**Whitelist (Safe Operator Prefixes - Always Allowed)**
+- `mesh.*` - Mesh operations (add, edit, modify)
+- `object.*` - Object operations (select, delete, duplicate, transform)
+- `transform.*` - Transform operations (translate, rotate, scale)
+- `view3d.*` - Viewport operations (view_selected, frame_selected)
+- `import_scene.*` - Import operations (FBX, OBJ, GLTF, USD)
+- `wm.obj_import`, `wm.gltf_import`, `wm.usd_import` - Modern import operators
+
+**Default Behavior**
+- Operators not in blacklist are allowed (with warning)
+- This allows GPT to use creative operators (curves, materials, nodes) while blocking dangerous ones
+
+**File Path Validation**
+- Import operators validate file paths exist before execution
+- Prevents errors from invalid file paths
+
+### Operation Execution Flow
+
+1. **Voice Command Received** → Transcribed by faster-whisper
+2. **Command Parsing**:
+   - Try I/O rules → if match, execute and return
+   - Try local rules → if match, execute and return
+   - Try GPT-4o → if match, execute and return
+3. **Safety Gate Check** → Validate operator is safe
+4. **Add-on Auto-Enable** → Enable required import add-ons if needed
+5. **Queue Operation** → Add to `_TASKQ` (thread-safe queue)
+6. **Main Thread Execution** → Blender's timer (`bpy.app.timers`) drains queue
+7. **Undo Push** → After command batch completes, push undo point
+8. **Result** → Success/failure message returned to voice script
+
+### Super Mode Enhancements (Future Phases)
+
+**Phase 2: Context Functions**
+- `get_modeling_context()`: Returns current scene state (selected objects, active mode, modifiers)
+- `analyze_current_mesh()`: Extracts mesh geometry (vertex count, edge loops, face topology)
+- GPT will receive this context in the prompt, enabling smarter operation selection
+
+**Phase 3: Enhanced GPT Prompts**
+- System prompt will include:
+  - Current mesh analysis (vertex positions, topology patterns)
+  - Target object context ("building an Echo Dot")
+  - Available Blender operations for the current mode
+- GPT will choose operations based on:
+  - Current geometry state
+  - Desired outcome
+  - Best practices for achieving the effect
+
+**Phase 4: Complex Operation Executor**
+- GPT will select from ANY Blender operation (not just whitelisted prefixes)
+- Will choose the best approach for complex tasks:
+  - Modifiers vs direct mesh editing
+  - Loop cuts vs edge loops vs subdivision
+  - Transform operations vs proportional editing
+- Will chain multiple operations intelligently
+
+**Phase 5: Edit Mode Commands**
+- GPT will understand edit mode context
+- Will select appropriate edit mode operations:
+  - `mesh.loopcut` for adding edge loops
+  - `mesh.subdivide` for adding geometry
+  - `mesh.select_all` with different actions for vertex/edge/face selection
+- Will maintain selection state across operations
+
+### Why This Approach Works
+
+**Speed**: Local rules handle 80%+ of common commands instantly (no API latency)
+
+**Flexibility**: GPT handles complex, natural language commands that rules can't cover
+
+**Safety**: Safety gate prevents dangerous operations while allowing creative ones
+
+**Scalability**: Adding new operations is easy:
+- Simple commands → add to local rules
+- Complex commands → GPT handles automatically
+- Dangerous operations → add to blacklist
+
+**User Experience**: 
+- Fast response for common commands
+- Natural language understanding for complex requests
+- Consistent behavior (deterministic with temperature=0)
+
+### Current Limitations & Future Improvements
+
+**Limitations:**
+- GPT doesn't know current mesh state (Phase 2 will fix)
+- GPT doesn't know Blender mode (Object/Edit/Sculpt) - Phase 5 will fix
+- GPT may choose suboptimal operations for complex tasks - Phase 3-4 will improve
+- No learning from user corrections - future improvement
+
+**Improvements Coming:**
+- Mesh context in GPT prompts (Phase 2-3)
+- Mode-aware operation selection (Phase 5)
+- Operation quality scoring (future)
+- User feedback loop for operation selection (future)
+
+The intelligent operation selection system balances speed, safety, and flexibility to provide a natural voice interface to Blender while maintaining control and preventing dangerous operations.
