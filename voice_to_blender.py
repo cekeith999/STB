@@ -26,32 +26,33 @@ def _get_openai_api_key():
         return _CACHED_API_KEY
     
     # Try RPC (from Blender preferences) first - this is the preferred source
-    try:
-        key = rpc.get_openai_api_key()
-        if VERBOSE_DEBUG:
-            print(f"[DEBUG] RPC returned key: length={len(key) if key else 0}, preview={key[:15] if key and len(key) > 15 else (key if key else 'None')}...")
-        
-        if key and key.strip():
-            key = key.strip()
-            # Remove any hidden whitespace characters (newlines, tabs, etc.)
-            key = ''.join(key.split())
-            # Remove non-printable characters
-            key = ''.join(c for c in key if c.isprintable())
-            if key:
-                # Cache the key
-                _CACHED_API_KEY = key
-                _CACHE_VALID = True
-                if VERBOSE_DEBUG:
-                    print(f"[DEBUG] ✅ Cached RPC key from preferences: length={len(key)}, preview={key[:15]}...")
-                return key
-        elif VERBOSE_DEBUG:
-            print(f"[DEBUG] RPC returned empty or invalid key")
-    except Exception as e:
-        if VERBOSE_DEBUG:
-            print(f"[DEBUG] RPC call failed: {e}")
-            import traceback
-            traceback.print_exc()
-        pass  # RPC not available or method doesn't exist
+    if rpc is not None:
+        try:
+            key = rpc.get_openai_api_key()
+            if VERBOSE_DEBUG:
+                print(f"[DEBUG] RPC returned key: length={len(key) if key else 0}, preview={key[:15] if key and len(key) > 15 else (key if key else 'None')}...")
+            
+            if key and key.strip():
+                key = key.strip()
+                # Remove any hidden whitespace characters (newlines, tabs, etc.)
+                key = ''.join(key.split())
+                # Remove non-printable characters
+                key = ''.join(c for c in key if c.isprintable())
+                if key:
+                    # Cache the key
+                    _CACHED_API_KEY = key
+                    _CACHE_VALID = True
+                    if VERBOSE_DEBUG:
+                        print(f"[DEBUG] ✅ Cached RPC key from preferences: length={len(key)}, preview={key[:15]}...")
+                    return key
+            elif VERBOSE_DEBUG:
+                print(f"[DEBUG] RPC returned empty or invalid key")
+        except Exception as e:
+            if VERBOSE_DEBUG:
+                print(f"[DEBUG] RPC call failed: {e}")
+                import traceback
+                traceback.print_exc()
+            pass  # RPC not available or method doesn't exist
     
     # Fall back to environment variable only if RPC/preferences key is not available
     env_key = os.getenv("OPENAI_API_KEY", "").strip()
@@ -103,12 +104,17 @@ RPC_URL = "http://127.0.0.1:8765/RPC2"
 ENABLE_GPT_FALLBACK = True   # GPT-4o fallback for natural language understanding
 VERBOSE_DEBUG = False        # debug prints for import matcher (set True for debugging)
 
+# Super Mode state (fetched from Blender)
+SUPER_MODE_ENABLED = False
+SUPER_MODE_TARGET = ""
+
 # Mic settings
 SAMPLE_RATE  = 16000
 BLOCK_SEC    = 0.2
-SILENCE_RMS  = 500
-SILENCE_HOLD = 0.8
-MIN_SPOKEN   = 0.7
+SILENCE_RMS  = 300  # Silence threshold (lower = more sensitive to silence)
+SILENCE_HOLD = 0.6  # Silence duration required to stop (using consecutive blocks)
+MIN_SPOKEN   = 0.3  # Minimum speech time before silence can trigger stop
+MAX_RECORD_SEC = 10.0  # Maximum recording time to prevent infinite loops
 
 def _log_paths_once():
     print("[Voice] Python:", sys.executable)
@@ -180,19 +186,55 @@ def record_until_silence():
     print("🎙️ Speak command…")
     frames, spoken_sec, silence_sec = [], 0.0, 0.0
     block_samples = int(BLOCK_SEC * SAMPLE_RATE)
-    with sd.InputStream(samplerate=SAMPLE_RATE, channels=1, dtype='int16') as stream:
+    consecutive_silence_blocks = 0
+    max_silence_blocks = int(SILENCE_HOLD / BLOCK_SEC)  # How many blocks of silence needed
+    
+    # Get the current default input device (respects system settings when headphones are plugged in)
+    # Query each time to pick up device changes
+    default_input = None
+    try:
+        # sd.default.device[0] is the default input device index
+        # Query each time to ensure we use the current system default
+        default_input = sd.default.device[0]
+        if VERBOSE_DEBUG and default_input is not None:
+            device_info = sd.query_devices(default_input)
+            _dbg(f"Using input device: {device_info.get('name', 'unknown')} (index {default_input})")
+    except Exception:
+        # If query fails, None will use the system default automatically
+        if VERBOSE_DEBUG:
+            _dbg("Using system default input device (device query failed)")
+    
+    with sd.InputStream(device=default_input, samplerate=SAMPLE_RATE, channels=1, dtype='int16') as stream:
         while True:
             block, _ = stream.read(block_samples)
             block = block.reshape(-1)
             frames.append(block)
             level = rms_int16(block)
+            total_time = len(frames) * BLOCK_SEC
+            
             if level < SILENCE_RMS:
                 silence_sec += BLOCK_SEC
+                consecutive_silence_blocks += 1
             else:
                 spoken_sec += BLOCK_SEC
-                silence_sec = 0.0
-            if silence_sec >= SILENCE_HOLD and spoken_sec >= MIN_SPOKEN:
+                silence_sec = 0.0  # Reset silence counter when speech detected
+                consecutive_silence_blocks = 0  # Reset consecutive silence counter
+            
+            # Stop if we have enough consecutive silence blocks after sufficient speech
+            # This is more reliable than cumulative silence time
+            if consecutive_silence_blocks >= max_silence_blocks and spoken_sec >= MIN_SPOKEN:
+                if VERBOSE_DEBUG:
+                    print(f"✅ Stopping: {spoken_sec:.2f}s speech, {silence_sec:.2f}s silence, {consecutive_silence_blocks} consecutive silent blocks")
                 break
+            
+            # Safety: stop if we've recorded more than MAX_RECORD_SEC total (prevents infinite loops)
+            if total_time > MAX_RECORD_SEC:
+                print(f"⚠️ Recording timeout ({MAX_RECORD_SEC}s) - stopping anyway (had {spoken_sec:.2f}s speech)")
+                break
+            
+            # Debug output every 2 seconds if verbose
+            if VERBOSE_DEBUG and len(frames) % 10 == 0:  # Every 2 seconds (10 blocks * 0.2s)
+                print(f"[DEBUG] Time: {total_time:.1f}s, Speech: {spoken_sec:.2f}s, Silence: {silence_sec:.2f}s, Level: {level}, Consecutive silent: {consecutive_silence_blocks}")
     audio = np.concatenate(frames, axis=0).astype(np.int16)
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     tmpdir = os.path.join(tempfile.gettempdir(), "voice_clips")
@@ -794,7 +836,183 @@ def try_local_rules(text: str):
 
 # ------------------ GPT Fallback ------------------
 
-def gpt_to_json(transcript: str):
+def _get_reference_knowledge(target_object: str):
+    """Get reference knowledge about common 3D objects (Phase 3)."""
+    if not target_object:
+        return None
+    
+    target_lower = target_object.lower()
+    
+    # Reference knowledge base for common objects
+    knowledge = {
+        "echo dot": {
+            "description": "Amazon Echo Dot - a small cylindrical smart speaker",
+            "typical_geometry": {
+                "shape": "cylinder with rounded top and bottom",
+                "proportions": "roughly 1:1:1 (height ≈ diameter)",
+                "features": [
+                    "Circular top face with button/light",
+                    "Cylindrical body with fabric mesh texture",
+                    "Rounded edges (beveled)",
+                    "Bottom with rubber base",
+                ],
+            },
+            "modeling_approach": [
+                "Start with cylinder primitive",
+                "Add subdivision surface for smoothness",
+                "Bevel edges for rounded appearance",
+                "Use loop cuts for button/light details",
+                "Consider fabric texture with displacement or normal map",
+            ],
+            "common_operations": [
+                "mesh.primitive_cylinder_add",
+                "object.modifier_add(type='SUBSURF')",
+                "mesh.bevel",
+                "mesh.loopcut",
+                "transform.resize",
+            ],
+        },
+        "phone": {
+            "description": "Smartphone - rectangular device with rounded corners",
+            "typical_geometry": {
+                "shape": "rectangular prism with rounded corners",
+                "proportions": "roughly 16:9 aspect ratio, thin depth",
+                "features": [
+                    "Large flat screen face",
+                    "Rounded corners (fillet)",
+                    "Thin bezel around screen",
+                    "Camera bump on back",
+                    "Button cutouts",
+                ],
+            },
+            "modeling_approach": [
+                "Start with cube or plane",
+                "Scale to phone proportions",
+                "Bevel corners for rounded edges",
+                "Add inset for screen bezel",
+                "Extrude for camera bump",
+            ],
+            "common_operations": [
+                "mesh.primitive_cube_add",
+                "mesh.inset_faces",
+                "mesh.extrude_faces",
+                "mesh.bevel",
+                "transform.resize",
+            ],
+        },
+        "sphere": {
+            "description": "Sphere - perfectly round object",
+            "typical_geometry": {
+                "shape": "perfect sphere",
+                "features": ["Uniform curvature", "No edges"],
+            },
+            "modeling_approach": [
+                "Use UV sphere or icosphere primitive",
+                "Subdivision surface for smoothness",
+            ],
+            "common_operations": [
+                "mesh.primitive_uv_sphere_add",
+                "mesh.primitive_ico_sphere_add",
+                "object.modifier_add(type='SUBSURF')",
+            ],
+        },
+    }
+    
+    # Fuzzy match target object
+    for key, info in knowledge.items():
+        if key in target_lower or target_lower in key:
+            return info
+    
+    return None
+
+def _get_mode_aware_operations(current_mode: str, has_mesh: bool):
+    """Get recommended operations based on current Blender mode (Phase 3)."""
+    operations = {
+        "OBJECT": [
+            "object.select_all",
+            "object.delete",
+            "object.duplicate_move",
+            "transform.translate",
+            "transform.rotate",
+            "transform.resize",
+            "object.modifier_add",
+            "mesh.primitive_*_add",
+        ],
+        "EDIT": [
+            "mesh.select_all",
+            "mesh.delete",
+            "mesh.extrude_region",
+            "mesh.inset_faces",
+            "mesh.bevel",
+            "mesh.loopcut",
+            "mesh.subdivide",
+            "mesh.merge",
+            "mesh.separate",
+            "mesh.select_by_type",
+        ],
+        "SCULPT": [
+            "sculpt.sculptmode_toggle",
+            "paint.brush_select",
+            # Sculpt operations are typically brush-based, not operator-based
+        ],
+    }
+    
+    mode_ops = operations.get(current_mode, operations["OBJECT"])
+    
+    if not has_mesh:
+        # Filter out mesh-specific operations if no mesh
+        mode_ops = [op for op in mode_ops if not op.startswith("mesh.")]
+    
+    return mode_ops
+
+def _get_best_practices_guidance(modeling_context, mesh_analysis, target_object):
+    """Generate best practices guidance based on context (Phase 3)."""
+    practices = []
+    
+    if modeling_context:
+        mode = modeling_context.get("current_mode", "OBJECT")
+        
+        if mode == "EDIT":
+            practices.append("In EDIT mode: Use mesh operations (extrude, bevel, loopcut) for topology changes")
+            practices.append("Maintain quad topology when possible for better subdivision")
+            practices.append("Use loop cuts to add detail without changing overall shape")
+        
+        if modeling_context.get("modifiers"):
+            mods = modeling_context["modifiers"]
+            if any(m.get("type") == "SUBSURF" for m in mods):
+                practices.append("Subdivision Surface active: Ensure clean topology with quads")
+                practices.append("Avoid n-gons (faces with >4 vertices) when using subdivision")
+    
+    if mesh_analysis and not mesh_analysis.get("error"):
+        ma = mesh_analysis
+        face_types = ma.get("face_topology", {}).get("face_types", {})
+        
+        n_gon_count = sum(count for v, count in face_types.items() if v > 4)
+        if n_gon_count > 0:
+            practices.append(f"Warning: {n_gon_count} n-gon(s) detected - consider converting to quads/triangles")
+        
+        if face_types.get(3, 0) > face_types.get(4, 0) * 2:
+            practices.append("Many triangles detected - consider retopology for better subdivision")
+    
+    if target_object:
+        ref_knowledge = _get_reference_knowledge(target_object)
+        if ref_knowledge:
+            practices.append(f"Reference: {ref_knowledge.get('description', '')}")
+            if ref_knowledge.get("modeling_approach"):
+                practices.append("Recommended approach: " + "; ".join(ref_knowledge["modeling_approach"][:3]))
+    
+    return practices
+
+def gpt_to_json(transcript: str, modeling_context=None, mesh_analysis=None, target_object=""):
+    """
+    Convert natural language transcript to Blender operation JSON.
+    
+    Args:
+        transcript: Voice command text
+        modeling_context: Current modeling context (from get_modeling_context RPC)
+        mesh_analysis: Current mesh analysis (from analyze_current_mesh RPC)
+        target_object: Target object name for Super Mode
+    """
     # allow disabling while debugging
     if not ENABLE_GPT_FALLBACK:
         return None
@@ -821,14 +1039,191 @@ def gpt_to_json(transcript: str):
         print("⚠️ openai package not available; pip install openai")
         return None
 
-    system = (
-        "You are a Blender automation agent.\n"
-        "Output ONLY raw JSON (no prose, no code fences).\n"
-        "Each command must be of the form:{\"op\":\"<module.op>\",\"kwargs\":{}}.\n"
-        "If multiple steps are implied, output a JSON array of such dicts.\n"
-        "Prefer creative operators (object/mesh/curve/transform/material/node/render).\n"
-        "Never use file/quit/addon/script/image.save operators."
-    )
+    # Build system prompt with context if available (Phase 2 + Phase 3)
+    system_parts = [
+        "You are a Blender automation agent with expert knowledge of 3D modeling workflows.",
+        "Output ONLY raw JSON (no prose, no code fences).",
+        "Each command must be of the form: {\"op\":\"<module.op>\",\"kwargs\":{}}.",
+        "If multiple steps are implied, output a JSON array of such dicts.",
+        "Prefer creative operators (object/mesh/curve/transform/material/node/render).",
+        "Never use file/quit/addon/script/image.save operators.",
+    ]
+    
+    # Phase 3: Get reference knowledge and best practices
+    ref_knowledge = _get_reference_knowledge(target_object) if target_object else None
+    current_mode = modeling_context.get("current_mode", "OBJECT") if modeling_context else "OBJECT"
+    has_mesh = mesh_analysis is not None and not mesh_analysis.get("error")
+    mode_ops = _get_mode_aware_operations(current_mode, has_mesh)
+    best_practices = _get_best_practices_guidance(modeling_context, mesh_analysis, target_object)
+    
+    # Add context information if available (Phase 2: Super Mode)
+    if modeling_context or mesh_analysis or target_object:
+        system_parts.append("\n--- Current Scene Context ---")
+        
+        if target_object:
+            system_parts.append(f"Target Object: {target_object} (this is what we're building/modifying)")
+            if ref_knowledge:
+                system_parts.append(f"Reference Knowledge: {ref_knowledge.get('description', '')}")
+        
+        if modeling_context and not modeling_context.get("error"):
+            ctx = modeling_context
+            system_parts.append(f"Current Mode: {ctx.get('current_mode', 'OBJECT')}")
+            
+            if ctx.get("active_object"):
+                ao = ctx["active_object"]
+                system_parts.append(f"Active Object: {ao.get('name')} (type: {ao.get('type')}, mode: {ao.get('mode')})")
+            
+            if ctx.get("selected_objects"):
+                sel_count = len(ctx["selected_objects"])
+                system_parts.append(f"Selected Objects: {sel_count} object(s)")
+                for obj in ctx["selected_objects"][:3]:  # Show first 3
+                    system_parts.append(f"  - {obj.get('name')} ({obj.get('type')})")
+            
+            if ctx.get("modifiers"):
+                mods = ctx["modifiers"]
+                system_parts.append(f"Modifiers on active object: {len(mods)}")
+                for mod in mods[:5]:  # Show first 5
+                    system_parts.append(f"  - {mod.get('name')} ({mod.get('type')})")
+        
+        if mesh_analysis and not mesh_analysis.get("error"):
+            ma = mesh_analysis
+            system_parts.append(f"\n--- Mesh Analysis ---")
+            system_parts.append(f"Object: {ma.get('object_name')}")
+            system_parts.append(f"Vertices: {ma.get('vertex_count')}, Edges: {ma.get('edge_count')}, Faces: {ma.get('face_count')}")
+            
+            if ma.get("bounds"):
+                bounds = ma["bounds"]
+                size = bounds.get("size", (0, 0, 0))
+                system_parts.append(f"Size: {size[0]:.2f} x {size[1]:.2f} x {size[2]:.2f}")
+            
+            if ma.get("face_topology", {}).get("face_types"):
+                face_types = ma["face_topology"]["face_types"]
+                face_desc = ", ".join([f"{count} {v}-gons" if v > 4 else f"{count} {'triangles' if v == 3 else 'quads'}" 
+                                      for v, count in sorted(face_types.items())])
+                system_parts.append(f"Face Types: {face_desc}")
+            
+            if ma.get("selection"):
+                sel = ma["selection"]
+                if sel.get("vertices") or sel.get("edges") or sel.get("faces"):
+                    sel_desc = []
+                    if sel.get("vertices"):
+                        sel_desc.append(f"{len(sel['vertices'])} vertices")
+                    if sel.get("edges"):
+                        sel_desc.append(f"{len(sel['edges'])} edges")
+                    if sel.get("faces"):
+                        sel_desc.append(f"{len(sel['faces'])} faces")
+                    if sel_desc:
+                        system_parts.append(f"Selected: {', '.join(sel_desc)}")
+            
+            if ma.get("edge_loops"):
+                loops = ma["edge_loops"]
+                system_parts.append(f"Edge Loops: {len(loops)} potential loop(s) detected")
+        
+        # Phase 3: Add mode-aware operation suggestions
+        system_parts.append(f"\n--- Recommended Operations (Mode: {current_mode}) ---")
+        system_parts.append("Available operations for current mode:")
+        for op in mode_ops[:10]:  # Show first 10
+            system_parts.append(f"  - {op}")
+        
+        # Phase 3: Add reference knowledge details
+        if ref_knowledge:
+            system_parts.append(f"\n--- Reference Knowledge: {target_object} ---")
+            if ref_knowledge.get("typical_geometry"):
+                geom = ref_knowledge["typical_geometry"]
+                system_parts.append(f"Typical Shape: {geom.get('shape', '')}")
+                if geom.get("proportions"):
+                    system_parts.append(f"Proportions: {geom.get('proportions', '')}")
+                if geom.get("features"):
+                    system_parts.append("Key Features:")
+                    for feature in geom["features"][:5]:
+                        system_parts.append(f"  - {feature}")
+            
+            if ref_knowledge.get("common_operations"):
+                system_parts.append("Common Operations for this object type:")
+                for op in ref_knowledge["common_operations"][:8]:
+                    system_parts.append(f"  - {op}")
+        
+        # Phase 3: Add best practices guidance
+        if best_practices:
+            system_parts.append(f"\n--- Best Practices & Guidance ---")
+            for practice in best_practices:
+                system_parts.append(f"• {practice}")
+        
+        # Phase 3: Operation selection guidance
+        system_parts.append(f"\n--- Operation Selection Guidelines ---")
+        system_parts.append("Choose operations based on:")
+        system_parts.append("1. Current mode and available operations")
+        system_parts.append("2. Desired outcome and best practices")
+        system_parts.append("3. Current mesh topology and geometry state")
+        if ref_knowledge:
+            system_parts.append("4. Reference knowledge for target object type")
+        system_parts.append("5. Maintain clean topology (prefer quads, avoid n-gons when using subdivision)")
+        if current_mode == "EDIT":
+            system_parts.append("6. In EDIT mode: Use mesh operations for topology changes")
+        system_parts.append("7. Chain multiple operations if needed to achieve the desired effect")
+        
+        # Material operations guidance
+        system_parts.append(f"\n--- Material Operations ---")
+        system_parts.append("CRITICAL: Materials must be CREATED with proper name AND properties set. Use execute RPC with Python code.")
+        system_parts.append("IMPORTANT: Each execute call runs in separate scope. Combine ALL operations in ONE execute call.")
+        system_parts.append("MANDATORY: When creating glass material, you MUST:")
+        system_parts.append("  1. Name it exactly 'Glass' (not 'Material' or anything else)")
+        system_parts.append("  2. Enable use_nodes = True")
+        system_parts.append("  3. Get the Principled BSDF node")
+        system_parts.append("  4. Set Transmission = 1.0 (fully transparent)")
+        system_parts.append("  5. Set Roughness = 0.0 (smooth)")
+        system_parts.append("  6. Set IOR = 1.45 (glass index of refraction)")
+        system_parts.append("  7. Assign to object(s)")
+        system_parts.append("")
+        system_parts.append("EXACT CODE for glass material (copy this pattern):")
+        system_parts.append("import bpy")
+        system_parts.append("mat = bpy.data.materials.new(name='Glass')")
+        system_parts.append("mat.use_nodes = True")
+        system_parts.append("bsdf = mat.node_tree.nodes.get('Principled BSDF')")
+        system_parts.append("if bsdf:")
+        system_parts.append("    # Set transmission (glass transparency)")
+        system_parts.append("    if 'Transmission Weight' in bsdf.inputs:")
+        system_parts.append("        bsdf.inputs['Transmission Weight'].default_value = 1.0")
+        system_parts.append("    elif 'Transmission' in bsdf.inputs:")
+        system_parts.append("        bsdf.inputs['Transmission'].default_value = 1.0")
+        system_parts.append("    # Set roughness (smooth)")
+        system_parts.append("    bsdf.inputs['Roughness'].default_value = 0.0")
+        system_parts.append("    # Set IOR (glass index of refraction)")
+        system_parts.append("    if 'IOR' in bsdf.inputs:")
+        system_parts.append("        bsdf.inputs['IOR'].default_value = 1.45")
+        system_parts.append("    # Make base color white/light")
+        system_parts.append("    if 'Base Color' in bsdf.inputs:")
+        system_parts.append("        bsdf.inputs['Base Color'].default_value = (1.0, 1.0, 1.0, 1.0)")
+        system_parts.append("for obj in bpy.context.selected_objects:")
+        system_parts.append("    if obj.type == 'MESH':")
+        system_parts.append("        if not obj.data.materials:")
+        system_parts.append("            obj.data.materials.append(mat)")
+        system_parts.append("        else:")
+        system_parts.append("            obj.data.materials[0] = mat")
+        system_parts.append("")
+        system_parts.append("JSON format for execute call (use \\n for newlines):")
+        system_parts.append("{\"op\":\"execute\",\"kwargs\":{\"code\":\"import bpy\\nmat = bpy.data.materials.new(name='Glass')\\nmat.use_nodes = True\\nbsdf = mat.node_tree.nodes.get('Principled BSDF')\\nif bsdf:\\n    if 'Transmission Weight' in bsdf.inputs:\\n        bsdf.inputs['Transmission Weight'].default_value = 1.0\\n    elif 'Transmission' in bsdf.inputs:\\n        bsdf.inputs['Transmission'].default_value = 1.0\\n    bsdf.inputs['Roughness'].default_value = 0.0\\n    if 'IOR' in bsdf.inputs:\\n        bsdf.inputs['IOR'].default_value = 1.45\\n    if 'Base Color' in bsdf.inputs:\\n        bsdf.inputs['Base Color'].default_value = (1.0, 1.0, 1.0, 1.0)\\nfor obj in bpy.context.selected_objects:\\n    if obj.type == 'MESH':\\n        if not obj.data.materials:\\n            obj.data.materials.append(mat)\\n        else:\\n            obj.data.materials[0] = mat\"}}")
+        system_parts.append("")
+        system_parts.append("VERIFY: The material MUST be named 'Glass' and have all properties set")
+        system_parts.append("CRITICAL: Always check if input exists before setting: if 'InputName' in bsdf.inputs:")
+        system_parts.append("DO NOT: Create material without setting properties")
+        system_parts.append("DO NOT: Use generic names like 'Material'")
+        system_parts.append("DO NOT: Skip any of the BSDF property settings")
+        system_parts.append("DO NOT: Access inputs without checking if they exist first")
+        
+        # Reference resolution guidance
+        system_parts.append(f"\n--- Reference Resolution ---")
+        system_parts.append("When command contains references (them, it, these, those, they, all of them):")
+        system_parts.append("1. 'them'/'they'/'all of them' refers to objects created/mentioned earlier in the command")
+        system_parts.append("2. 'it' refers to the active/selected object or last created object")
+        system_parts.append("3. Resolve references by tracking what was created/modified in previous steps")
+        system_parts.append("4. Example: 'add 3 cubes and give them all glass materials' means:")
+        system_parts.append("   - Step 1: Create 3 cubes (mesh.primitive_cube_add, 3 times)")
+        system_parts.append("   - Step 2: Create glass material (material.new)")
+        system_parts.append("   - Step 3: Assign material to all 3 cubes (loop through objects, material.assign)")
+        system_parts.append("5. Always output ALL steps needed, including material creation AND assignment")
+    
+    system = "\n".join(system_parts)
     user = f"Instruction: {transcript}\nReturn JSON only."
 
     print("🧠 GPT mapping…")
@@ -923,6 +1318,8 @@ def send_to_blender(cmd: dict):
     op = cmd.get("op"); kwargs = cmd.get("kwargs", {}) or {}
     if not op or not isinstance(op, str):
         print("⚠️ Missing/invalid 'op' in command:", cmd); sys.stdout.flush(); return
+    if rpc is None:
+        print("❌ RPC not available - cannot send command"); sys.stdout.flush(); return
     try:
         print(f"➡️ enqueue {op} {kwargs}"); sys.stdout.flush()
         # NOTE: If your bridge exposes a different method name, swap below accordingly,
@@ -937,71 +1334,256 @@ def send_to_blender(cmd: dict):
 # ------------------ Main loop ------------------
 
 if __name__ == "__main__":
-    print("Voice → Whisper → (IO rules / Local rules / GPT) → Blender via Safety Gate (Ctrl+C to exit)")
     try:
-        print("ping:", rpc.ping())
-        # Get OpenAI API key from RPC (Blender preferences) - this will cache it
-        api_key = _get_openai_api_key()
-        if api_key:
-            # Show first few chars for verification (keys start with "sk-")
-            key_preview = api_key[:7] + "..." if len(api_key) > 7 else api_key
-            print(f"✅ OpenAI API key loaded and cached ({key_preview})")
-            # Validate format
-            if not api_key.startswith("sk-") and not api_key.startswith("sk-proj-"):
-                print(f"⚠️ Warning: API key format looks unusual (should start with 'sk-' or 'sk-proj-')")
-        elif ENABLE_GPT_FALLBACK:
-            print("⚠️ OpenAI API key not set in preferences or environment; GPT fallback disabled")
-    except Exception as e:
-        print("⚠️ Could not reach Blender RPC at", RPC_URL, ":", e)
-        # Try environment variable as fallback
-        api_key = _get_openai_api_key()  # Will try env var
-        if api_key and ENABLE_GPT_FALLBACK:
-            print("✅ Using OpenAI API key from environment variable (cached)")
-
-    while True:
+        print("Voice → Whisper → (IO rules / Local rules / GPT) → Blender via Safety Gate (Ctrl+C to exit)")
+        print("=" * 70)
+        
+        # Test imports first
         try:
-            wav = record_until_silence()
-            text = transcribe(wav)
-            if not text:
-                print("⚠️ No transcription."); sys.stdout.flush()
-                continue
-            print("📝 Transcript ->", text); sys.stdout.flush()
-
-            # Split into multiple commands if needed
-            command_parts = _split_multiple_commands(text)
-            
-            all_commands = []
-            for part in command_parts:
-                # import/export first
-                cmd = try_io_rules(part)
-                
-                # Local rules
-                cmd = cmd or try_local_rules(part)
-                
-                # GPT fallback (currently disabled via flag)
-                cmd = cmd or gpt_to_json(part)
-                
-                if cmd:
-                    if isinstance(cmd, list):
-                        all_commands.extend(cmd)
-                    else:
-                        all_commands.append(cmd)
-            
-            if all_commands:
-                for single in all_commands:
-                    send_to_blender(single)
-                    time.sleep(0.01)  # Small delay between commands (reduced from 0.05)
-            else:
-                print("🤷 No command derived for:", text); sys.stdout.flush()
-
-            time.sleep(0.05)  # Reduced from 0.2 for faster response
-
-        except KeyboardInterrupt:
-            print("\nBye.")
-            sys.exit(0)
+            import numpy as np
+            import sounddevice as sd
+            print("✅ Imports OK")
+        except ImportError as e:
+            print(f"❌ Import error: {e}")
+            print("Please install: pip install numpy sounddevice")
+            input("\nPress Enter to exit...")
+            sys.exit(1)
+        
+        # Test RPC connection
+        if rpc is None:
+            print(f"❌ RPC proxy not created")
+            print(f"   Make sure Blender RPC server is running on {RPC_URL}")
+        else:
+            try:
+                ping_result = rpc.ping()
+                print(f"✅ RPC connection OK: {ping_result}")
+            except Exception as e:
+                print(f"❌ RPC connection failed: {e}")
+                print(f"   Make sure Blender RPC server is running on {RPC_URL}")
+                print("   The script will continue but commands won't work until RPC is available.")
+                traceback.print_exc()
+        
+        # Get OpenAI API key from RPC (Blender preferences) - this will cache it
+        try:
+            api_key = _get_openai_api_key()
+            if api_key:
+                # Show first few chars for verification (keys start with "sk-")
+                key_preview = api_key[:7] + "..." if len(api_key) > 7 else api_key
+                print(f"✅ OpenAI API key loaded and cached ({key_preview})")
+                # Validate format
+                if not api_key.startswith("sk-") and not api_key.startswith("sk-proj-"):
+                    print(f"⚠️ Warning: API key format looks unusual (should start with 'sk-' or 'sk-proj-')")
+            elif ENABLE_GPT_FALLBACK:
+                print("⚠️ OpenAI API key not set in preferences or environment; GPT fallback disabled")
         except Exception as e:
-            print("💥 Loop error:", e)
-            traceback.print_exc()
-            # Don’t die; keep the panel/process alive
-            time.sleep(0.1)  # Reduced from 0.3 for faster response
-            continue
+            print("⚠️ Could not get OpenAI API key:", e)
+            # Try environment variable as fallback
+            try:
+                api_key = _get_openai_api_key()  # Will try env var
+                if api_key and ENABLE_GPT_FALLBACK:
+                    print("✅ Using OpenAI API key from environment variable (cached)")
+            except Exception:
+                pass
+
+        while True:
+            try:
+                # Check if voice listening is enabled via RPC (quick check before recording)
+                listening_enabled = True
+                if rpc is not None:
+                    try:
+                        state = rpc.get_voice_listening_state()
+                        listening_enabled = state.get("enabled", True)
+                    except Exception:
+                        # If RPC call fails, assume listening is enabled
+                        listening_enabled = True
+                
+                if not listening_enabled:
+                    # Listening is paused, check more frequently for responsive toggling
+                    time.sleep(0.1)
+                    continue
+                
+                wav = record_until_silence()
+                
+                # Check listening state AGAIN after recording (user might have toggled during recording)
+                listening_enabled = True
+                if rpc is not None:
+                    try:
+                        state = rpc.get_voice_listening_state()
+                        listening_enabled = state.get("enabled", True)
+                    except Exception:
+                        listening_enabled = True
+                
+                if not listening_enabled:
+                    # Listening was disabled during recording, skip processing
+                    print("⏸️ Listening disabled - skipping audio processing"); sys.stdout.flush()
+                    continue
+                
+                text = transcribe(wav)
+                if not text:
+                    print("⚠️ No transcription."); sys.stdout.flush()
+                    continue
+                print("📝 Transcript ->", text); sys.stdout.flush()
+
+                # Mark start of new voice command (pushes undo point)
+                if rpc is not None:
+                    try:
+                        rpc.start_voice_command()
+                    except Exception:
+                        pass  # Ignore if RPC doesn't support it yet
+                    
+                    # Check super mode state
+                    try:
+                        super_state = rpc.get_super_mode_state()
+                        SUPER_MODE_ENABLED = super_state.get("enabled", False)
+                        SUPER_MODE_TARGET = super_state.get("target_object", "")
+                        if SUPER_MODE_ENABLED and SUPER_MODE_TARGET:
+                            print(f"⚡ Super Mode: Building {SUPER_MODE_TARGET}")
+                    except Exception:
+                        SUPER_MODE_ENABLED = False
+                        SUPER_MODE_TARGET = ""
+                else:
+                    SUPER_MODE_ENABLED = False
+                    SUPER_MODE_TARGET = ""
+
+                # Check if command contains references (them, it, these, those, they)
+                # If so, send full command to GPT for better context understanding
+                has_references = bool(re.search(r'\b(them|it|these|those|they|all of them|each of them)\b', text, re.IGNORECASE))
+                
+                # Split into multiple commands if needed
+                command_parts = _split_multiple_commands(text)
+                
+                all_commands = []
+                
+                # If command has references, send full original text to GPT for better understanding
+                if has_references and ENABLE_GPT_FALLBACK:
+                    # Try local rules first on individual parts
+                    local_cmds = []
+                    for part in command_parts:
+                        cmd = try_io_rules(part)
+                        cmd = cmd or try_local_rules(part)
+                        if cmd:
+                            if isinstance(cmd, list):
+                                local_cmds.extend(cmd)
+                            else:
+                                local_cmds.append(cmd)
+                    
+                    # If we got some local matches but not all, or if we need GPT for references
+                    # Send full command to GPT with context about what was already done
+                    if len(local_cmds) < len(command_parts) or has_references:
+                        # Fetch context from Blender
+                        modeling_context = None
+                        mesh_analysis = None
+                        
+                        try:
+                            if rpc is not None:
+                                modeling_context = rpc.get_modeling_context()
+                                if modeling_context and modeling_context.get("active_object"):
+                                    ao = modeling_context["active_object"]
+                                    if ao.get("type") == "MESH":
+                                        mesh_analysis = rpc.analyze_current_mesh()
+                        except Exception as e:
+                            if VERBOSE_DEBUG:
+                                print(f"[DEBUG] Error fetching context: {e}")
+                        
+                        # Send FULL original command to GPT for reference resolution
+                        gpt_cmd = gpt_to_json(text,  # Full original text, not split parts
+                                            modeling_context=modeling_context,
+                                            mesh_analysis=mesh_analysis,
+                                            target_object=SUPER_MODE_TARGET)
+                        
+                        if gpt_cmd:
+                            if isinstance(gpt_cmd, list):
+                                all_commands.extend(gpt_cmd)
+                            else:
+                                all_commands.append(gpt_cmd)
+                        else:
+                            # Fallback: use local commands we found
+                            all_commands.extend(local_cmds)
+                    else:
+                        # All parts matched locally
+                        all_commands.extend(local_cmds)
+                else:
+                    # No references, process parts individually
+                    for part in command_parts:
+                        # Route based on mode
+                        if SUPER_MODE_ENABLED:
+                            # Super Mode: Try local rules first, then enhanced GPT with context
+                            cmd = try_io_rules(part)
+                            cmd = cmd or try_local_rules(part)
+                            
+                            # If no local match, use GPT with super mode context (Phase 2)
+                            if not cmd and ENABLE_GPT_FALLBACK:
+                                # Fetch context from Blender
+                                modeling_context = None
+                                mesh_analysis = None
+                                
+                                try:
+                                    if rpc is not None:
+                                        modeling_context = rpc.get_modeling_context()
+                                        # Only analyze mesh if we have an active mesh object
+                                        if modeling_context and modeling_context.get("active_object"):
+                                            ao = modeling_context["active_object"]
+                                            if ao.get("type") == "MESH":
+                                                mesh_analysis = rpc.analyze_current_mesh()
+                                except Exception as e:
+                                    if VERBOSE_DEBUG:
+                                        print(f"[DEBUG] Error fetching context: {e}")
+                                    # Continue without context if fetch fails
+                                
+                                cmd = gpt_to_json(part, 
+                                                modeling_context=modeling_context,
+                                                mesh_analysis=mesh_analysis,
+                                                target_object=SUPER_MODE_TARGET)
+                        else:
+                            # Normal Mode: Fast path
+                            cmd = try_io_rules(part)
+                            cmd = cmd or try_local_rules(part)
+                            cmd = cmd or gpt_to_json(part)
+                        
+                        if cmd:
+                            if isinstance(cmd, list):
+                                all_commands.extend(cmd)
+                            else:
+                                all_commands.append(cmd)
+                
+                if all_commands:
+                    # Final check: ensure listening is still enabled before sending commands
+                    listening_enabled = True
+                    if rpc is not None:
+                        try:
+                            state = rpc.get_voice_listening_state()
+                            listening_enabled = state.get("enabled", True)
+                        except Exception:
+                            listening_enabled = True
+                    
+                    if not listening_enabled:
+                        print("⏸️ Listening disabled - skipping command execution"); sys.stdout.flush()
+                    else:
+                        for single in all_commands:
+                            send_to_blender(single)
+                            time.sleep(0.01)  # Small delay between commands (reduced from 0.05)
+                else:
+                    print("🤷 No command derived for:", text); sys.stdout.flush()
+
+                time.sleep(0.05)  # Reduced from 0.2 for faster response
+
+            except KeyboardInterrupt:
+                print("\nBye.")
+                sys.exit(0)
+            except Exception as e:
+                print("💥 Loop error:", e)
+                traceback.print_exc()
+                # Don't die; keep the panel/process alive
+                time.sleep(0.1)  # Reduced from 0.3 for faster response
+                continue
+    except Exception as e:
+        print("\n" + "=" * 70)
+        print("❌ FATAL ERROR - Script crashed!")
+        print(f"Error: {e}")
+        print("\nFull traceback:")
+        traceback.print_exc()
+        print("\n" + "=" * 70)
+        print("This window will close in 10 seconds...")
+        print("(Check the error above to diagnose the issue)")
+        time.sleep(10)
+        sys.exit(1)

@@ -16,6 +16,7 @@ import socket
 import time
 import subprocess
 import shutil
+import bmesh
 from xmlrpc.server import SimpleXMLRPCServer, SimpleXMLRPCRequestHandler
 from bpy.props import StringProperty, EnumProperty
 from bpy.types import AddonPreferences, Operator, Panel
@@ -29,10 +30,12 @@ _SERVER_THREAD = None
 _SERVER = None
 _SERVER_RUNNING = False
 _TASKQ = queue.Queue()
+_NEED_UNDO_PUSH = False  # Flag to track when to push undo point for voice commands
 
 # ───────── Voice Process State ─────────
 _VOICE_POPEN = None
 _VOICE_RUNNING = False
+_VOICE_LISTENING_ENABLED = True  # Toggle for voice listening (Alt+F)
 DEFAULT_VOICE_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "voice_to_blender.py")
 
 # ───────── Preferences (single class) ─────────
@@ -108,6 +111,13 @@ class STB_AddonPreferences(AddonPreferences):
         default="",
         maxlen=200,
     )
+    
+    # Super Mode settings
+    super_mode_target_object: StringProperty(
+        name="Target Object",
+        description="What are you building? (e.g., 'Echo Dot', 'Coffee Mug', 'Character Head')",
+        default="",
+    )
 
     def draw(self, context):
         layout = self.layout
@@ -150,6 +160,15 @@ class STB_AddonPreferences(AddonPreferences):
         
         col.separator()
         col.label(text="Used for natural language command understanding", icon="INFO")
+        
+        # Super Mode Settings
+        box = layout.box()
+        box.label(text="Super Mode Settings", icon="LIGHT")
+        col = box.column(align=True)
+        col.prop(self, "super_mode_target_object")
+        col.separator()
+        col.label(text="Target object provides context for intelligent modeling", icon="INFO")
+        col.label(text="Example: 'Echo Dot', 'Coffee Mug', 'Smartphone'", icon="BLANK1")
 
 
 # ───────── Minimal operator and panels so UI never crashes ─────────
@@ -372,12 +391,27 @@ def _rpc_execute(cmd_dict):
                 # Old format: direct operator call
                 op = cmd_dict.get("op")
                 kwargs = cmd_dict.get("kwargs", {})
+                
+                # Special case: execute Python code
+                if op == "execute" and "code" in kwargs:
+                    return _execute_python_code(kwargs.get("code", ""))
+                
                 if op:
                     ok, msg = _safe_call_operator(op, kwargs)
                     return {"ok": ok, "message": msg}
         return {"ok": False, "error": "Invalid command format"}
     except Exception as e:
         return {"ok": False, "error": str(e)}
+
+
+def _execute_python_code(code: str):
+    """Queue Python code execution on main thread. Returns immediately."""
+    if not code or not isinstance(code, str):
+        return {"ok": False, "error": "No code provided"}
+    
+    # Queue execution on main thread (like operators)
+    _TASKQ.put(("EXEC_PYTHON", code))
+    return {"ok": True, "message": "Code queued for execution"}
 
 
 def _server_loop():
@@ -481,11 +515,233 @@ def _server_loop():
                     traceback.print_exc()
                 return ""
             
+            def start_voice_command():
+                """RPC method: Mark the start of a new voice command (pushes undo point)."""
+                global _NEED_UNDO_PUSH
+                _NEED_UNDO_PUSH = True
+                return "OK"
+            
+            def get_super_mode_state():
+                """RPC method: Get super mode state and context."""
+                try:
+                    wm = bpy.context.window_manager
+                    super_mode = getattr(wm, "stb_super_mode", False)
+                    
+                    target_object = ""
+                    if ADDON_ROOT in bpy.context.preferences.addons:
+                        addon_prefs = bpy.context.preferences.addons[ADDON_ROOT].preferences
+                        target_object = getattr(addon_prefs, "super_mode_target_object", "")
+                    
+                    return {
+                        "enabled": super_mode,
+                        "target_object": target_object,
+                    }
+                except Exception as e:
+                    print(f"[SpeechToBlender] Error getting super mode state: {e}")
+                    return {"enabled": False, "target_object": ""}
+            
+            def get_modeling_context():
+                """RPC method: Get current modeling context (scene state, selected objects, mode, modifiers)."""
+                try:
+                    context = bpy.context
+                    scene = context.scene
+                    
+                    # Get selected objects (use view_layer for proper access)
+                    selected_objects = []
+                    for obj in context.view_layer.objects.selected:
+                        obj_info = {
+                            "name": obj.name,
+                            "type": obj.type,
+                            "location": tuple(obj.location),
+                            "rotation": tuple(obj.rotation_euler),
+                            "scale": tuple(obj.scale),
+                        }
+                        selected_objects.append(obj_info)
+                    
+                    # Get active object (use view_layer for proper access)
+                    active_obj = None
+                    if context.view_layer.objects.active:
+                        active = context.view_layer.objects.active
+                        active_obj = {
+                            "name": active.name,
+                            "type": active.type,
+                            "mode": active.mode if hasattr(active, "mode") else "OBJECT",
+                        }
+                    
+                    # Get current mode
+                    current_mode = "OBJECT"
+                    if context.view_layer.objects.active:
+                        active = context.view_layer.objects.active
+                        if hasattr(active, "mode"):
+                            current_mode = active.mode
+                    
+                    # Get modifiers on active object
+                    modifiers = []
+                    if context.view_layer.objects.active:
+                        active = context.view_layer.objects.active
+                        if hasattr(active, "modifiers"):
+                            for mod in active.modifiers:
+                                mod_info = {
+                                    "name": mod.name,
+                                    "type": mod.type,
+                                }
+                                modifiers.append(mod_info)
+                    
+                    # Get scene info
+                    scene_info = {
+                        "object_count": len(scene.objects),
+                        "collection_count": len(bpy.data.collections),
+                        "material_count": len(bpy.data.materials),
+                    }
+                    
+                    return {
+                        "selected_objects": selected_objects,
+                        "active_object": active_obj,
+                        "current_mode": current_mode,
+                        "modifiers": modifiers,
+                        "scene_info": scene_info,
+                    }
+                except Exception as e:
+                    print(f"[SpeechToBlender] Error getting modeling context: {e}")
+                    import traceback
+                    traceback.print_exc()
+                    return {"error": str(e)}
+            
+            def analyze_current_mesh():
+                """RPC method: Analyze current mesh geometry (vertex count, edge loops, face topology)."""
+                try:
+                    context = bpy.context
+                    obj = context.view_layer.objects.active if context.view_layer.objects.active else None
+                    if not obj or obj.type != 'MESH':
+                        return {"error": "No active mesh object"}
+                    
+                    mesh = obj.data
+                    
+                    # Basic mesh stats
+                    vertex_count = len(mesh.vertices)
+                    edge_count = len(mesh.edges)
+                    face_count = len(mesh.polygons)
+                    
+                    # Vertex positions (sample first 100 for context, not all)
+                    vertices_sample = []
+                    sample_size = min(100, vertex_count)
+                    for i in range(sample_size):
+                        v = mesh.vertices[i]
+                        vertices_sample.append({
+                            "index": i,
+                            "co": tuple(v.co),
+                        })
+                    
+                    # Edge loop detection (simplified - find edges that form loops)
+                    edge_loops = []
+                    # This is a simplified check - full edge loop detection is complex
+                    # For now, we'll identify potential loops by checking edge connectivity
+                    if edge_count > 0:
+                        # Count edges per vertex (indicator of loop topology)
+                        vertex_edge_count = {}
+                        for edge in mesh.edges:
+                            for v_idx in edge.vertices:
+                                vertex_edge_count[v_idx] = vertex_edge_count.get(v_idx, 0) + 1
+                        
+                        # Vertices with 2 edges are likely part of a loop
+                        loop_vertices = [v_idx for v_idx, count in vertex_edge_count.items() if count == 2]
+                        if loop_vertices:
+                            edge_loops.append({
+                                "type": "potential_loop",
+                                "vertex_count": len(loop_vertices),
+                            })
+                    
+                    # Face topology analysis
+                    face_types = {}
+                    for face in mesh.polygons:
+                        vert_count = len(face.vertices)
+                        face_types[vert_count] = face_types.get(vert_count, 0) + 1
+                    
+                    # Mesh bounds
+                    if mesh.vertices:
+                        coords = [v.co for v in mesh.vertices]
+                        min_co = tuple(min(c[i] for c in coords) for i in range(3))
+                        max_co = tuple(max(c[i] for c in coords) for i in range(3))
+                        bounds = {
+                            "min": min_co,
+                            "max": max_co,
+                            "size": tuple(max_co[i] - min_co[i] for i in range(3)),
+                        }
+                    else:
+                        bounds = None
+                    
+                    # Selection state
+                    selected_vertices = []
+                    selected_edges = []
+                    selected_faces = []
+                    
+                    if obj.mode == 'EDIT':
+                        # In edit mode, get selected elements
+                        # Need to use bmesh from edit mesh
+                        bm = bmesh.from_edit_mesh(mesh)
+                        bm.verts.ensure_lookup_table()
+                        bm.edges.ensure_lookup_table()
+                        bm.faces.ensure_lookup_table()
+                        
+                        for v in bm.verts:
+                            if v.select:
+                                selected_vertices.append(v.index)
+                        for e in bm.edges:
+                            if e.select:
+                                selected_edges.append(e.index)
+                        for f in bm.faces:
+                            if f.select:
+                                selected_faces.append(f.index)
+                        
+                        # Don't free bmesh from edit mesh - it's managed by Blender
+                    
+                    return {
+                        "vertex_count": vertex_count,
+                        "edge_count": edge_count,
+                        "face_count": face_count,
+                        "vertices_sample": vertices_sample,
+                        "edge_loops": edge_loops,
+                        "face_topology": {
+                            "face_types": face_types,  # {3: count, 4: count, ...} for triangles, quads, etc.
+                        },
+                        "bounds": bounds,
+                        "selection": {
+                            "vertices": selected_vertices,
+                            "edges": selected_edges,
+                            "faces": selected_faces,
+                        },
+                        "object_name": obj.name,
+                        "object_mode": obj.mode,
+                    }
+                except Exception as e:
+                    print(f"[SpeechToBlender] Error analyzing mesh: {e}")
+                    import traceback
+                    traceback.print_exc()
+                    return {"error": str(e)}
+            
             server.register_function(ping, "ping")
             server.register_function(enqueue_op_safe, "enqueue_op_safe")
             server.register_function(enqueue_op_safe, "enqueue_op")  # Alias
             server.register_function(_rpc_execute, "execute")
             server.register_function(get_openai_api_key, "get_openai_api_key")
+            server.register_function(start_voice_command, "start_voice_command")
+            server.register_function(get_super_mode_state, "get_super_mode_state")
+            server.register_function(get_modeling_context, "get_modeling_context")
+            server.register_function(analyze_current_mesh, "analyze_current_mesh")
+            
+            def get_voice_listening_state():
+                """RPC method: Get voice listening enabled state."""
+                global _VOICE_LISTENING_ENABLED
+                return {"enabled": _VOICE_LISTENING_ENABLED}
+            
+            def set_voice_listening_state(enabled):
+                """RPC method: Set voice listening enabled state."""
+                global _VOICE_LISTENING_ENABLED
+                _VOICE_LISTENING_ENABLED = bool(enabled)
+                return {"enabled": _VOICE_LISTENING_ENABLED}
+            
+            server.register_function(get_voice_listening_state, "get_voice_listening_state")
+            server.register_function(set_voice_listening_state, "set_voice_listening_state")
             
             _SERVER_RUNNING = True
             print(f"[SpeechToBlender] XML-RPC listening on http://{HOST}:{PORT}/RPC2")
@@ -548,17 +804,59 @@ def _stop_server_thread():
 
 def _drain_task_queue():
     """Drain the task queue on the main thread (called by timer)."""
+    global _NEED_UNDO_PUSH
     try:
+        # Push undo ONCE at the start if needed (marks start of new voice command)
+        if _NEED_UNDO_PUSH:
+            try:
+                bpy.ops.ed.undo_push(message="Voice Command")
+                print("[SpeechToBlender] Pushed undo point for voice command")
+            except Exception as e:
+                print(f"[SpeechToBlender] Failed to push undo: {e}")
+            _NEED_UNDO_PUSH = False
+        
         while not _TASKQ.empty():
             msg = _TASKQ.get_nowait()
-            kind, name, kwargs = msg
+            kind = msg[0]
             if kind == "OP_SAFE":
-                print(f"[SpeechToBlender] Executing: {name} with kwargs: {kwargs}")
-                ok, reason = _safe_call_operator(name, kwargs)
-                if ok:
-                    print(f"[SpeechToBlender] ✅ Success: {name}")
+                _, name, kwargs = msg
+                # Special case: handle execute (Python code execution)
+                if name == "execute" and "code" in kwargs:
+                    code = kwargs.get("code", "")
+                    print(f"[SpeechToBlender] Executing Python code...")
+                    try:
+                        exec(code, {"__builtins__": __builtins__, "bpy": bpy})
+                        print(f"[SpeechToBlender] ✅ Python code executed successfully")
+                    except Exception as e:
+                        error_msg = str(e)
+                        import traceback
+                        tb = traceback.format_exc()
+                        print(f"[SpeechToBlender] ❌ Python execution error: {error_msg}")
+                        print(f"[SpeechToBlender] Traceback: {tb}")
                 else:
-                    print(f"[SpeechToBlender] ❌ Failed: {name} - {reason}")
+                    print(f"[SpeechToBlender] Executing: {name} with kwargs: {kwargs}")
+                    ok, reason = _safe_call_operator(name, kwargs)
+                    if ok:
+                        print(f"[SpeechToBlender] ✅ Success: {name}")
+                    else:
+                        print(f"[SpeechToBlender] ❌ Failed: {name} - {reason}")
+                try:
+                    bpy.ops.wm.redraw_timer(type="DRAW_WIN", iterations=1)
+                except Exception:
+                    pass
+            elif kind == "EXEC_PYTHON":
+                _, code = msg
+                print(f"[SpeechToBlender] Executing Python code...")
+                try:
+                    # Execute Python code in Blender's context
+                    exec(code, {"__builtins__": __builtins__, "bpy": bpy})
+                    print(f"[SpeechToBlender] ✅ Python code executed successfully")
+                except Exception as e:
+                    error_msg = str(e)
+                    import traceback
+                    tb = traceback.format_exc()
+                    print(f"[SpeechToBlender] ❌ Python execution error: {error_msg}")
+                    print(f"[SpeechToBlender] Traceback: {tb}")
                 try:
                     bpy.ops.wm.redraw_timer(type="DRAW_WIN", iterations=1)
                 except Exception:
@@ -687,10 +985,6 @@ def _start_voice_process():
         print("[SpeechToBlender] Could not resolve Python executable")
         return False
     
-    creationflags = 0
-    if os.name == "nt":
-        creationflags = subprocess.CREATE_NEW_CONSOLE
-    
     try:
         print(f"[SpeechToBlender] Launching voice script: {voice_path}")
         print(f"[SpeechToBlender] Using Python: {python_exe}")
@@ -709,14 +1003,54 @@ def _start_voice_process():
         # Let batch wrappers know which python to run
         env["STB_PYTHON_EXE"] = python_exe
         
-        _VOICE_POPEN = subprocess.Popen(
-            [python_exe, voice_path],
-            creationflags=creationflags,
-            cwd=os.path.dirname(voice_path) or None,
-            env=env,
-        )
+        # Create a batch file wrapper that keeps console open
+        if os.name == "nt":
+            # Create temp batch file
+            import tempfile
+            batch_dir = tempfile.gettempdir()
+            batch_file = os.path.join(batch_dir, "stb_voice_launcher.bat")
+            
+            # Write batch file that runs Python and pauses on error
+            with open(batch_file, 'w') as f:
+                f.write(f'@echo off\n')
+                f.write(f'cd /d "{os.path.dirname(voice_path) or "."}"\n')
+                f.write(f'"{python_exe}" "{voice_path}"\n')
+                f.write(f'if errorlevel 1 (\n')
+                f.write(f'    echo.\n')
+                f.write(f'    echo Script exited with error code %errorlevel%\n')
+                f.write(f'    pause\n')
+                f.write(f')\n')
+            
+            # Launch batch file with new console
+            _VOICE_POPEN = subprocess.Popen(
+                ["cmd.exe", "/c", "start", "cmd.exe", "/k", batch_file],
+                creationflags=subprocess.CREATE_NO_WINDOW,  # Don't create extra window for launcher
+                env=env,
+            )
+        else:
+            # Non-Windows: just run directly
+            _VOICE_POPEN = subprocess.Popen(
+                [python_exe, voice_path],
+                cwd=os.path.dirname(voice_path) or None,
+                env=env,
+            )
+        
         _VOICE_RUNNING = True
         print("[SpeechToBlender] Voice process started")
+        print("[SpeechToBlender] A console window should have opened - check it for output/errors")
+        
+        # Wait a moment and check if it's still running
+        time.sleep(1.0)  # Give it more time to start
+        if _VOICE_POPEN.poll() is not None:
+            # Process exited immediately
+            print(f"[SpeechToBlender] ⚠️ Voice process launcher exited immediately with code: {_VOICE_POPEN.returncode}")
+            print(f"[SpeechToBlender] Check the console window that should have opened")
+            print(f"[SpeechToBlender] Or run manually to see errors:")
+            print(f"[SpeechToBlender]   {python_exe} {voice_path}")
+            _VOICE_POPEN = None
+            _VOICE_RUNNING = False
+            return False
+        
         return True
         
     except FileNotFoundError as e:
@@ -756,9 +1090,11 @@ class STB_OT_RPCStart(bpy.types.Operator):
     bl_label = "Start RPC"
 
     def execute(self, context):
+        global _VOICE_LISTENING_ENABLED
         ok = _start_server_thread()
         if ok:
             context.window_manager.stb_rpc_server_running = True
+            _VOICE_LISTENING_ENABLED = True  # Enable listening when RPC starts
             bpy.app.timers.register(_drain_task_queue, first_interval=0.3)
             # Automatically start voice script
             if _start_voice_process():
@@ -778,6 +1114,30 @@ class STB_OT_RPCStop(bpy.types.Operator):
         _stop_server_thread()
         context.window_manager.stb_rpc_server_running = False
         self.report({'INFO'}, "RPC server stopping…")
+        return {'FINISHED'}
+
+
+class STB_OT_ToggleVoiceListening(bpy.types.Operator):
+    bl_idname = "stb.toggle_voice_listening"
+    bl_label = "Toggle Voice Listening"
+    bl_description = "Toggle voice listening on/off (Alt+F)"
+    bl_options = {'REGISTER'}
+
+    def execute(self, context):
+        global _VOICE_LISTENING_ENABLED
+        _VOICE_LISTENING_ENABLED = not _VOICE_LISTENING_ENABLED
+        status = "ON" if _VOICE_LISTENING_ENABLED else "OFF"
+        self.report({'INFO'}, f"Voice listening: {status}")
+        print(f"[SpeechToBlender] Voice listening toggled: {status}")
+        
+        # Force UI redraw to show status change immediately
+        try:
+            for area in context.screen.areas:
+                if area.type == 'VIEW_3D':
+                    area.tag_redraw()
+        except Exception:
+            pass
+        
         return {'FINISHED'}
 
 
@@ -802,11 +1162,67 @@ class STB_PT_RPCBridge(Panel):
                 layout.label(text="Voice: Running", icon="CHECKMARK")
             else:
                 layout.label(text="Voice: Stopped", icon="X")
+            global _VOICE_LISTENING_ENABLED
+            if _VOICE_LISTENING_ENABLED:
+                layout.label(text="🟢 Listening: ON (Alt+F to toggle)", icon="SPEAKER")
+            else:
+                layout.label(text="🟡 Listening: OFF (Alt+F to toggle)", icon="SPEAKER")
             layout.operator("stb.rpc_stop", icon="PAUSE", text="Stop RPC")
         else:
             layout.label(text=f"RPC: Stopped", icon="X")
             layout.label(text="Voice: Stopped", icon="X")
             layout.operator("stb.rpc_start", icon="PLAY", text="Start RPC")
+
+
+class STB_PT_VoiceMode(Panel):
+    bl_space_type = "VIEW_3D"
+    bl_region_type = "UI"
+    bl_category = "STB"
+    bl_label = "Voice Mode"
+    bl_options = {'DEFAULT_CLOSED'}
+
+    def draw(self, context):
+        layout = self.layout
+        wm = context.window_manager
+        
+        # Mode toggle
+        box = layout.box()
+        row = box.row()
+        row.prop(wm, "stb_super_mode", text="Super Mode", toggle=True, icon="LIGHT" if wm.stb_super_mode else "OUTLINER_OB_LIGHT")
+        
+        box.separator()
+        
+        if wm.stb_super_mode:
+            # Super mode active
+            col = box.column(align=True)
+            col.label(text="⚡ Context-Aware Modeling", icon="INFO")
+            
+            # Get target from preferences
+            try:
+                addon_prefs = context.preferences.addons[ADDON_ROOT].preferences
+                target = addon_prefs.super_mode_target_object
+                if target:
+                    col.label(text=f"Building: {target}", icon="OBJECT_DATA")
+                else:
+                    col.label(text="No target set (see preferences)", icon="ERROR")
+            except Exception:
+                col.label(text="Set target in preferences", icon="PREFERENCES")
+            
+            col.separator()
+            col.label(text="Features:", icon="DOT")
+            col.label(text="• Multi-step operations", icon="BLANK1")
+            col.label(text="• Geometry analysis", icon="BLANK1")
+            col.label(text="• Context-aware GPT", icon="BLANK1")
+            col.label(text="• Any Blender operation", icon="BLANK1")
+            col.label(text="• Smart operation selection", icon="BLANK1")
+            
+            col.separator()
+            col.label(text="⚠ Slower, uses more API credits", icon="INFO")
+        else:
+            # Normal mode
+            col = box.column(align=True)
+            col.label(text="Fast Local Commands", icon="CHECKMARK")
+            col.label(text="Quick operations, instant response", icon="INFO")
 
 
 # ───────── Safe stub: lazy import inside register, timers last ─────────
@@ -817,7 +1233,9 @@ _CLASSES = (
     STB_PT_MeshyStatus,
     STB_OT_RPCStart,
     STB_OT_RPCStop,
+    STB_OT_ToggleVoiceListening,
     STB_PT_RPCBridge,
+    STB_PT_VoiceMode,
 )
 
 def register():
@@ -836,6 +1254,12 @@ def register():
             default=False,
             options={'HIDDEN'},
         )
+    if not hasattr(bpy.types.WindowManager, "stb_super_mode"):
+        bpy.types.WindowManager.stb_super_mode = bpy.props.BoolProperty(
+            name="Super Mode",
+            description="Enable context-aware intelligent modeling (slower, more powerful)",
+            default=False,
+        )
 
     # 3) operators and panels
     bpy.utils.register_class(STB_OT_MeshyGenerate)
@@ -843,12 +1267,27 @@ def register():
     bpy.utils.register_class(STB_PT_MeshyStatus)
     bpy.utils.register_class(STB_OT_RPCStart)
     bpy.utils.register_class(STB_OT_RPCStop)
+    bpy.utils.register_class(STB_OT_ToggleVoiceListening)
     bpy.utils.register_class(STB_PT_RPCBridge)
+    bpy.utils.register_class(STB_PT_VoiceMode)
+    
+    # 4) Register Alt+F keyboard shortcut for voice listening toggle
+    wm = bpy.context.window_manager
+    kc = wm.keyconfigs.addon
+    if kc:
+        km = kc.keymaps.new(name='Window', space_type='EMPTY')
+        kmi = km.keymap_items.new(
+            STB_OT_ToggleVoiceListening.bl_idname,
+            'F',
+            'PRESS',
+            alt=True
+        )
+        print("[SpeechToBlender] Registered Alt+F shortcut for voice listening toggle")
 
     # 4) ensure openai is available in bundled Python
     _ensure_openai_installed()
 
-    # 5) lazy import real module, never crash on error
+    # 6) lazy import real module, never crash on error
     try:
         # Import your heavy modules late
         from . import stb_core  # noqa: F401
@@ -856,10 +1295,23 @@ def register():
         # do not raise, just log so Blender does not auto‑disable
         print("[SpeechToBlender] STARTUP ERROR:", e)
 
-    # 6) timers last if you add them later
+    # 7) timers last if you add them later
 
 
 def unregister():
+    # Unregister keyboard shortcut
+    try:
+        wm = bpy.context.window_manager
+        kc = wm.keyconfigs.addon
+        if kc:
+            km = kc.keymaps.get('Window')
+            if km:
+                for kmi in list(km.keymap_items):
+                    if kmi.idname == STB_OT_ToggleVoiceListening.bl_idname:
+                        km.keymap_items.remove(kmi)
+    except Exception:
+        pass
+    
     # panels and ops
     for cls in reversed(_CLASSES[1:]):
         try:
@@ -886,5 +1338,7 @@ def unregister():
             del bpy.types.WindowManager.stb_meshy_prompt
         if hasattr(bpy.types.WindowManager, "stb_rpc_server_running"):
             del bpy.types.WindowManager.stb_rpc_server_running
+        if hasattr(bpy.types.WindowManager, "stb_super_mode"):
+            del bpy.types.WindowManager.stb_super_mode
     except Exception:
         pass

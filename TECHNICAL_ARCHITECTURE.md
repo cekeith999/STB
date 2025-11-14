@@ -719,3 +719,5 @@ Stored in `bpy.context.preferences.addons["SpeechToBlender"]`:
 - Privacy (local STT, no telemetry)
 - Flexibility (GPT fallback, extensible providers)
 
+
+
