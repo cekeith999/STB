@@ -13,6 +13,7 @@ import sounddevice as sd
 import xmlrpc.client
 from datetime import datetime
 import traceback  # keep tracebacks visible instead of killing process
+import webrtcvad
 
 # ========= CONFIG (portable paths) =========
 def _get_openai_api_key():
@@ -104,17 +105,20 @@ RPC_URL = "http://127.0.0.1:8765/RPC2"
 ENABLE_GPT_FALLBACK = True   # GPT-4o fallback for natural language understanding
 VERBOSE_DEBUG = False        # debug prints for import matcher (set True for debugging)
 
-# Super Mode state (fetched from Blender)
-SUPER_MODE_ENABLED = False
+# Modeling target / reasoning state (from Blender)
 SUPER_MODE_TARGET = ""
+USE_REACT_REASONING = False
 
 # Mic settings
 SAMPLE_RATE  = 16000
 BLOCK_SEC    = 0.2
-SILENCE_RMS  = 300  # Silence threshold (lower = more sensitive to silence)
-SILENCE_HOLD = 0.6  # Silence duration required to stop (using consecutive blocks)
-MIN_SPOKEN   = 0.3  # Minimum speech time before silence can trigger stop
-MAX_RECORD_SEC = 10.0  # Maximum recording time to prevent infinite loops
+SILENCE_HOLD = 0.6   # Silence duration required to stop (using consecutive blocks)
+MIN_SPOKEN   = 0.3   # Minimum speech time before silence can trigger stop
+MAX_RECORD_SEC = 8.0  # Maximum recording time to prevent infinite loops
+INITIAL_SILENCE_ABORT = 2.0  # Stop early if no speech detected after this many seconds
+VAD_FRAME_MS = 30  # Frame size used for WebRTC VAD (10, 20, or 30 ms only)
+VAD_AGGRESSIVENESS = 2  # 0=least aggressive, 3=most aggressive
+VAD = webrtcvad.Vad(VAD_AGGRESSIVENESS)
 
 def _log_paths_once():
     print("[Voice] Python:", sys.executable)
@@ -135,6 +139,31 @@ def _dbg(*args):
 
 def rms_int16(block: np.ndarray) -> float:
     return float(np.sqrt(np.mean(block.astype(np.int32)**2)))
+
+
+def _block_has_voice(block: np.ndarray) -> bool:
+    """Return True if any sub-frame in this block is classified as speech by VAD."""
+    if VAD is None:
+        return False
+    frame_samples = int(SAMPLE_RATE * (VAD_FRAME_MS / 1000.0))
+    if frame_samples <= 0:
+        return False
+    frame_bytes = frame_samples * 2  # int16 -> 2 bytes
+    raw = block.astype(np.int16).tobytes()
+    total = len(raw)
+    if total < frame_bytes:
+        return False
+    for start in range(0, total - frame_bytes + 1, frame_bytes):
+        chunk = raw[start:start + frame_bytes]
+        if len(chunk) < frame_bytes:
+            break
+        try:
+            if VAD.is_speech(chunk, SAMPLE_RATE):
+                return True
+        except Exception:
+            # Ignore badly sized frames
+            continue
+    return False
 
 def _parse_number(s):
     try:
@@ -180,14 +209,665 @@ def _deg2rad(v):
     except Exception:
         return None
 
+
+def _should_use_react_command(text: str) -> bool:
+    """Heuristic to decide whether to invoke ReAct reasoning."""
+    if not text:
+        return False
+    lowered = text.lower()
+    complex_markers = [
+        "then ",
+        "after ",
+        "before ",
+        "all of them",
+        "each of them",
+        "together",
+        "loop cut",
+        "loopcut",
+        "subdivide",
+        "modifier",
+        "bevel",
+        "boolean",
+        "material",
+        "glass",
+        "extrude",
+        "bridge edge",
+        "connect",
+    ]
+    if any(marker in lowered for marker in complex_markers):
+        return True
+    if " and " in lowered and len(text.split()) >= 10:
+        return True
+    if len(text) > 60:
+        return True
+    return False
+
+
+def _capture_screen_local():
+    """Capture screen using local Python libraries (PIL/mss) - runs in voice script, not Blender."""
+    try:
+        import base64
+        import tempfile
+        import os
+        
+        # Method 1: Try PIL/Pillow
+        try:
+            from PIL import ImageGrab
+            print("[Screenshot] Trying PIL.ImageGrab...")
+            screenshot = ImageGrab.grab()
+            temp_path = tempfile.mktemp(suffix='.png')
+            screenshot.save(temp_path, 'PNG')
+            
+            with open(temp_path, 'rb') as f:
+                image_data = f.read()
+                screenshot_data = base64.b64encode(image_data).decode('utf-8')
+            
+            os.remove(temp_path)
+            print(f"[Screenshot] ✅ PIL.ImageGrab succeeded: {len(image_data)} bytes raw, {len(screenshot_data)} chars base64")
+            return screenshot_data
+        except ImportError as e:
+            print(f"[Screenshot] ⚠️ PIL not available: {e}")
+        except Exception as e:
+            print(f"[Screenshot] ⚠️ PIL.ImageGrab failed: {e}")
+            import traceback
+            traceback.print_exc()
+        
+        # Method 2: Try mss
+        try:
+            import mss
+            print("[Screenshot] Trying mss...")
+            with mss.mss() as sct:
+                screenshot = sct.grab(sct.monitors[0])
+                temp_path = tempfile.mktemp(suffix='.png')
+                mss.tools.to_png(screenshot.rgb, screenshot.size, output=temp_path)
+                
+                with open(temp_path, 'rb') as f:
+                    image_data = f.read()
+                    screenshot_data = base64.b64encode(image_data).decode('utf-8')
+                
+                os.remove(temp_path)
+                print(f"[Screenshot] ✅ mss succeeded: {len(image_data)} bytes raw, {len(screenshot_data)} chars base64")
+                return screenshot_data
+        except ImportError as e:
+            print(f"[Screenshot] ⚠️ mss not available: {e}")
+        except Exception as e:
+            print(f"[Screenshot] ⚠️ mss failed: {e}")
+            import traceback
+            traceback.print_exc()
+        
+        # If both fail, return None
+        print("[Screenshot] ❌ Both PIL and mss unavailable or failed for screen capture")
+        return None
+    except Exception as e:
+        print(f"[Screenshot] ❌ Screen capture error: {e}")
+        import traceback
+        traceback.print_exc()
+        return None
+
+
+def _fetch_context_for_gpt(include_screenshot: bool = True):
+    """Helper to fetch modeling context + mesh analysis + scene analysis + screenshot via RPC."""
+    modeling_context = None
+    mesh_analysis = None
+    scene_analysis = None
+    screenshot_data = None
+    if rpc is None:
+        return modeling_context, mesh_analysis, scene_analysis, screenshot_data
+    try:
+        modeling_context = rpc.get_modeling_context()
+        if modeling_context and modeling_context.get("active_object"):
+            ao = modeling_context["active_object"]
+            if ao.get("type") == "MESH":
+                mesh_analysis = rpc.analyze_current_mesh()
+        # Always fetch scene analysis for context
+        try:
+            scene_analysis = rpc.analyze_scene()
+        except Exception as e:
+            print(f"[Context] ⚠️ Error analyzing scene: {e}")
+            scene_analysis = None
+        
+        # Capture screenshot if requested (use local screen capture, not Blender RPC)
+        # Do this even if context fetching failed
+        if include_screenshot:
+            try:
+                print("📸 Capturing viewport screenshot...")
+                screenshot_data = _capture_screen_local()
+                if screenshot_data:
+                    print(f"✅ Screenshot captured: {len(screenshot_data)} bytes (base64)")
+                else:
+                    print("⚠️ Screenshot capture returned None - check [Screenshot] messages above for details")
+            except Exception as e:
+                print(f"⚠️ Screenshot capture exception: {e}")
+                import traceback
+                traceback.print_exc()
+    except Exception as e:
+        print(f"[Context] ⚠️ Error fetching context: {e}")
+        import traceback
+        traceback.print_exc()
+        # Still try screenshot even if context fetch failed
+        if include_screenshot and not screenshot_data:
+            try:
+                print("📸 Attempting screenshot capture after context error...")
+                screenshot_data = _capture_screen_local()
+                if screenshot_data:
+                    print(f"✅ Screenshot captured after error: {len(screenshot_data)} bytes (base64)")
+            except Exception as e2:
+                print(f"⚠️ Screenshot capture also failed: {e2}")
+    return modeling_context, mesh_analysis, scene_analysis, screenshot_data
+
+
+def _resolve_local_sequence(command_parts):
+    """Try to satisfy every command part via local rule handlers."""
+    sequence = []
+    for part in command_parts:
+        cmd = try_io_rules(part)
+        cmd = cmd or try_local_rules(part)
+        if not cmd:
+            return None
+        if isinstance(cmd, list):
+            sequence.extend(cmd)
+        else:
+            sequence.append(cmd)
+    return sequence
+
+
+def _react_observe(request: str) -> str:
+    """Perform observation requests for ReAct loop with actionable error messages."""
+    if rpc is None:
+        return "RPC unavailable; cannot observe. You should EXECUTE actions instead."
+    req = (request or "").strip().lower()
+    try:
+        if req in ("selected_objects", "selection", "selected"):
+            ctx = rpc.get_modeling_context()
+            selected = ctx.get("selected_objects", [])
+            if not selected:
+                return "No objects are currently selected. You may need to create objects first using EXECUTE actions."
+            return json.dumps(selected, indent=2)
+        if req in ("active_object", "active", "current_object"):
+            ctx = rpc.get_modeling_context()
+            active = ctx.get("active_object")
+            if not active:
+                return "No active object. You may need to create an object first using EXECUTE actions like mesh.primitive_cube_add."
+            return json.dumps(active, indent=2)
+        if req in ("mesh_analysis", "mesh", "geometry"):
+            try:
+                analysis = rpc.analyze_current_mesh()
+                if analysis and analysis.get("error"):
+                    return f"Mesh analysis error: {analysis.get('error')}. There may be no active mesh object. Create one first using EXECUTE actions."
+                if analysis:
+                    return json.dumps(analysis, indent=2)
+                return "Mesh analysis returned empty result. There may be no active mesh object."
+            except Exception as e:
+                error_msg = str(e)
+                if "TypeError" in error_msg or "dictionary key" in error_msg:
+                    return f"Mesh analysis error (serialization issue): {error_msg}. Try executing an action to create or select a mesh object first."
+                return f"Mesh analysis error: {error_msg}. There may be no active mesh object or the object is in an invalid state."
+        if req in ("modifiers", "mods"):
+            ctx = rpc.get_modeling_context()
+            mods = ctx.get("modifiers", [])
+            if not mods:
+                return "No modifiers on active object. You can add modifiers using EXECUTE with object.modifier_add."
+            return json.dumps(mods, indent=2)
+        if req in ("scene", "scene_info", "scene_analysis"):
+            analysis = rpc.analyze_scene()
+            return json.dumps(analysis, indent=2)
+        if req in ("parts", "categorized_parts", "object_parts"):
+            analysis = rpc.analyze_scene()
+            parts = analysis.get("categorized_parts", {})
+            if not any(parts.values()):
+                return "No categorized parts found. You may need to create objects first using EXECUTE actions."
+            return json.dumps(parts, indent=2)
+        return f"Unknown observation '{request}'. Try selected_objects, active_object, mesh_analysis, modifiers, scene, scene_analysis, parts. If you need to create objects, use EXECUTE actions instead."
+    except Exception as e:
+        return f"Observation error: {e}. Consider using EXECUTE actions to create or modify objects instead of observing."
+
+
+def _validate_object_after_execution(target_object: str, mesh_analysis) -> str:
+    """Post-execution validation for key objects. Returns validation message or empty string if OK."""
+    if not target_object or not mesh_analysis or mesh_analysis.get("error"):
+        return ""
+    
+    target_lower = target_object.lower()
+    bounds = mesh_analysis.get("bounds")
+    if not bounds:
+        return ""
+    
+    size = bounds.get("size", (0, 0, 0))
+    shape_class = bounds.get("shape_class", "")
+    
+    # Validate Echo Dot
+    if "echo" in target_lower or "dot" in target_lower:
+        # Should be roughly cylindrical (balanced or slightly tall)
+        if shape_class == "flat":
+            return "⚠️ Validation: Echo Dot appears too flat. Should be roughly cylindrical (height ≈ diameter)."
+        # Check if dimensions are roughly equal (cylindrical)
+        dims = sorted(size, reverse=True)
+        if len(dims) >= 2:
+            ratio = dims[0] / dims[1] if dims[1] > 0.001 else 0
+            if ratio > 2.0:
+                return f"⚠️ Validation: Echo Dot proportions seem off (largest dimension is {ratio:.1f}x the second). Should be roughly 1:1:1."
+    
+    # Validate smartphone
+    if "phone" in target_lower or "smartphone" in target_lower:
+        # Should be very flat (depth << width/height)
+        if shape_class != "flat":
+            return "⚠️ Validation: Smartphone should be very flat (thin depth). Current shape classification: " + shape_class
+        # Check depth is much smaller than width/height
+        width, depth, height = size[0], size[1], size[2]
+        if depth > min(width, height) * 0.3:
+            return f"⚠️ Validation: Smartphone depth ({depth:.2f}) is too large. Should be much thinner (depth << width/height)."
+        # Check aspect ratio (should be roughly 16:9 or similar)
+        if width > 0.001 and height > 0.001:
+            aspect = max(width, height) / min(width, height)
+            if aspect < 1.5:
+                return f"⚠️ Validation: Smartphone aspect ratio ({aspect:.2f}) seems too square. Should be roughly 16:9 (≈1.78)."
+    
+    return ""  # Validation passed
+
+
+# Global state memory for ReAct (persists between commands)
+_REACT_STATE_MEMORY = {
+    "last_summary": None,
+    "last_target": None,
+    "executed_ops": [],  # Track executed operations to avoid duplicates
+}
+
+# Global conversation history (persists across voice commands)
+_CONVERSATION_HISTORY = []
+_MAX_HISTORY_LENGTH = 20  # Keep last 20 messages
+
+
+def add_to_conversation_history(role: str, content: str, images: list = None):
+    """Add message to persistent conversation history."""
+    global _CONVERSATION_HISTORY
+    has_images = bool(images and len(images) > 0)
+    _CONVERSATION_HISTORY.append({
+        "role": role,
+        "content": content,
+        "images": images or [],
+        "timestamp": datetime.now().isoformat()
+    })
+    # Keep last N messages
+    if len(_CONVERSATION_HISTORY) > _MAX_HISTORY_LENGTH:
+        _CONVERSATION_HISTORY.pop(0)
+    
+    # Debug logging
+    img_info = f" (with {len(images)} image(s))" if has_images else ""
+    print(f"💾 Saved to history: {role.upper()}{img_info} - {content[:50]}{'...' if len(content) > 50 else ''}")
+    print(f"📚 Total history: {len(_CONVERSATION_HISTORY)} messages")
+
+
+def get_conversation_context(max_messages: int = 10):
+    """Get recent conversation history for GPT (last N messages)."""
+    history = _CONVERSATION_HISTORY[-max_messages:] if _CONVERSATION_HISTORY else []
+    if history:
+        total_images = sum(1 for msg in history if msg.get("images"))
+        print(f"📖 Loading {len(history)} messages from history ({total_images} with images)")
+    return history
+
+
+def clear_conversation_history():
+    """Clear conversation history (useful for resetting context)."""
+    global _CONVERSATION_HISTORY
+    _CONVERSATION_HISTORY = []
+
+def _react_execute(action_input: str, executed_commands: list) -> str:
+    """Execute a command emitted by ReAct loop with error handling."""
+    if not action_input:
+        return "❌ Execute called with empty input. You must provide valid JSON. Example: {\"op\":\"mesh.primitive_cube_add\",\"kwargs\":{}}"
+    
+    cleaned = action_input.strip()
+    if cleaned.startswith("```"):
+        cleaned = cleaned.strip("` \n")
+    
+    # Check if it looks like JSON
+    if not (cleaned.startswith("{") or cleaned.startswith("[")):
+        return f"❌ Execute input doesn't look like JSON. Expected JSON object or array. Got: {cleaned[:100]}. Example: {{\"op\":\"mesh.primitive_cube_add\",\"kwargs\":{{}}}}"
+    
+    try:
+        cmd = json.loads(cleaned)
+    except json.JSONDecodeError as e:
+        return f"❌ JSON parse error in execute: {e}. Input: {cleaned[:120]}. Make sure your JSON is valid. Example: {{\"op\":\"mesh.primitive_cube_add\",\"kwargs\":{{}}}}"
+    
+    def _exec_single(single_cmd):
+        if not isinstance(single_cmd, dict) or "op" not in single_cmd:
+            return "Execute input must be a JSON object with 'op' and optional 'kwargs'."
+        
+        op = single_cmd.get("op", "")
+        kwargs = single_cmd.get("kwargs", {})
+        
+        # Operations that should be allowed to run multiple times (state-changing operations)
+        # These operations modify selection/state and may need to be repeated
+        allow_repeat_ops = {
+            "object.select_all",
+            "object.select_by_type",
+            "object.join",
+            "object.delete",
+            "mesh.select_all",
+            "mesh.select_mode",
+            "object.mode_set",
+        }
+        
+        # Check for duplicate operations (same op + same kwargs)
+        # But allow certain operations to repeat
+        if op not in allow_repeat_ops:
+            cmd_signature = (op, json.dumps(kwargs, sort_keys=True))
+            if cmd_signature in _REACT_STATE_MEMORY["executed_ops"]:
+                return f"⚠️ Duplicate operation skipped: {op} (already executed with same parameters)"
+        
+        # Try to execute
+        try:
+            executed_commands.append(single_cmd)
+            # Only track non-repeatable operations for duplicate detection
+            if op not in allow_repeat_ops:
+                cmd_signature = (op, json.dumps(kwargs, sort_keys=True))
+                _REACT_STATE_MEMORY["executed_ops"].append(cmd_signature)
+            result = send_to_blender(single_cmd)
+            time.sleep(0.15)  # Give Blender a moment to process before next observation
+            
+            # Check if result indicates failure
+            if result and isinstance(result, str):
+                if "error" in result.lower() or "failed" in result.lower() or "❌" in result:
+                    return f"❌ Operation failed: {op} - {result}. Try a different approach."
+            
+            return f"✅ Queued {op}: {result}"
+        except Exception as e:
+            error_msg = str(e)
+            print(f"[ReAct] Execution error for {op}: {error_msg}")
+            return f"❌ Operation error: {op} - {error_msg}. Try a different approach or check if prerequisites are met."
+    
+    if isinstance(cmd, list):
+        observations = []
+        for single in cmd:
+            obs = _exec_single(single)
+            observations.append(obs)
+        return " | ".join(observations)
+    else:
+        return _exec_single(cmd)
+
+
+def gpt_to_json_react(transcript: str, modeling_context=None, mesh_analysis=None, scene_analysis=None, target_object="", screenshot_data=None):
+    """Use ReAct loop (Thought/Action/Observation) to execute complex commands."""
+    if not ENABLE_GPT_FALLBACK:
+        return None
+    api_key = _get_openai_api_key()
+    if not api_key:
+        print("⚠️ ReAct: Missing OpenAI API key.")
+        return None
+    try:
+        from openai import OpenAI
+    except Exception as e:
+        print(f"⚠️ ReAct: Failed to import OpenAI: {e}")
+        return None
+    
+    # Get reference knowledge with step-by-step templates
+    ref_knowledge = _get_reference_knowledge(target_object) if target_object else None
+    
+    system_prompt = [
+        "You are a Blender automation agent that must follow the ReAct (Reason + Action) format.",
+        "Respond ONLY with blocks containing:",
+        "Thought: <reasoning>",
+        "Action: <execute|observe|finish>",
+        "Action Input: <JSON or observation request>",
+        "",
+        "Action rules:",
+        "- execute: run a Blender operator via JSON, e.g. {\"op\":\"mesh.primitive_cube_add\",\"kwargs\":{}}.",
+        "- observe: ask for data (selected_objects, active_object, mesh_analysis, modifiers, scene).",
+        "- finish: task done, provide short summary.",
+        "",
+        "CRITICAL RULES:",
+        "1. DO NOT observe more than 2 times in a row. After observing, you MUST execute an action.",
+        "2. If an operation fails, try a DIFFERENT approach, don't just observe again.",
+        "3. If you're stuck, simplify your approach or finish with what you have.",
+        "4. Always provide valid JSON in Action Input for execute actions.",
+        "5. If you need to create objects, use EXECUTE with mesh.primitive_*_add operators.",
+        "",
+        "Never output prose outside the required fields. Combine multiple Blender steps into sequential execute actions.",
+        "",
+        "IMPORTANT: If an operation fails, observe the current state ONCE, then try a different approach or finish.",
+        "IMPORTANT: Avoid repeating the same operation with identical parameters (duplicates are skipped).",
+    ]
+    
+    # Add state memory context
+    if _REACT_STATE_MEMORY["last_summary"] and _REACT_STATE_MEMORY["last_target"] == target_object:
+        system_prompt.append(f"\nPrevious command summary: {_REACT_STATE_MEMORY['last_summary']}")
+        system_prompt.append("Continue building on the previous work.")
+    
+    if target_object:
+        system_prompt.append(f"\nTarget Object: {target_object}")
+        
+        # Add detailed reference template if available
+        if ref_knowledge:
+            system_prompt.append(f"\n--- Reference Template: {target_object} ---")
+            system_prompt.append(f"Description: {ref_knowledge.get('description', '')}")
+            
+            if ref_knowledge.get("typical_geometry"):
+                geom = ref_knowledge["typical_geometry"]
+                system_prompt.append(f"Shape: {geom.get('shape', '')}")
+                system_prompt.append(f"Proportions: {geom.get('proportions', '')}")
+                if geom.get("features"):
+                    system_prompt.append("Key Features:")
+                    for feature in geom["features"]:
+                        system_prompt.append(f"  - {feature}")
+            
+            if ref_knowledge.get("step_by_step_template"):
+                template = ref_knowledge["step_by_step_template"]
+                system_prompt.append("\nStep-by-Step Build Template:")
+                for step_name, step_info in template.items():
+                    if isinstance(step_info, dict) and "op" in step_info:
+                        system_prompt.append(f"  {step_name}: {step_info.get('description', '')}")
+                        system_prompt.append(f"    Operation: {step_info['op']} with kwargs: {json.dumps(step_info.get('kwargs', {}))}")
+                        if step_info.get("requires_edit_mode"):
+                            system_prompt.append(f"    NOTE: Requires EDIT mode (enter edit mode first)")
+                        if step_info.get("requires_object_mode"):
+                            system_prompt.append(f"    NOTE: Requires OBJECT mode")
+                    elif isinstance(step_info, dict) and "steps" in step_info:
+                        system_prompt.append(f"  {step_name}: {step_info.get('description', '')}")
+                        for substep in step_info["steps"]:
+                            system_prompt.append(f"    - {substep}")
+            
+            if ref_knowledge.get("modeling_approach"):
+                system_prompt.append("\nRecommended Modeling Approach:")
+                for approach in ref_knowledge["modeling_approach"]:
+                    system_prompt.append(f"  - {approach}")
+    
+    if modeling_context:
+        system_prompt.append(f"\n--- Current Modeling Context ---")
+        system_prompt.append(json.dumps(modeling_context, indent=2))
+    
+    if mesh_analysis and not mesh_analysis.get("error"):
+        system_prompt.append(f"\n--- Current Mesh Analysis ---")
+        ma = mesh_analysis
+        system_prompt.append(f"Object: {ma.get('object_name')}")
+        system_prompt.append(f"Vertices: {ma.get('vertex_count')}, Edges: {ma.get('edge_count')}, Faces: {ma.get('face_count')}")
+        
+        if ma.get("bounds"):
+            bounds = ma["bounds"]
+            size = bounds.get("size", (0, 0, 0))
+            system_prompt.append(f"Size: {size[0]:.2f} x {size[1]:.2f} x {size[2]:.2f}")
+            
+            # Enhanced geometry hints
+            if bounds.get("avg_thickness"):
+                system_prompt.append(f"Average Thickness: {bounds['avg_thickness']:.3f}")
+            if bounds.get("shape_class"):
+                system_prompt.append(f"Shape Classification: {bounds['shape_class']} (flat/tall/balanced)")
+            if bounds.get("aspect_ratios"):
+                ratios = bounds["aspect_ratios"]
+                system_prompt.append(f"Aspect Ratios: width/depth={ratios.get('width_depth', 0):.2f}, width/height={ratios.get('width_height', 0):.2f}")
+        
+        if ma.get("face_topology", {}).get("face_types"):
+            face_types = ma["face_topology"]["face_types"]
+            # Keys are strings from XML-RPC, convert back to int for comparison
+            face_desc = ", ".join([f"{count} {int(v)}-gons" if int(v) > 4 else f"{count} {'triangles' if int(v) == 3 else 'quads'}" 
+                                  for v, count in sorted(face_types.items(), key=lambda x: int(x[0]))])
+            system_prompt.append(f"Face Types: {face_desc}")
+    
+    system_prompt_text = "\n".join(system_prompt)
+    
+    client = OpenAI(api_key=api_key)
+    
+    # Build initial conversation with history and optional screenshot
+    conversation = []
+    
+    # Add conversation history (last 10 messages)
+    history = get_conversation_context(max_messages=10)
+    for hist_msg in history:
+        msg_content = hist_msg["content"]
+        # If history has images, include them
+        if hist_msg.get("images") and hist_msg["images"]:
+            content_list = [{"type": "text", "text": msg_content}]
+            for img_data in hist_msg["images"]:
+                content_list.append({
+                    "type": "image_url",
+                    "image_url": {
+                        "url": f"data:image/png;base64,{img_data}"
+                    }
+                })
+            conversation.append({
+                "role": hist_msg["role"],
+                "content": content_list
+            })
+        else:
+            conversation.append({
+                "role": hist_msg["role"],
+                "content": msg_content
+            })
+    
+    # Add current task with optional screenshot
+    task_content = f"Task: {transcript}\nUse ReAct format. Begin reasoning."
+    if screenshot_data:
+        user_content = [
+            {"type": "text", "text": task_content},
+            {
+                "type": "image_url",
+                "image_url": {
+                    "url": f"data:image/png;base64,{screenshot_data}"
+                }
+            }
+        ]
+        print(f"📸 Including viewport screenshot in ReAct GPT call ({len(screenshot_data)} bytes)")
+    else:
+        user_content = task_content
+        print("⚠️ No screenshot available for ReAct GPT call")
+    
+    conversation.append({"role": "user", "content": user_content})
+    
+    executed_commands = []
+    max_iterations = 25
+    action_history = []  # Track action history for loop detection
+    last_execute_iteration = -1  # Track when we last executed something
+    
+    for iteration in range(max_iterations):
+        try:
+            resp = client.chat.completions.create(
+                model="gpt-4o",
+                messages=[{"role": "system", "content": system_prompt_text}, *conversation],
+                temperature=0,
+            )
+        except Exception as e:
+            print(f"⚠️ ReAct GPT error: {e}")
+            return None
+        
+        output = (resp.choices[0].message.content or "").strip()
+        conversation.append({"role": "assistant", "content": output})
+        
+        thought_match = re.search(r"Thought:\s*(.+?)(?=Action:|$)", output, re.DOTALL)
+        action_match = re.search(r"Action:\s*(\w+)", output)
+        action_input_match = re.search(r"Action Input:\s*(.+)", output, re.DOTALL)
+        
+        thought = thought_match.group(1).strip() if thought_match else ""
+        action = action_match.group(1).strip().lower() if action_match else ""
+        action_input = action_input_match.group(1).strip() if action_input_match else ""
+        
+        # Track action history for loop detection
+        action_history.append(action)
+        
+        # Detect observation loops (3+ consecutive OBSERVE actions)
+        if len(action_history) >= 3 and all(a == "observe" for a in action_history[-3:]):
+            print(f"[ReAct] ⚠️ Detection: Observation loop detected (3+ consecutive OBSERVE actions)")
+            observation = f"⚠️ You have been observing repeatedly. You must either EXECUTE an action or FINISH the task. Stop observing and take action. If you're stuck, try a simpler approach or finish with what you have."
+            conversation.append({"role": "user", "content": f"Observation: {observation}"})
+            continue
+        
+        # Detect execute-without-action loops (empty or repeated execute attempts)
+        if action == "execute" and (not action_input or action_input.strip() == ""):
+            print(f"[ReAct] ⚠️ Detection: Empty execute action")
+            observation = "⚠️ Execute action called but no action input provided. You must provide valid JSON with 'op' and optional 'kwargs'. Example: {\"op\":\"mesh.primitive_cube_add\",\"kwargs\":{}}"
+            conversation.append({"role": "user", "content": f"Observation: {observation}"})
+            continue
+        
+        # Log reasoning (Thought content) to console
+        if thought:
+            print(f"[ReAct] Iteration {iteration+1} - Thought: {thought[:200]}{'...' if len(thought) > 200 else ''}")
+        print(f"[ReAct] Iteration {iteration+1} - Action: {action.upper()}"); sys.stdout.flush()
+        
+        if action == "execute":
+            observation = _react_execute(action_input, executed_commands)
+            if "✅" in observation:  # Success
+                last_execute_iteration = iteration
+        elif action == "observe":
+            observation = _react_observe(action_input)
+            # If we've been observing for 5+ iterations without executing, warn
+            if iteration - last_execute_iteration >= 5 and last_execute_iteration >= 0:
+                observation += " ⚠️ You've been observing for 5+ iterations. You must EXECUTE an action soon or FINISH."
+        elif action == "finish":
+            summary = action_input
+            
+            # Post-execution validation (before finishing)
+            validation_failed = False
+            if target_object and executed_commands:
+                try:
+                    # Get fresh mesh analysis for validation
+                    fresh_analysis = rpc.analyze_current_mesh() if rpc else None
+                    validation_msg = _validate_object_after_execution(target_object, fresh_analysis)
+                    if validation_msg:
+                        print(f"[ReAct] ⚠️ Validation warning: {validation_msg}")
+                        # If validation fails, add it as an observation and continue loop
+                        conversation.append({"role": "user", "content": f"Observation: {validation_msg}. Please fix this issue before finishing."})
+                        validation_failed = True
+                except Exception as e:
+                    if VERBOSE_DEBUG:
+                        print(f"[ReAct] Validation error: {e}")
+            
+            # If validation failed, continue the loop instead of finishing
+            if validation_failed:
+                print(f"[ReAct] Continuing due to validation issue...")
+                continue
+            
+            # Validation passed or no validation needed - finish
+            print(f"[ReAct] Finished: {summary}"); sys.stdout.flush()
+            
+            # Update state memory
+            _REACT_STATE_MEMORY["last_summary"] = summary
+            _REACT_STATE_MEMORY["last_target"] = target_object
+            # Keep executed_ops for duplicate detection, but clear if starting new target
+            if target_object != _REACT_STATE_MEMORY.get("last_target"):
+                _REACT_STATE_MEMORY["executed_ops"] = []
+            
+            # Save to conversation history
+            add_to_conversation_history("user", transcript, [screenshot_data] if screenshot_data else None)
+            add_to_conversation_history("assistant", f"ReAct completed: {summary}")
+            
+            return {"commands": executed_commands, "summary": summary, "iterations": iteration+1}
+        else:
+            observation = f"Unknown action '{action}'. Expected execute/observe/finish."
+        
+        conversation.append({"role": "user", "content": f"Observation: {observation}"})
+    
+    print(f"⚠️ ReAct: Max iterations ({max_iterations}) reached without finish.")
+    return {"commands": executed_commands, "summary": "Max iterations reached"}
+
 # ------------------ Recorder ------------------
 
 def record_until_silence():
     print("🎙️ Speak command…")
-    frames, spoken_sec, silence_sec = [], 0.0, 0.0
+    frames = []
+    spoken_sec = 0.0
+    silence_sec = 0.0
     block_samples = int(BLOCK_SEC * SAMPLE_RATE)
     consecutive_silence_blocks = 0
-    max_silence_blocks = int(SILENCE_HOLD / BLOCK_SEC)  # How many blocks of silence needed
+    max_silence_blocks = int(SILENCE_HOLD / BLOCK_SEC)
+    detected_speech = False
     
     # Get the current default input device (respects system settings when headphones are plugged in)
     # Query each time to pick up device changes
@@ -209,32 +889,42 @@ def record_until_silence():
             block, _ = stream.read(block_samples)
             block = block.reshape(-1)
             frames.append(block)
-            level = rms_int16(block)
             total_time = len(frames) * BLOCK_SEC
+            voiced = _block_has_voice(block)
             
-            if level < SILENCE_RMS:
+            if voiced:
+                detected_speech = True
+                spoken_sec += BLOCK_SEC
+                silence_sec = 0.0
+                consecutive_silence_blocks = 0
+            else:
                 silence_sec += BLOCK_SEC
                 consecutive_silence_blocks += 1
-            else:
-                spoken_sec += BLOCK_SEC
-                silence_sec = 0.0  # Reset silence counter when speech detected
-                consecutive_silence_blocks = 0  # Reset consecutive silence counter
             
             # Stop if we have enough consecutive silence blocks after sufficient speech
-            # This is more reliable than cumulative silence time
-            if consecutive_silence_blocks >= max_silence_blocks and spoken_sec >= MIN_SPOKEN:
+            if detected_speech and consecutive_silence_blocks >= max_silence_blocks and spoken_sec >= MIN_SPOKEN:
                 if VERBOSE_DEBUG:
                     print(f"✅ Stopping: {spoken_sec:.2f}s speech, {silence_sec:.2f}s silence, {consecutive_silence_blocks} consecutive silent blocks")
                 break
             
-            # Safety: stop if we've recorded more than MAX_RECORD_SEC total (prevents infinite loops)
+            if not detected_speech and total_time >= INITIAL_SILENCE_ABORT:
+                if VERBOSE_DEBUG:
+                    print(f"[DEBUG] Aborting capture after {total_time:.1f}s (no speech detected)")
+                break
+
+            # If no speech was detected yet, allow early abort after a short timeout
             if total_time > MAX_RECORD_SEC:
                 print(f"⚠️ Recording timeout ({MAX_RECORD_SEC}s) - stopping anyway (had {spoken_sec:.2f}s speech)")
                 break
             
             # Debug output every 2 seconds if verbose
             if VERBOSE_DEBUG and len(frames) % 10 == 0:  # Every 2 seconds (10 blocks * 0.2s)
-                print(f"[DEBUG] Time: {total_time:.1f}s, Speech: {spoken_sec:.2f}s, Silence: {silence_sec:.2f}s, Level: {level}, Consecutive silent: {consecutive_silence_blocks}")
+                print(f"[DEBUG] Time: {total_time:.1f}s, Speech: {spoken_sec:.2f}s, Silence: {silence_sec:.2f}s, Silent blocks: {consecutive_silence_blocks}")
+
+    if not detected_speech:
+        if VERBOSE_DEBUG:
+            print("🤫 Silence/noise only clip discarded")
+        return None
     audio = np.concatenate(frames, axis=0).astype(np.int16)
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     tmpdir = os.path.join(tempfile.gettempdir(), "voice_clips")
@@ -791,7 +1481,7 @@ def try_local_rules(text: str):
         
         # Single object type (original logic)
         qty = _maybe_quantity(tl)
-        
+
         def make_add_cmd_single(template):
             op, param_map = template
             base_kwargs = _extract_common_kwargs(words)
@@ -836,39 +1526,74 @@ def try_local_rules(text: str):
 
 # ------------------ GPT Fallback ------------------
 
-def _get_reference_knowledge(target_object: str):
-    """Get reference knowledge about common 3D objects (Phase 3)."""
-    if not target_object:
-        return None
-    
-    target_lower = target_object.lower()
-    
-    # Reference knowledge base for common objects
+# Cache for generated reference knowledge
+_REFERENCE_CACHE = {}
+
+def _get_hardcoded_reference(target_lower: str):
+    """Fallback to hardcoded templates for common objects."""
     knowledge = {
         "echo dot": {
             "description": "Amazon Echo Dot - a small cylindrical smart speaker",
             "typical_geometry": {
                 "shape": "cylinder with rounded top and bottom",
-                "proportions": "roughly 1:1:1 (height ≈ diameter)",
+                "proportions": "roughly 1:1:1 (height ≈ diameter), approximately 3-4 units in Blender scale",
                 "features": [
-                    "Circular top face with button/light",
+                    "Circular top face with button/light array (4 small circular indentations)",
                     "Cylindrical body with fabric mesh texture",
                     "Rounded edges (beveled)",
                     "Bottom with rubber base",
+                    "Ring detail around the top edge",
                 ],
             },
             "modeling_approach": [
-                "Start with cylinder primitive",
-                "Add subdivision surface for smoothness",
-                "Bevel edges for rounded appearance",
-                "Use loop cuts for button/light details",
-                "Consider fabric texture with displacement or normal map",
+                "Step 1: Create base cylinder (mesh.primitive_cylinder_add) with radius ~1.5-2.0, depth ~1.5-2.0",
+                "Step 2: Enter EDIT mode and add loop cuts near top and bottom for detail",
+                "Step 3: Bevel top and bottom edges for rounded appearance",
+                "Step 4: On top face, create 4 small circular indentations (inset faces, then extrude inward)",
+                "Step 5: Add subdivision surface modifier for smoothness",
+                "Step 6: Scale/position as needed",
             ],
+            "step_by_step_template": {
+                "base_primitive": {
+                    "op": "mesh.primitive_cylinder_add",
+                    "kwargs": {"radius": 1.8, "depth": 1.8, "vertices": 32},
+                    "description": "Create main cylindrical body"
+                },
+                "loop_cuts": {
+                    "op": "mesh.loopcut",
+                    "kwargs": {"number_cuts": 2},
+                    "description": "Add detail loops for beveling",
+                    "requires_edit_mode": True
+                },
+                "bevel_edges": {
+                    "op": "mesh.bevel",
+                    "kwargs": {"offset": 0.05, "segments": 3},
+                    "description": "Round the top and bottom edges",
+                    "requires_edit_mode": True
+                },
+                "top_details": {
+                    "description": "Create 4 button indentations on top face",
+                    "steps": [
+                        "Select top face",
+                        "Inset faces (mesh.inset_faces) with small amount",
+                        "Extrude region (mesh.extrude_region) inward slightly",
+                        "Repeat for 4 positions in square pattern"
+                    ]
+                },
+                "subdivision": {
+                    "op": "object.modifier_add",
+                    "kwargs": {"type": "SUBSURF"},
+                    "description": "Add smoothness",
+                    "requires_object_mode": True
+                }
+            },
             "common_operations": [
                 "mesh.primitive_cylinder_add",
                 "object.modifier_add(type='SUBSURF')",
                 "mesh.bevel",
                 "mesh.loopcut",
+                "mesh.inset_faces",
+                "mesh.extrude_region",
                 "transform.resize",
             ],
         },
@@ -876,26 +1601,65 @@ def _get_reference_knowledge(target_object: str):
             "description": "Smartphone - rectangular device with rounded corners",
             "typical_geometry": {
                 "shape": "rectangular prism with rounded corners",
-                "proportions": "roughly 16:9 aspect ratio, thin depth",
+                "proportions": "roughly 16:9 aspect ratio (width:height), very thin depth (~0.1-0.15 units)",
                 "features": [
-                    "Large flat screen face",
-                    "Rounded corners (fillet)",
-                    "Thin bezel around screen",
-                    "Camera bump on back",
-                    "Button cutouts",
+                    "Large flat screen face (front)",
+                    "Rounded corners (fillet/bevel)",
+                    "Thin bezel around screen (inset on front face)",
+                    "Camera bump on back (small extruded rectangle)",
+                    "Button cutouts on sides",
+                    "Very thin profile (depth << width/height)",
                 ],
             },
             "modeling_approach": [
-                "Start with cube or plane",
-                "Scale to phone proportions",
-                "Bevel corners for rounded edges",
-                "Add inset for screen bezel",
-                "Extrude for camera bump",
+                "Step 1: Create base cube (mesh.primitive_cube_add)",
+                "Step 2: Scale to phone proportions: width ~6-8, height ~10-14, depth ~0.1-0.15 (make it very thin)",
+                "Step 3: Enter EDIT mode and bevel all edges for rounded corners",
+                "Step 4: Select front face and inset for screen bezel",
+                "Step 5: Select back face, inset slightly, then extrude outward for camera bump",
+                "Step 6: Add small details (button cutouts on sides if needed)",
             ],
+            "step_by_step_template": {
+                "base_primitive": {
+                    "op": "mesh.primitive_cube_add",
+                    "kwargs": {"size": 1.0},
+                    "description": "Create base cube"
+                },
+                "scale_to_proportions": {
+                    "op": "transform.resize",
+                    "kwargs": {"value": (7.0, 12.0, 0.12)},
+                    "description": "Scale to phone proportions (width, height, very thin depth)",
+                    "note": "Depth should be much smaller than width/height (phone is very thin)"
+                },
+                "bevel_edges": {
+                    "op": "mesh.bevel",
+                    "kwargs": {"offset": 0.2, "segments": 4},
+                    "description": "Round all edges for phone-like appearance",
+                    "requires_edit_mode": True
+                },
+                "screen_bezel": {
+                    "description": "Create screen bezel on front face",
+                    "steps": [
+                        "Select front face (largest face)",
+                        "Inset faces (mesh.inset_faces) with small amount (~0.1-0.2)",
+                        "This creates the bezel around the screen"
+                    ]
+                },
+                "camera_bump": {
+                    "description": "Create camera bump on back",
+                    "steps": [
+                        "Select back face (opposite of front)",
+                        "Inset faces slightly",
+                        "Extrude region (mesh.extrude_region) outward by small amount (~0.05-0.1)",
+                        "This creates the camera bump"
+                    ]
+                }
+            },
             "common_operations": [
                 "mesh.primitive_cube_add",
                 "mesh.inset_faces",
                 "mesh.extrude_faces",
+                "mesh.extrude_region",
                 "mesh.bevel",
                 "transform.resize",
             ],
@@ -922,6 +1686,114 @@ def _get_reference_knowledge(target_object: str):
     for key, info in knowledge.items():
         if key in target_lower or target_lower in key:
             return info
+    
+    return None
+
+def _get_reference_knowledge(target_object: str, use_gpt=True):
+    """Get reference knowledge about any 3D object - dynamically generated via GPT or cached."""
+    if not target_object:
+        return None
+    
+    target_lower = target_object.lower()
+    
+    # Check cache first
+    if target_lower in _REFERENCE_CACHE:
+        return _REFERENCE_CACHE[target_lower]
+    
+    # Try hardcoded templates first (for common objects - keep existing ones)
+    hardcoded = _get_hardcoded_reference(target_lower)
+    if hardcoded:
+        _REFERENCE_CACHE[target_lower] = hardcoded
+        return hardcoded
+    
+    # Generate dynamically using GPT if enabled
+    if use_gpt and ENABLE_GPT_FALLBACK:
+        api_key = _get_openai_api_key()
+        if api_key:
+            try:
+                from openai import OpenAI
+                client = OpenAI(api_key=api_key)
+                
+                prompt = f"""You are a 3D modeling expert specializing in Blender. Generate comprehensive reference knowledge for modeling a "{target_object}" in Blender.
+
+Provide a JSON response with this exact structure:
+{{
+    "description": "Brief 1-2 sentence description of the object",
+    "typical_geometry": {{
+        "shape": "Overall shape description (e.g., 'cylindrical', 'rectangular prism', 'organic curved')",
+        "proportions": "Typical size ratios and dimensions (e.g., 'roughly 1:1:1 (height ≈ diameter), approximately 3-4 units in Blender scale')",
+        "features": ["Key visual feature 1", "Key visual feature 2", "Key visual feature 3"]
+    }},
+    "modeling_approach": [
+        "Step 1: Create base primitive (specify which and dimensions)",
+        "Step 2: Enter EDIT mode and...",
+        "Step 3: Add details by...",
+        "Step 4: Apply modifiers for...",
+        "Step 5: Final adjustments..."
+    ],
+    "step_by_step_template": {{
+        "base_primitive": {{
+            "op": "mesh.primitive_cube_add",
+            "kwargs": {{"size": 1.0}},
+            "description": "Create base shape"
+        }},
+        "detail_step_1": {{
+            "op": "mesh.bevel",
+            "kwargs": {{"offset": 0.1, "segments": 3}},
+            "description": "Round edges",
+            "requires_edit_mode": true
+        }}
+    }},
+    "common_operations": ["mesh.primitive_cube_add", "mesh.bevel", "transform.resize"]
+}}
+
+Guidelines:
+- Be specific about Blender operations and operators
+- Include realistic proportions and dimensions
+- Focus on key visual features that make the object recognizable
+- Provide step-by-step workflow that's actually achievable in Blender
+- Use proper Blender operator names (mesh.*, object.*, transform.*)
+- Consider both OBJECT and EDIT modes where appropriate
+"""
+                
+                response = client.chat.completions.create(
+                    model="gpt-4o",
+                    messages=[
+                        {"role": "system", "content": "You are a 3D modeling expert. Return only valid JSON matching the exact structure requested. Do not include markdown code fences."},
+                        {"role": "user", "content": prompt}
+                    ],
+                    temperature=0.3,
+                    response_format={"type": "json_object"}
+                )
+                
+                content = response.choices[0].message.content.strip()
+                # Remove any markdown code fences if present
+                if content.startswith("```"):
+                    content = content.split("```", 2)[-1].strip()
+                    if content.startswith("json"):
+                        content = content[4:].strip()
+                
+                generated = json.loads(content)
+                
+                # Validate structure
+                if isinstance(generated, dict) and "description" in generated:
+                    _REFERENCE_CACHE[target_lower] = generated
+                    print(f"[ReAct] Generated reference template for: {target_object}")
+                    return generated
+                else:
+                    if VERBOSE_DEBUG:
+                        print(f"[DEBUG] Generated reference has invalid structure")
+                    return None
+                
+            except json.JSONDecodeError as e:
+                if VERBOSE_DEBUG:
+                    print(f"[DEBUG] JSON parse error for {target_object}: {e}")
+                    print(f"[DEBUG] Response was: {content[:200]}")
+                return None
+            except Exception as e:
+                if VERBOSE_DEBUG:
+                    print(f"[DEBUG] Failed to generate reference for {target_object}: {e}")
+                return None
     
     return None
 
@@ -1003,7 +1875,7 @@ def _get_best_practices_guidance(modeling_context, mesh_analysis, target_object)
     
     return practices
 
-def gpt_to_json(transcript: str, modeling_context=None, mesh_analysis=None, target_object=""):
+def gpt_to_json(transcript: str, modeling_context=None, mesh_analysis=None, target_object="", screenshot_data=None):
     """
     Convert natural language transcript to Blender operation JSON.
     
@@ -1011,7 +1883,8 @@ def gpt_to_json(transcript: str, modeling_context=None, mesh_analysis=None, targ
         transcript: Voice command text
         modeling_context: Current modeling context (from get_modeling_context RPC)
         mesh_analysis: Current mesh analysis (from analyze_current_mesh RPC)
-        target_object: Target object name for Super Mode
+        target_object: Modeling target provided by Blender preferences
+        screenshot_data: Base64-encoded screenshot image (optional)
     """
     # allow disabling while debugging
     if not ENABLE_GPT_FALLBACK:
@@ -1056,7 +1929,7 @@ def gpt_to_json(transcript: str, modeling_context=None, mesh_analysis=None, targ
     mode_ops = _get_mode_aware_operations(current_mode, has_mesh)
     best_practices = _get_best_practices_guidance(modeling_context, mesh_analysis, target_object)
     
-    # Add context information if available (Phase 2: Super Mode)
+    # Add context information if available
     if modeling_context or mesh_analysis or target_object:
         system_parts.append("\n--- Current Scene Context ---")
         
@@ -1272,9 +2145,57 @@ def gpt_to_json(transcript: str, modeling_context=None, mesh_analysis=None, targ
         
         # Create client with explicit key
         client = OpenAI(api_key=api_key)
+        
+        # Build messages with conversation history and image
+        messages = [{"role": "system", "content": system}]
+        
+        # Add conversation history (last 10 messages)
+        history = get_conversation_context(max_messages=10)
+        for hist_msg in history:
+            # Reconstruct message from history
+            msg_content = hist_msg["content"]
+            # If history has images, include them
+            if hist_msg.get("images") and hist_msg["images"]:
+                # Format as vision API message
+                content_list = [{"type": "text", "text": msg_content}]
+                for img_data in hist_msg["images"]:
+                    content_list.append({
+                        "type": "image_url",
+                        "image_url": {
+                            "url": f"data:image/png;base64,{img_data}"
+                        }
+                    })
+                messages.append({
+                    "role": hist_msg["role"],
+                    "content": content_list
+                })
+            else:
+                messages.append({
+                    "role": hist_msg["role"],
+                    "content": msg_content
+                })
+        
+        # Add current user message with optional screenshot
+        if screenshot_data:
+            user_content = [
+                {"type": "text", "text": user},
+                {
+                    "type": "image_url",
+                    "image_url": {
+                        "url": f"data:image/png;base64,{screenshot_data}"
+                    }
+                }
+            ]
+            print(f"📸 Including viewport screenshot in GPT call ({len(screenshot_data)} bytes)")
+        else:
+            user_content = user
+            print("⚠️ No screenshot available for this GPT call")
+        
+        messages.append({"role": "user", "content": user_content})
+        
         resp = client.chat.completions.create(
             model="gpt-4o",
-            messages=[{"role":"system","content":system},{"role":"user","content":user}],
+            messages=messages,
             temperature=0,
         )
         out = (resp.choices[0].message.content or "").strip()
@@ -1287,8 +2208,14 @@ def gpt_to_json(transcript: str, modeling_context=None, mesh_analysis=None, targ
             print("⚠️ JSON parse error:", e, "RAW:", out[:2000])
             return None
         if isinstance(cmd, dict) and "op" in cmd:
+            # Save to conversation history
+            add_to_conversation_history("user", transcript, [screenshot_data] if screenshot_data else None)
+            add_to_conversation_history("assistant", out)
             return cmd
         if isinstance(cmd, list) and all(isinstance(x, dict) and "op" in x for x in cmd):
+            # Save to conversation history
+            add_to_conversation_history("user", transcript, [screenshot_data] if screenshot_data else None)
+            add_to_conversation_history("assistant", out)
             return cmd
         print("⚠️ GPT returned JSON but missing 'op':", str(out)[:500])
         return None
@@ -1326,6 +2253,7 @@ def send_to_blender(cmd: dict):
         # e.g. rpc.enqueue_op or rpc.enqueue
         res = rpc.enqueue_op_safe(op, kwargs)
         print("✅ RPC:", res); sys.stdout.flush()
+        return res
     except Exception as e:
         print("❌ RPC failed:", e)
         traceback.print_exc()
@@ -1367,19 +2295,16 @@ if __name__ == "__main__":
         try:
             api_key = _get_openai_api_key()
             if api_key:
-                # Show first few chars for verification (keys start with "sk-")
                 key_preview = api_key[:7] + "..." if len(api_key) > 7 else api_key
                 print(f"✅ OpenAI API key loaded and cached ({key_preview})")
-                # Validate format
                 if not api_key.startswith("sk-") and not api_key.startswith("sk-proj-"):
                     print(f"⚠️ Warning: API key format looks unusual (should start with 'sk-' or 'sk-proj-')")
             elif ENABLE_GPT_FALLBACK:
                 print("⚠️ OpenAI API key not set in preferences or environment; GPT fallback disabled")
         except Exception as e:
             print("⚠️ Could not get OpenAI API key:", e)
-            # Try environment variable as fallback
             try:
-                api_key = _get_openai_api_key()  # Will try env var
+                api_key = _get_openai_api_key()
                 if api_key and ENABLE_GPT_FALLBACK:
                     print("✅ Using OpenAI API key from environment variable (cached)")
             except Exception:
@@ -1387,24 +2312,22 @@ if __name__ == "__main__":
 
         while True:
             try:
-                # Check if voice listening is enabled via RPC (quick check before recording)
                 listening_enabled = True
                 if rpc is not None:
                     try:
                         state = rpc.get_voice_listening_state()
                         listening_enabled = state.get("enabled", True)
                     except Exception:
-                        # If RPC call fails, assume listening is enabled
                         listening_enabled = True
                 
                 if not listening_enabled:
-                    # Listening is paused, check more frequently for responsive toggling
                     time.sleep(0.1)
                     continue
                 
                 wav = record_until_silence()
+                if not wav:
+                    continue
                 
-                # Check listening state AGAIN after recording (user might have toggled during recording)
                 listening_enabled = True
                 if rpc is not None:
                     try:
@@ -1414,7 +2337,6 @@ if __name__ == "__main__":
                         listening_enabled = True
                 
                 if not listening_enabled:
-                    # Listening was disabled during recording, skip processing
                     print("⏸️ Listening disabled - skipping audio processing"); sys.stdout.flush()
                     continue
                 
@@ -1424,72 +2346,99 @@ if __name__ == "__main__":
                     continue
                 print("📝 Transcript ->", text); sys.stdout.flush()
 
-                # Mark start of new voice command (pushes undo point)
                 if rpc is not None:
                     try:
                         rpc.start_voice_command()
                     except Exception:
-                        pass  # Ignore if RPC doesn't support it yet
+                        pass
                     
-                    # Check super mode state
                     try:
                         super_state = rpc.get_super_mode_state()
-                        SUPER_MODE_ENABLED = super_state.get("enabled", False)
                         SUPER_MODE_TARGET = super_state.get("target_object", "")
-                        if SUPER_MODE_ENABLED and SUPER_MODE_TARGET:
-                            print(f"⚡ Super Mode: Building {SUPER_MODE_TARGET}")
+                        USE_REACT_REASONING = bool(super_state.get("use_react", False))
+                        if SUPER_MODE_TARGET:
+                            print(f"🎯 Modeling target: {SUPER_MODE_TARGET}")
+                        if USE_REACT_REASONING:
+                            print("[ReAct] Iterative reasoning enabled")
                     except Exception:
-                        SUPER_MODE_ENABLED = False
                         SUPER_MODE_TARGET = ""
+                        USE_REACT_REASONING = False
                 else:
-                    SUPER_MODE_ENABLED = False
                     SUPER_MODE_TARGET = ""
+                    USE_REACT_REASONING = False
 
-                # Check if command contains references (them, it, these, those, they)
-                # If so, send full command to GPT for better context understanding
                 has_references = bool(re.search(r'\b(them|it|these|those|they|all of them|each of them)\b', text, re.IGNORECASE))
-                
-                # Split into multiple commands if needed
                 command_parts = _split_multiple_commands(text)
-                
+
+                context_cache = {"modeling": None, "mesh": None, "scene": None, "screenshot": None}
+
+                def ensure_context():
+                    # Always fetch fresh screenshot (don't cache it) since scene changes between commands
+                    # But cache modeling/mesh/scene context to avoid repeated RPC calls
+                    if context_cache["modeling"] is None:
+                        print("[Context] Fetching fresh context (first time)...")
+                        modeling_context_cache, mesh_analysis_cache, scene_analysis_cache, screenshot_cache = _fetch_context_for_gpt(include_screenshot=True)
+                        context_cache["modeling"] = modeling_context_cache
+                        context_cache["mesh"] = mesh_analysis_cache
+                        context_cache["scene"] = scene_analysis_cache
+                        context_cache["screenshot"] = screenshot_cache
+                        print(f"[Context] Cached context, screenshot: {'✅' if screenshot_cache else '❌ None'}")
+                    else:
+                        # Context is cached, but always get fresh screenshot
+                        print("[Context] Context cached, fetching fresh screenshot...")
+                        _, _, _, screenshot_cache = _fetch_context_for_gpt(include_screenshot=True)
+                        context_cache["screenshot"] = screenshot_cache
+                        print(f"[Context] Fresh screenshot: {'✅' if screenshot_cache else '❌ None'}")
+                    return context_cache["modeling"], context_cache["mesh"], context_cache.get("scene"), context_cache.get("screenshot")
+
                 all_commands = []
-                
-                # If command has references, send full original text to GPT for better understanding
-                if has_references and ENABLE_GPT_FALLBACK:
-                    # Try local rules first on individual parts
-                    local_cmds = []
-                    for part in command_parts:
-                        cmd = try_io_rules(part)
-                        cmd = cmd or try_local_rules(part)
-                        if cmd:
-                            if isinstance(cmd, list):
-                                local_cmds.extend(cmd)
-                            else:
-                                local_cmds.append(cmd)
-                    
-                    # If we got some local matches but not all, or if we need GPT for references
-                    # Send full command to GPT with context about what was already done
-                    if len(local_cmds) < len(command_parts) or has_references:
-                        # Fetch context from Blender
-                        modeling_context = None
-                        mesh_analysis = None
+
+                local_sequence = None
+                if not has_references:
+                    local_sequence = _resolve_local_sequence(command_parts)
+
+                if local_sequence:
+                    all_commands = local_sequence
+                else:
+                    react_attempted = False
+                    if USE_REACT_REASONING and ENABLE_GPT_FALLBACK:
+                        ensure_context()
+                        react_result = gpt_to_json_react(
+                            text,
+                            modeling_context=context_cache["modeling"],
+                            mesh_analysis=context_cache["mesh"],
+                            scene_analysis=context_cache.get("scene"),
+                            target_object=SUPER_MODE_TARGET,
+                            screenshot_data=context_cache.get("screenshot"),
+                        )
+                        react_attempted = True
+                        if react_result:
+                            executed = len(react_result.get("commands", []))
+                            iterations = react_result.get("iterations", "?")
+                            print(f"[ReAct] Executed {executed} commands in {iterations} iterations")
+                            continue
+                        else:
+                            print("[ReAct] No plan returned, falling back to standard GPT")
+
+                    if has_references and ENABLE_GPT_FALLBACK:
+                        local_cmds = []
+                        for part in command_parts:
+                            cmd = try_io_rules(part)
+                            cmd = cmd or try_local_rules(part)
+                            if cmd:
+                                if isinstance(cmd, list):
+                                    local_cmds.extend(cmd)
+                                else:
+                                    local_cmds.append(cmd)
                         
-                        try:
-                            if rpc is not None:
-                                modeling_context = rpc.get_modeling_context()
-                                if modeling_context and modeling_context.get("active_object"):
-                                    ao = modeling_context["active_object"]
-                                    if ao.get("type") == "MESH":
-                                        mesh_analysis = rpc.analyze_current_mesh()
-                        except Exception as e:
-                            if VERBOSE_DEBUG:
-                                print(f"[DEBUG] Error fetching context: {e}")
-                        
-                        # Send FULL original command to GPT for reference resolution
-                        gpt_cmd = gpt_to_json(text,  # Full original text, not split parts
-                                            modeling_context=modeling_context,
-                                            mesh_analysis=mesh_analysis,
-                                            target_object=SUPER_MODE_TARGET)
+                        ensure_context()
+                        gpt_cmd = gpt_to_json(
+                            text,
+                            modeling_context=context_cache["modeling"],
+                            mesh_analysis=context_cache["mesh"],
+                            target_object=SUPER_MODE_TARGET,
+                            screenshot_data=context_cache.get("screenshot"),
+                        )
                         
                         if gpt_cmd:
                             if isinstance(gpt_cmd, list):
@@ -1497,57 +2446,29 @@ if __name__ == "__main__":
                             else:
                                 all_commands.append(gpt_cmd)
                         else:
-                            # Fallback: use local commands we found
                             all_commands.extend(local_cmds)
                     else:
-                        # All parts matched locally
-                        all_commands.extend(local_cmds)
-                else:
-                    # No references, process parts individually
-                    for part in command_parts:
-                        # Route based on mode
-                        if SUPER_MODE_ENABLED:
-                            # Super Mode: Try local rules first, then enhanced GPT with context
+                        for part in command_parts:
                             cmd = try_io_rules(part)
                             cmd = cmd or try_local_rules(part)
                             
-                            # If no local match, use GPT with super mode context (Phase 2)
                             if not cmd and ENABLE_GPT_FALLBACK:
-                                # Fetch context from Blender
-                                modeling_context = None
-                                mesh_analysis = None
-                                
-                                try:
-                                    if rpc is not None:
-                                        modeling_context = rpc.get_modeling_context()
-                                        # Only analyze mesh if we have an active mesh object
-                                        if modeling_context and modeling_context.get("active_object"):
-                                            ao = modeling_context["active_object"]
-                                            if ao.get("type") == "MESH":
-                                                mesh_analysis = rpc.analyze_current_mesh()
-                                except Exception as e:
-                                    if VERBOSE_DEBUG:
-                                        print(f"[DEBUG] Error fetching context: {e}")
-                                    # Continue without context if fetch fails
-                                
-                                cmd = gpt_to_json(part, 
-                                                modeling_context=modeling_context,
-                                                mesh_analysis=mesh_analysis,
-                                                target_object=SUPER_MODE_TARGET)
-                        else:
-                            # Normal Mode: Fast path
-                            cmd = try_io_rules(part)
-                            cmd = cmd or try_local_rules(part)
-                            cmd = cmd or gpt_to_json(part)
-                        
-                        if cmd:
-                            if isinstance(cmd, list):
-                                all_commands.extend(cmd)
-                            else:
-                                all_commands.append(cmd)
+                                ensure_context()
+                                cmd = gpt_to_json(
+                                    part,
+                                    modeling_context=context_cache["modeling"],
+                                    mesh_analysis=context_cache["mesh"],
+                                    target_object=SUPER_MODE_TARGET,
+                                    screenshot_data=context_cache.get("screenshot"),
+                                )
+                            
+                            if cmd:
+                                if isinstance(cmd, list):
+                                    all_commands.extend(cmd)
+                                else:
+                                    all_commands.append(cmd)
                 
                 if all_commands:
-                    # Final check: ensure listening is still enabled before sending commands
                     listening_enabled = True
                     if rpc is not None:
                         try:
@@ -1561,11 +2482,11 @@ if __name__ == "__main__":
                     else:
                         for single in all_commands:
                             send_to_blender(single)
-                            time.sleep(0.01)  # Small delay between commands (reduced from 0.05)
+                            time.sleep(0.01)
                 else:
                     print("🤷 No command derived for:", text); sys.stdout.flush()
 
-                time.sleep(0.05)  # Reduced from 0.2 for faster response
+                    time.sleep(0.05)
 
             except KeyboardInterrupt:
                 print("\nBye.")
@@ -1573,8 +2494,7 @@ if __name__ == "__main__":
             except Exception as e:
                 print("💥 Loop error:", e)
                 traceback.print_exc()
-                # Don't die; keep the panel/process alive
-                time.sleep(0.1)  # Reduced from 0.3 for faster response
+                time.sleep(0.1)
                 continue
     except Exception as e:
         print("\n" + "=" * 70)

@@ -18,7 +18,7 @@ import subprocess
 import shutil
 import bmesh
 from xmlrpc.server import SimpleXMLRPCServer, SimpleXMLRPCRequestHandler
-from bpy.props import StringProperty, EnumProperty
+from bpy.props import StringProperty, EnumProperty, BoolProperty
 from bpy.types import AddonPreferences, Operator, Panel
 
 ADDON_ROOT = (__package__ or __name__).split(".")[0]  # "SpeechToBlender"
@@ -71,6 +71,12 @@ class STB_AddonPreferences(AddonPreferences):
         default="glb,fbx,obj",
     )
     
+    use_react_reasoning: bpy.props.BoolProperty(
+        name="Use ReAct Reasoning",
+        description="Let GPT iterate with Thought/Action/Observation loops for complex requests (slower, more API calls)",
+        default=False,
+    )
+    
     def _update_openai_key_part1(self, context):
         """Update callback to strip whitespace from part 1."""
         if self.openai_api_key_part1:
@@ -112,9 +118,9 @@ class STB_AddonPreferences(AddonPreferences):
         maxlen=200,
     )
     
-    # Super Mode settings
+    # Modeling context settings (formerly Super Mode)
     super_mode_target_object: StringProperty(
-        name="Target Object",
+        name="Modeling Target",
         description="What are you building? (e.g., 'Echo Dot', 'Coffee Mug', 'Character Head')",
         default="",
     )
@@ -141,6 +147,9 @@ class STB_AddonPreferences(AddonPreferences):
         col.label(text="OpenAI API Key (split into two parts):", icon="INFO")
         col.prop(self, "openai_api_key_part1")
         col.prop(self, "openai_api_key_part2")
+        col.separator()
+        col.prop(self, "use_react_reasoning", icon="LOOP_BACK")
+        col.label(text="ReAct enables step-by-step reasoning (slower, more API credits)", icon="INFO")
         
         # Show combined length
         part1_len = len(self.openai_api_key_part1) if self.openai_api_key_part1 else 0
@@ -161,14 +170,14 @@ class STB_AddonPreferences(AddonPreferences):
         col.separator()
         col.label(text="Used for natural language command understanding", icon="INFO")
         
-        # Super Mode Settings
+        # Modeling Context Settings
         box = layout.box()
-        box.label(text="Super Mode Settings", icon="LIGHT")
+        box.label(text="Modeling Context", icon="LIGHT")
         col = box.column(align=True)
         col.prop(self, "super_mode_target_object")
         col.separator()
-        col.label(text="Target object provides context for intelligent modeling", icon="INFO")
-        col.label(text="Example: 'Echo Dot', 'Coffee Mug', 'Smartphone'", icon="BLANK1")
+        col.label(text="Target object gives GPT extra context for modeling", icon="INFO")
+        col.label(text="Examples: 'Echo Dot', 'Coffee Mug', 'Smartphone'", icon="BLANK1")
 
 
 # ───────── Minimal operator and panels so UI never crashes ─────────
@@ -522,23 +531,23 @@ def _server_loop():
                 return "OK"
             
             def get_super_mode_state():
-                """RPC method: Get super mode state and context."""
+                """RPC method: Return modeling context state (always enabled)."""
                 try:
-                    wm = bpy.context.window_manager
-                    super_mode = getattr(wm, "stb_super_mode", False)
-                    
                     target_object = ""
+                    use_react = False
                     if ADDON_ROOT in bpy.context.preferences.addons:
                         addon_prefs = bpy.context.preferences.addons[ADDON_ROOT].preferences
                         target_object = getattr(addon_prefs, "super_mode_target_object", "")
+                        use_react = getattr(addon_prefs, "use_react_reasoning", False)
                     
                     return {
-                        "enabled": super_mode,
+                        "enabled": True,  # Mode is always on now
                         "target_object": target_object,
+                        "use_react": use_react,
                     }
                 except Exception as e:
-                    print(f"[SpeechToBlender] Error getting super mode state: {e}")
-                    return {"enabled": False, "target_object": ""}
+                    print(f"[SpeechToBlender] Error getting modeling state: {e}")
+                    return {"enabled": True, "target_object": "", "use_react": False}
             
             def get_modeling_context():
                 """RPC method: Get current modeling context (scene state, selected objects, mode, modifiers)."""
@@ -622,50 +631,116 @@ def _server_loop():
                     edge_count = len(mesh.edges)
                     face_count = len(mesh.polygons)
                     
-                    # Vertex positions (sample first 100 for context, not all)
-                    vertices_sample = []
-                    sample_size = min(100, vertex_count)
-                    for i in range(sample_size):
-                        v = mesh.vertices[i]
-                        vertices_sample.append({
+                    # FINE DETAILS: ALL vertices (not just sample)
+                    all_vertices = []
+                    for i, v in enumerate(mesh.vertices):
+                        all_vertices.append({
                             "index": i,
                             "co": tuple(v.co),
+                            "normal": tuple(v.normal) if hasattr(v, 'normal') else None,
+                            "select": v.select if hasattr(v, 'select') else False,
                         })
                     
-                    # Edge loop detection (simplified - find edges that form loops)
+                    # FINE DETAILS: All edges with connectivity
+                    all_edges = []
+                    for i, edge in enumerate(mesh.edges):
+                        all_edges.append({
+                            "index": i,
+                            "vertices": tuple(edge.vertices),
+                            "select": edge.select if hasattr(edge, 'select') else False,
+                        })
+                    
+                    # FINE DETAILS: All faces with vertex indices
+                    all_faces = []
+                    for i, face in enumerate(mesh.polygons):
+                        all_faces.append({
+                            "index": i,
+                            "vertices": tuple(face.vertices),
+                            "edges": tuple(face.edge_keys) if hasattr(face, 'edge_keys') else None,
+                            "normal": tuple(face.normal),
+                            "center": tuple(face.center),
+                            "area": face.area,
+                            "select": face.select if hasattr(face, 'select') else False,
+                        })
+                    
+                    # Edge loop detection (enhanced)
                     edge_loops = []
-                    # This is a simplified check - full edge loop detection is complex
-                    # For now, we'll identify potential loops by checking edge connectivity
                     if edge_count > 0:
-                        # Count edges per vertex (indicator of loop topology)
+                        # Build edge connectivity graph
                         vertex_edge_count = {}
+                        vertex_edges = {}  # Map vertex -> list of connected edges
                         for edge in mesh.edges:
                             for v_idx in edge.vertices:
                                 vertex_edge_count[v_idx] = vertex_edge_count.get(v_idx, 0) + 1
+                                if v_idx not in vertex_edges:
+                                    vertex_edges[v_idx] = []
+                                vertex_edges[v_idx].append(edge.index)
                         
-                        # Vertices with 2 edges are likely part of a loop
+                        # Find actual loops (vertices with exactly 2 edges)
                         loop_vertices = [v_idx for v_idx, count in vertex_edge_count.items() if count == 2]
                         if loop_vertices:
                             edge_loops.append({
                                 "type": "potential_loop",
                                 "vertex_count": len(loop_vertices),
+                                "vertices": loop_vertices[:50],  # Limit to first 50 for size
                             })
                     
-                    # Face topology analysis
+                    # Face topology analysis (detailed)
+                    # XML-RPC requires dictionary keys to be strings
                     face_types = {}
+                    n_gons = []  # Track problematic n-gons
                     for face in mesh.polygons:
                         vert_count = len(face.vertices)
-                        face_types[vert_count] = face_types.get(vert_count, 0) + 1
+                        key = str(vert_count)  # Convert to string for XML-RPC compatibility
+                        face_types[key] = face_types.get(key, 0) + 1
+                        if vert_count > 4:
+                            n_gons.append({
+                                "index": face.index,
+                                "vertex_count": vert_count,
+                            })
                     
-                    # Mesh bounds
+                    # Mesh bounds with enhanced geometry hints
                     if mesh.vertices:
                         coords = [v.co for v in mesh.vertices]
                         min_co = tuple(min(c[i] for c in coords) for i in range(3))
                         max_co = tuple(max(c[i] for c in coords) for i in range(3))
+                        size = tuple(max_co[i] - min_co[i] for i in range(3))
+                        
+                        # Enhanced geometry hints
+                        # Sort dimensions: width (x), depth (y), height (z) - typically largest to smallest
+                        sorted_dims = sorted(size, reverse=True)
+                        width, depth, height = size[0], size[1], size[2]
+                        
+                        # Average thickness (minimum dimension)
+                        avg_thickness = min(size)
+                        
+                        # Aspect ratios
+                        aspect_ratio_xy = width / depth if depth > 0.001 else 0
+                        aspect_ratio_xz = width / height if height > 0.001 else 0
+                        aspect_ratio_yz = depth / height if height > 0.001 else 0
+                        
+                        # Classification: flat vs tall
+                        # Flat: height is significantly smaller than width/depth
+                        # Tall: height is similar to or larger than width/depth
+                        is_flat = height < (width * 0.3) and height < (depth * 0.3)
+                        is_tall = height > (width * 0.7) or height > (depth * 0.7)
+                        shape_class = "flat" if is_flat else ("tall" if is_tall else "balanced")
+                        
                         bounds = {
                             "min": min_co,
                             "max": max_co,
-                            "size": tuple(max_co[i] - min_co[i] for i in range(3)),
+                            "size": size,
+                            "width": width,
+                            "depth": depth,
+                            "height": height,
+                            "avg_thickness": avg_thickness,
+                            "aspect_ratios": {
+                                "width_depth": aspect_ratio_xy,
+                                "width_height": aspect_ratio_xz,
+                                "depth_height": aspect_ratio_yz,
+                            },
+                            "shape_class": shape_class,
+                            "sorted_dimensions": sorted_dims,  # Largest to smallest
                         }
                     else:
                         bounds = None
@@ -699,10 +774,13 @@ def _server_loop():
                         "vertex_count": vertex_count,
                         "edge_count": edge_count,
                         "face_count": face_count,
-                        "vertices_sample": vertices_sample,
+                        "all_vertices": all_vertices,  # ALL vertices, not sample
+                        "all_edges": all_edges,  # ALL edges
+                        "all_faces": all_faces,  # ALL faces
                         "edge_loops": edge_loops,
                         "face_topology": {
                             "face_types": face_types,  # {3: count, 4: count, ...} for triangles, quads, etc.
+                            "n_gons": n_gons[:20],  # First 20 n-gons
                         },
                         "bounds": bounds,
                         "selection": {
@@ -719,6 +797,356 @@ def _server_loop():
                     traceback.print_exc()
                     return {"error": str(e)}
             
+            def capture_viewport_screenshot():
+                """RPC method: Capture current Blender viewport as base64-encoded PNG image.
+                Uses screen capture to get the Blender window directly."""
+                try:
+                    import base64
+                    import tempfile
+                    import os
+                    import sys
+                    
+                    print("[SpeechToBlender] 📸 Starting viewport screenshot capture (screen capture method)...")
+                    
+                    # Try multiple methods for screen capture
+                    screenshot_data = None
+                    
+                    # Method 1: Try using PIL/Pillow with screen capture (if available)
+                    try:
+                        from PIL import ImageGrab
+                        print("[SpeechToBlender] 📸 Attempting PIL.ImageGrab screen capture...")
+                        # Capture entire screen
+                        screenshot = ImageGrab.grab()
+                        temp_path = tempfile.mktemp(suffix='.png')
+                        screenshot.save(temp_path, 'PNG')
+                        
+                        with open(temp_path, 'rb') as f:
+                            image_data = f.read()
+                            screenshot_data = base64.b64encode(image_data).decode('utf-8')
+                        
+                        os.remove(temp_path)
+                        print(f"[SpeechToBlender] ✅ Captured screenshot using PIL.ImageGrab: {len(image_data)} bytes raw, {len(screenshot_data)} chars base64")
+                        return {"image_base64": screenshot_data, "format": "png"}
+                    except ImportError as e:
+                        print(f"[SpeechToBlender] ⚠️ PIL/Pillow not available: {e}, trying mss...")
+                    except Exception as e:
+                        print(f"[SpeechToBlender] ⚠️ PIL.ImageGrab failed: {e}, trying mss...")
+                        import traceback
+                        traceback.print_exc()
+                    
+                    # Method 2: Try using mss (if available) - faster and more reliable
+                    try:
+                        import mss
+                        print("[SpeechToBlender] 📸 Attempting mss screen capture...")
+                        with mss.mss() as sct:
+                            # Capture entire screen
+                            screenshot = sct.grab(sct.monitors[0])  # Primary monitor
+                            temp_path = tempfile.mktemp(suffix='.png')
+                            mss.tools.to_png(screenshot.rgb, screenshot.size, output=temp_path)
+                            
+                            with open(temp_path, 'rb') as f:
+                                image_data = f.read()
+                                screenshot_data = base64.b64encode(image_data).decode('utf-8')
+                            
+                            os.remove(temp_path)
+                            print(f"[SpeechToBlender] ✅ Captured screenshot using mss: {len(image_data)} bytes raw, {len(screenshot_data)} chars base64")
+                            return {"image_base64": screenshot_data, "format": "png"}
+                    except ImportError as e:
+                        print(f"[SpeechToBlender] ⚠️ mss not available: {e}, trying Blender render method...")
+                    except Exception as e:
+                        print(f"[SpeechToBlender] ⚠️ mss failed: {e}, trying Blender render method...")
+                        import traceback
+                        traceback.print_exc()
+                    
+                    # Method 3: Fallback to Blender render (if screen capture libraries not available)
+                    # This runs synchronously on the RPC thread but should work
+                    try:
+                        context = bpy.context
+                        
+                        # Find a 3D viewport area
+                        viewport_area = None
+                        for area in context.screen.areas:
+                            if area.type == 'VIEW_3D':
+                                viewport_area = area
+                                break
+                        
+                        if viewport_area:
+                            # Override context to use the 3D viewport
+                            override = context.copy()
+                            override['area'] = viewport_area
+                            override['region'] = viewport_area.regions[-1]  # Main region
+                            
+                            try:
+                                # Use OpenGL render with context override
+                                bpy.ops.render.opengl(override, write_still=False)
+                                print("[SpeechToBlender] ✅ Used render.opengl with context override")
+                            except Exception as e:
+                                print(f"[SpeechToBlender] ⚠️ render.opengl failed: {e}, trying render.render()...")
+                                # Fall back to regular render
+                                bpy.ops.render.render(override, write_still=False)
+                        else:
+                            # No 3D viewport found, use regular render
+                            print("[SpeechToBlender] ⚠️ No 3D viewport found, using render.render()...")
+                            bpy.ops.render.render(write_still=False)
+                        
+                        # Get the rendered image from Render Result
+                        render_result = bpy.data.images.get('Render Result')
+                        if not render_result:
+                            return {"error": "Could not get Render Result image"}
+                        
+                        print(f"[SpeechToBlender] ✅ Got Render Result: {render_result.size[0]}x{render_result.size[1]}")
+                        
+                        # Save to temporary file
+                        temp_path = tempfile.mktemp(suffix='.png')
+                        render_result.save_render(temp_path)
+                        print(f"[SpeechToBlender] 💾 Saved render to temp file: {temp_path}")
+                        
+                        # Read and encode as base64
+                        with open(temp_path, 'rb') as f:
+                            image_data = f.read()
+                            screenshot_data = base64.b64encode(image_data).decode('utf-8')
+                        
+                        print(f"[SpeechToBlender] ✅ Encoded to base64: {len(image_data)} bytes raw, {len(screenshot_data)} chars base64")
+                        
+                        # Cleanup temp file
+                        try:
+                            os.remove(temp_path)
+                            print(f"[SpeechToBlender] 🗑️ Cleaned up temp file")
+                        except Exception:
+                            pass
+                        
+                        return {"image_base64": screenshot_data, "format": "png"}
+                    except Exception as e:
+                        print(f"[SpeechToBlender] ⚠️ Blender render method failed: {e}")
+                        return {"error": f"All screenshot methods failed. Last error: {str(e)}. Install Pillow (pip install Pillow) or mss (pip install mss) for better screen capture."}
+                    
+                except Exception as e:
+                    print(f"[SpeechToBlender] ❌ Error capturing screenshot: {e}")
+                    import traceback
+                    traceback.print_exc()
+                    return {"error": str(e)}
+            
+            def analyze_scene():
+                """RPC method: Analyze entire scene - high-level overview of all objects and their relationships."""
+                try:
+                    context = bpy.context
+                    scene = context.scene
+                    
+                    # HIGH-LEVEL: Scene summary stats
+                    scene_summary = {
+                        "total_objects": len(scene.objects),
+                        "mesh_objects": 0,
+                        "light_objects": 0,
+                        "camera_objects": 0,
+                        "collection_count": len(bpy.data.collections),
+                        "material_count": len(bpy.data.materials),
+                    }
+                    
+                    # HIGH-LEVEL: Object groups by type
+                    objects_by_type = {}
+                    scene_objects = []  # Initialize list to store all object info
+                    
+                    # Analyze all objects in scene (keep lightweight for scene view)
+                    for obj in scene.objects:
+                        obj_type = obj.type
+                        scene_summary[f"{obj_type.lower()}_objects"] = scene_summary.get(f"{obj_type.lower()}_objects", 0) + 1
+                        
+                        if obj_type not in objects_by_type:
+                            objects_by_type[obj_type] = []
+                        
+                        obj_info = {
+                            "name": obj.name,
+                            "type": obj_type,
+                            "location": tuple(obj.location),
+                            "scale": tuple(obj.scale),
+                        }
+                        
+                        # For mesh objects, get summary info (not full detail)
+                        if obj.type == 'MESH':
+                            mesh = obj.data
+                            vertex_count = len(mesh.vertices)
+                            face_count = len(mesh.polygons)
+                            
+                            # Quick bounds calculation
+                            if mesh.vertices:
+                                coords = [v.co for v in mesh.vertices]
+                                min_co = tuple(min(c[i] for c in coords) for i in range(3))
+                                max_co = tuple(max(c[i] for c in coords) for i in range(3))
+                                size = tuple(max_co[i] - min_co[i] for i in range(3))
+                                volume_estimate = size[0] * size[1] * size[2]
+                                thickness = min(size)
+                            else:
+                                size = (0, 0, 0)
+                                volume_estimate = 0
+                                thickness = 0
+                            
+                            obj_info["mesh_summary"] = {
+                                "vertex_count": vertex_count,
+                                "face_count": face_count,
+                                "size": size,
+                                "volume_estimate": volume_estimate,
+                                "thickness": thickness,
+                            }
+                            
+                            # Materials (summary)
+                            materials = []
+                            if obj.data.materials:
+                                for mat in obj.data.materials:
+                                    if mat:
+                                        materials.append({
+                                            "name": mat.name,
+                                            "use_nodes": getattr(mat, "use_nodes", False),
+                                        })
+                            obj_info["materials"] = materials
+                            
+                            # Modifiers (summary)
+                            modifiers = []
+                            if hasattr(obj, "modifiers"):
+                                for mod in obj.modifiers:
+                                    modifiers.append({
+                                        "name": mod.name,
+                                        "type": mod.type,
+                                    })
+                            obj_info["modifiers"] = modifiers
+                        
+                        objects_by_type[obj_type].append(obj_info["name"])
+                        scene_objects.append(obj_info)
+                    
+                    # Categorize objects by part type (based on names and geometry)
+                    def categorize_object_parts(objects):
+                        """Categorize objects into parts (screen, camera, button, body, etc.)."""
+                        categories = {
+                            "body": [],
+                            "screen": [],
+                            "camera": [],
+                            "button": [],
+                            "bezel": [],
+                            "other": [],
+                        }
+                        
+                        for obj in objects:
+                            name_lower = obj.get("name", "").lower()
+                            obj_type = obj.get("type", "")
+                            mesh_info = obj.get("mesh_info", {})
+                            
+                            # Skip non-mesh objects for part detection
+                            if obj_type != "MESH" or not mesh_info:
+                                categories["other"].append(obj.get("name"))
+                                continue
+                            
+                            bounds = mesh_info.get("bounds", {})
+                            size = bounds.get("size", (0, 0, 0))
+                            thickness = bounds.get("thickness", 0)
+                            volume = bounds.get("volume_estimate", 0)
+                            
+                            # Part detection based on name keywords
+                            is_screen = any(kw in name_lower for kw in ["screen", "display", "panel", "face"])
+                            is_camera = any(kw in name_lower for kw in ["camera", "lens", "sensor"])
+                            is_button = any(kw in name_lower for kw in ["button", "btn", "key", "switch"])
+                            is_bezel = any(kw in name_lower for kw in ["bezel", "frame", "rim"])
+                            is_body = any(kw in name_lower for kw in ["body", "case", "housing", "chassis", "main"])
+                            
+                            # Part detection based on geometry
+                            # Screen: very flat, large area, thin
+                            if not is_screen and thickness > 0:
+                                aspect_flat = max(size[0], size[1]) / thickness if thickness > 0.001 else 0
+                                if aspect_flat > 20 and volume > 0.1:  # Very flat and reasonably large
+                                    is_screen = True
+                            
+                            # Camera: small extruded part (small volume, but not too thin)
+                            if not is_camera and volume > 0:
+                                if volume < 0.5 and thickness > 0.05:  # Small but not paper-thin
+                                    is_camera = True
+                            
+                            # Button: very small, often circular/cylindrical
+                            if not is_button and volume > 0:
+                                if volume < 0.1:  # Very small
+                                    is_button = True
+                            
+                            # Material-based detection
+                            materials = obj.get("materials", [])
+                            for mat in materials:
+                                mat_name = mat.get("name", "").lower()
+                                if "glass" in mat_name or mat.get("is_glass"):
+                                    is_screen = True
+                            
+                            # Categorize
+                            if is_screen:
+                                categories["screen"].append({
+                                    "name": obj.get("name"),
+                                    "size": size,
+                                    "thickness": thickness,
+                                })
+                            elif is_camera:
+                                categories["camera"].append({
+                                    "name": obj.get("name"),
+                                    "size": size,
+                                    "volume": volume,
+                                })
+                            elif is_button:
+                                categories["button"].append({
+                                    "name": obj.get("name"),
+                                    "size": size,
+                                    "volume": volume,
+                                })
+                            elif is_bezel:
+                                categories["bezel"].append({
+                                    "name": obj.get("name"),
+                                    "size": size,
+                                })
+                            elif is_body:
+                                categories["body"].append({
+                                    "name": obj.get("name"),
+                                    "size": size,
+                                    "volume": volume,
+                                })
+                            else:
+                                # Try to infer from size/position
+                                # Largest object is likely the body
+                                if volume > 1.0:
+                                    categories["body"].append({
+                                        "name": obj.get("name"),
+                                        "size": size,
+                                        "volume": volume,
+                                        "inferred": True,
+                                    })
+                                else:
+                                    categories["other"].append(obj.get("name"))
+                        
+                        return categories
+                    
+                    # HIGH-LEVEL: Spatial relationships
+                    spatial_info = {
+                        "objects_in_scene": len(scene_objects),
+                        "largest_object": None,
+                        "smallest_object": None,
+                    }
+                    
+                    if scene_objects:
+                        mesh_objs = [o for o in scene_objects if o.get("type") == "MESH" and "mesh_summary" in o]
+                        if mesh_objs:
+                            largest = max(mesh_objs, key=lambda x: x.get("mesh_summary", {}).get("volume_estimate", 0))
+                            smallest = min(mesh_objs, key=lambda x: x.get("mesh_summary", {}).get("volume_estimate", float('inf')))
+                            spatial_info["largest_object"] = largest.get("name")
+                            spatial_info["smallest_object"] = smallest.get("name")
+                    
+                    categorized_parts = categorize_object_parts(scene_objects)
+                    
+                    return {
+                        "scene_summary": scene_summary,
+                        "objects_by_type": objects_by_type,
+                        "spatial_info": spatial_info,
+                        "object_count": len(scene_objects),
+                        "objects": scene_objects,  # Full list but with summary-level detail
+                        "categorized_parts": categorized_parts,
+                    }
+                except Exception as e:
+                    print(f"[SpeechToBlender] Error analyzing scene: {e}")
+                    import traceback
+                    traceback.print_exc()
+                    return {"error": str(e)}
+            
+            
             server.register_function(ping, "ping")
             server.register_function(enqueue_op_safe, "enqueue_op_safe")
             server.register_function(enqueue_op_safe, "enqueue_op")  # Alias
@@ -728,6 +1156,8 @@ def _server_loop():
             server.register_function(get_super_mode_state, "get_super_mode_state")
             server.register_function(get_modeling_context, "get_modeling_context")
             server.register_function(analyze_current_mesh, "analyze_current_mesh")
+            server.register_function(analyze_scene, "analyze_scene")
+            server.register_function(capture_viewport_screenshot, "capture_viewport_screenshot")
             
             def get_voice_listening_state():
                 """RPC method: Get voice listening enabled state."""
@@ -861,6 +1291,18 @@ def _drain_task_queue():
                     bpy.ops.wm.redraw_timer(type="DRAW_WIN", iterations=1)
                 except Exception:
                     pass
+            elif kind == "CAPTURE_SCREENSHOT":
+                _, capture_func = msg
+                print(f"[SpeechToBlender] Executing screenshot capture on main thread...")
+                try:
+                    capture_func()
+                    print(f"[SpeechToBlender] ✅ Screenshot capture completed")
+                except Exception as e:
+                    error_msg = str(e)
+                    import traceback
+                    tb = traceback.format_exc()
+                    print(f"[SpeechToBlender] ❌ Screenshot capture error: {error_msg}")
+                    print(f"[SpeechToBlender] Traceback: {tb}")
     except queue.Empty:
         pass
     except Exception as e:
@@ -1185,44 +1627,40 @@ class STB_PT_VoiceMode(Panel):
         layout = self.layout
         wm = context.window_manager
         
-        # Mode toggle
         box = layout.box()
-        row = box.row()
-        row.prop(wm, "stb_super_mode", text="Super Mode", toggle=True, icon="LIGHT" if wm.stb_super_mode else "OUTLINER_OB_LIGHT")
+        col = box.column(align=True)
+        col.label(text="⚡ Context-Aware Voice Modeling", icon="SPEAKER")
         
-        box.separator()
+        # Target info
+        try:
+            addon_prefs = context.preferences.addons[ADDON_ROOT].preferences
+            target = addon_prefs.super_mode_target_object
+        except Exception:
+            target = ""
         
-        if wm.stb_super_mode:
-            # Super mode active
-            col = box.column(align=True)
-            col.label(text="⚡ Context-Aware Modeling", icon="INFO")
-            
-            # Get target from preferences
-            try:
-                addon_prefs = context.preferences.addons[ADDON_ROOT].preferences
-                target = addon_prefs.super_mode_target_object
-                if target:
-                    col.label(text=f"Building: {target}", icon="OBJECT_DATA")
-                else:
-                    col.label(text="No target set (see preferences)", icon="ERROR")
-            except Exception:
-                col.label(text="Set target in preferences", icon="PREFERENCES")
-            
-            col.separator()
-            col.label(text="Features:", icon="DOT")
-            col.label(text="• Multi-step operations", icon="BLANK1")
-            col.label(text="• Geometry analysis", icon="BLANK1")
-            col.label(text="• Context-aware GPT", icon="BLANK1")
-            col.label(text="• Any Blender operation", icon="BLANK1")
-            col.label(text="• Smart operation selection", icon="BLANK1")
-            
-            col.separator()
-            col.label(text="⚠ Slower, uses more API credits", icon="INFO")
+        if target:
+            col.label(text=f"Modeling Target: {target}", icon="OBJECT_DATA")
         else:
-            # Normal mode
-            col = box.column(align=True)
-            col.label(text="Fast Local Commands", icon="CHECKMARK")
-            col.label(text="Quick operations, instant response", icon="INFO")
+            col.label(text="Set a target in preferences for richer context", icon="INFO")
+        
+        react_enabled = False
+        try:
+            react_enabled = bool(addon_prefs.use_react_reasoning)
+        except Exception:
+            react_enabled = False
+        icon = "LOOP_BACK" if react_enabled else "LOOP_FORWARDS"
+        status = "ReAct reasoning: ON (iterative)" if react_enabled else "ReAct reasoning: OFF (single-shot)"
+        col.label(text=status, icon=icon)
+        
+        col.separator()
+        col.label(text="Capabilities:", icon="DOT")
+        col.label(text="• Multi-step operations", icon="BLANK1")
+        col.label(text="• Geometry analysis", icon="BLANK1")
+        col.label(text="• Context-aware GPT", icon="BLANK1")
+        col.label(text="• Any Blender operation", icon="BLANK1")
+        col.label(text="• Smart operation selection", icon="BLANK1")
+        col.separator()
+        col.label(text="⚠ Uses API credits when GPT is needed", icon="INFO")
 
 
 # ───────── Safe stub: lazy import inside register, timers last ─────────
@@ -1254,13 +1692,6 @@ def register():
             default=False,
             options={'HIDDEN'},
         )
-    if not hasattr(bpy.types.WindowManager, "stb_super_mode"):
-        bpy.types.WindowManager.stb_super_mode = bpy.props.BoolProperty(
-            name="Super Mode",
-            description="Enable context-aware intelligent modeling (slower, more powerful)",
-            default=False,
-        )
-
     # 3) operators and panels
     bpy.utils.register_class(STB_OT_MeshyGenerate)
     bpy.utils.register_class(STB_PT_MeshyTools)
@@ -1338,7 +1769,5 @@ def unregister():
             del bpy.types.WindowManager.stb_meshy_prompt
         if hasattr(bpy.types.WindowManager, "stb_rpc_server_running"):
             del bpy.types.WindowManager.stb_rpc_server_running
-        if hasattr(bpy.types.WindowManager, "stb_super_mode"):
-            del bpy.types.WindowManager.stb_super_mode
     except Exception:
         pass
