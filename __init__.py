@@ -124,6 +124,25 @@ class STB_AddonPreferences(AddonPreferences):
         description="What are you building? (e.g., 'Echo Dot', 'Coffee Mug', 'Character Head')",
         default="",
     )
+    
+    # AI Model Selection
+    ai_model_provider: EnumProperty(
+        name="AI Model Provider",
+        description="Choose which AI model to use for command understanding",
+        items=[
+            ("openai-gpt-4o", "OpenAI GPT-4o", "OpenAI GPT-4o (Vision capable, high quality)"),
+            ("google-gemini-3-pro", "Google Gemini 3 Pro", "Google Gemini 3 Pro (Vision capable, high quality)"),
+            ("google-gemini-3-fast", "Google Gemini 3 Fast", "Google Gemini 3 Fast (Vision capable, faster)"),
+        ],
+        default="openai-gpt-4o",
+    )
+    
+    gemini_api_key: StringProperty(
+        name="Google Gemini API Key",
+        description="Get from https://aistudio.google.com/app/apikey",
+        subtype="PASSWORD",
+        default="",
+    )
 
     def draw(self, context):
         layout = self.layout
@@ -143,29 +162,44 @@ class STB_AddonPreferences(AddonPreferences):
         box.label(text="Voice & AI Settings", icon="SPEAKER")
         col = box.column(align=True)
         
-        # Split key fields
-        col.label(text="OpenAI API Key (split into two parts):", icon="INFO")
-        col.prop(self, "openai_api_key_part1")
-        col.prop(self, "openai_api_key_part2")
+        # Model Selection
+        col.label(text="AI Model Selection:", icon="SETTINGS")
+        col.prop(self, "ai_model_provider", icon="WORLD")
+        
+        # Show API key fields based on selected provider
+        if self.ai_model_provider.startswith("openai"):
+            col.separator()
+            col.label(text="OpenAI API Key (split into two parts):", icon="INFO")
+            col.prop(self, "openai_api_key_part1")
+            col.prop(self, "openai_api_key_part2")
+            
+            # Show combined length
+            part1_len = len(self.openai_api_key_part1) if self.openai_api_key_part1 else 0
+            part2_len = len(self.openai_api_key_part2) if self.openai_api_key_part2 else 0
+            total_len = part1_len + part2_len
+            
+            if total_len > 0:
+                col.separator()
+                col.label(text=f"Combined key length: {total_len} characters", icon="INFO")
+                if total_len < 150:
+                    col.label(text="⚠️ Key may be incomplete (expected ~164 chars)", icon="ERROR")
+                elif total_len >= 150:
+                    col.label(text="✅ Key length looks good", icon="CHECKMARK")
+        elif self.ai_model_provider.startswith("google"):
+            col.separator()
+            col.label(text="Google Gemini API Key:", icon="INFO")
+            col.prop(self, "gemini_api_key")
+            if self.gemini_api_key:
+                key_len = len(self.gemini_api_key)
+                col.label(text=f"Key length: {key_len} characters", icon="INFO")
+                if key_len < 30:
+                    col.label(text="⚠️ Key may be incomplete", icon="ERROR")
+                else:
+                    col.label(text="✅ Key length looks good", icon="CHECKMARK")
+        
         col.separator()
         col.prop(self, "use_react_reasoning", icon="LOOP_BACK")
         col.label(text="ReAct enables step-by-step reasoning (slower, more API credits)", icon="INFO")
-        
-        # Show combined length
-        part1_len = len(self.openai_api_key_part1) if self.openai_api_key_part1 else 0
-        part2_len = len(self.openai_api_key_part2) if self.openai_api_key_part2 else 0
-        total_len = part1_len + part2_len
-        
-        if total_len > 0:
-            col.separator()
-            col.label(text=f"Combined key length: {total_len} characters", icon="INFO")
-            if total_len < 150:
-                col.label(text="⚠️ Key may be incomplete (expected ~164 chars)", icon="ERROR")
-            elif total_len >= 150:
-                col.label(text="✅ Key length looks good", icon="CHECKMARK")
-        
-        # Legacy field (hidden but kept for compatibility)
-        # col.prop(self, "openai_api_key")  # Hidden - use parts instead
         
         col.separator()
         col.label(text="Used for natural language command understanding", icon="INFO")
@@ -449,6 +483,17 @@ def _server_loop():
                 _TASKQ.put(("OP_SAFE", op_name, kwargs))
                 return "enqueued"
             
+            def get_ai_model_provider():
+                """RPC method: Get selected AI model provider."""
+                try:
+                    if ADDON_ROOT in bpy.context.preferences.addons:
+                        addon_prefs = bpy.context.preferences.addons[ADDON_ROOT].preferences
+                        provider = getattr(addon_prefs, "ai_model_provider", "openai-gpt-4o") or "openai-gpt-4o"
+                        return provider
+                except Exception as e:
+                    print(f"[SpeechToBlender] Error getting AI model provider: {e}")
+                return "openai-gpt-4o"  # Default fallback
+            
             def get_openai_api_key():
                 """RPC method: Get OpenAI API key from preferences (combines parts if split)."""
                 try:
@@ -480,6 +525,7 @@ def _server_loop():
                             key = key.strip()  # Only leading/trailing
                             # Remove any embedded newlines or tabs that might have been pasted
                             key = key.replace('\n', '').replace('\r', '').replace('\t', ' ')
+            
                             # Remove any double spaces
                             while '  ' in key:
                                 key = key.replace('  ', ' ')
@@ -522,6 +568,20 @@ def _server_loop():
                     print(f"[SpeechToBlender] Error getting OpenAI API key: {e}")
                     import traceback
                     traceback.print_exc()
+                return ""
+            
+            def get_gemini_api_key():
+                """RPC method: Get Google Gemini API key from preferences."""
+                try:
+                    if ADDON_ROOT in bpy.context.preferences.addons:
+                        addon_prefs = bpy.context.preferences.addons[ADDON_ROOT].preferences
+                        key = getattr(addon_prefs, "gemini_api_key", "") or ""
+                        if key:
+                            key = key.strip()
+                            print(f"[SpeechToBlender] Retrieved Gemini API key: {len(key)} chars")
+                        return key
+                except Exception as e:
+                    print(f"[SpeechToBlender] Error getting Gemini API key: {e}")
                 return ""
             
             def start_voice_command():
@@ -699,9 +759,12 @@ def _server_loop():
                                 "vertex_count": vert_count,
                             })
                     
-                    # Mesh bounds with enhanced geometry hints
+                    # Mesh bounds with enhanced geometry hints - USE WORLD-SPACE to account for transforms
                     if mesh.vertices:
-                        coords = [v.co for v in mesh.vertices]
+                        # Get world-space coordinates (accounts for all transforms: scale, rotation, translation)
+                        import mathutils
+                        matrix_world = obj.matrix_world
+                        coords = [matrix_world @ v.co for v in mesh.vertices]
                         min_co = tuple(min(c[i] for c in coords) for i in range(3))
                         max_co = tuple(max(c[i] for c in coords) for i in range(3))
                         size = tuple(max_co[i] - min_co[i] for i in range(3))
@@ -926,6 +989,225 @@ def _server_loop():
                     traceback.print_exc()
                     return {"error": str(e)}
             
+            def rename_active_object(new_name: str):
+                """RPC method: Rename the currently active object."""
+                try:
+                    context = bpy.context
+                    obj = context.view_layer.objects.active
+                    if not obj:
+                        return {"ok": False, "error": "No active object"}
+                    
+                    old_name = obj.name
+                    obj.name = new_name
+                    print(f"[SpeechToBlender] Renamed object: {old_name} -> {new_name}")
+                    return {"ok": True, "old_name": old_name, "new_name": new_name}
+                except Exception as e:
+                    print(f"[SpeechToBlender] Error renaming object: {e}")
+                    import traceback
+                    traceback.print_exc()
+                    return {"ok": False, "error": str(e)}
+            
+            def assess_object_quality(target_object: str = ""):
+                """RPC method: Assess the quality and completeness of the current object/scene relative to a target object.
+                Returns detailed assessment including what's missing, what needs refinement, and suggestions."""
+                try:
+                    context = bpy.context
+                    scene = context.scene
+                    active_obj = context.view_layer.objects.active
+                    
+                    # Get all mesh objects and their names
+                    mesh_objects = [o for o in scene.objects if o.type == 'MESH']
+                    object_names = [obj.name.lower() for obj in mesh_objects]
+                    
+                    assessment = {
+                        "target_object": target_object,
+                        "timestamp": time.time(),
+                        "scene_summary": {
+                            "total_objects": len(scene.objects),
+                            "mesh_objects": len(mesh_objects),
+                            "object_names": [obj.name for obj in mesh_objects],
+                        },
+                        "active_object": None,
+                        "quality_score": 0.0,
+                        "target_match_score": 0.0,  # How well it matches the target object
+                        "completeness": {
+                            "basic_structure": False,
+                            "details": False,
+                            "proportions": False,
+                            "refinement": False,
+                            "target_features": False,
+                        },
+                        "issues": [],
+                        "suggestions": [],
+                        "missing_features": [],
+                        "found_features": [],
+                    }
+                    
+                    # TARGET-SPECIFIC CHECKS
+                    target_lower = target_object.lower() if target_object else ""
+                    
+                    # iPhone-specific checks
+                    if "iphone" in target_lower or "phone" in target_lower:
+                        required_parts = {
+                            "body": ["body", "phone body", "iphone body"],
+                            "screen": ["screen", "display", "phone screen", "iphone screen"],
+                            "camera": ["camera", "camera module", "lens"],
+                        }
+                        optional_parts = {
+                            "buttons": ["button", "volume", "power", "home"],
+                            "speaker": ["speaker", "audio"],
+                            "port": ["port", "charging", "lightning"],
+                        }
+                        
+                        found_parts = {}
+                        for part_type, keywords in required_parts.items():
+                            found = any(any(kw in name for kw in keywords) for name in object_names)
+                            found_parts[part_type] = found
+                            if found:
+                                assessment["found_features"].append(f"{part_type.title()} found")
+                            else:
+                                assessment["missing_features"].append(f"Missing {part_type}")
+                                assessment["issues"].append(f"Missing required part: {part_type}")
+                        
+                        for part_type, keywords in optional_parts.items():
+                            found = any(any(kw in name for kw in keywords) for name in object_names)
+                            if found:
+                                assessment["found_features"].append(f"{part_type.title()} found")
+                        
+                        # Calculate target match score for iPhone
+                        required_count = sum(1 for found in found_parts.values() if found)
+                        total_required = len(required_parts)
+                        assessment["target_match_score"] = required_count / total_required if total_required > 0 else 0.0
+                        
+                        if assessment["target_match_score"] < 0.5:
+                            assessment["issues"].append(f"Object does not look like {target_object} - missing {total_required - required_count} required parts")
+                            assessment["suggestions"].append(f"Add missing parts: {', '.join([k for k, v in found_parts.items() if not v])}")
+                    
+                    # Car-specific checks
+                    elif "car" in target_lower or "vehicle" in target_lower:
+                        required_parts = {
+                            "body": ["body", "car body", "chassis"],
+                            "wheels": ["wheel", "tire"],
+                        }
+                        optional_parts = {
+                            "windows": ["window", "windshield", "glass"],
+                            "lights": ["light", "headlight", "taillight"],
+                            "spoiler": ["spoiler"],
+                        }
+                        
+                        found_parts = {}
+                        for part_type, keywords in required_parts.items():
+                            found = any(any(kw in name for kw in keywords) for name in object_names)
+                            found_parts[part_type] = found
+                            if found:
+                                assessment["found_features"].append(f"{part_type.title()} found")
+                            else:
+                                assessment["missing_features"].append(f"Missing {part_type}")
+                        
+                        # Check wheel count
+                        wheel_count = sum(1 for name in object_names if any(kw in name for kw in ["wheel", "tire"]))
+                        if wheel_count < 4:
+                            assessment["issues"].append(f"Car should have 4 wheels, found {wheel_count}")
+                            assessment["missing_features"].append(f"Need {4 - wheel_count} more wheels")
+                        
+                        required_count = sum(1 for found in found_parts.values() if found)
+                        total_required = len(required_parts)
+                        assessment["target_match_score"] = required_count / total_required if total_required > 0 else 0.0
+                    
+                    # Cup/Mug-specific checks
+                    elif "cup" in target_lower or "mug" in target_lower:
+                        required_parts = {
+                            "body": ["body", "cup body", "mug body"],
+                            "handle": ["handle"],
+                        }
+                        
+                        found_parts = {}
+                        for part_type, keywords in required_parts.items():
+                            found = any(any(kw in name for kw in keywords) for name in object_names)
+                            found_parts[part_type] = found
+                            if found:
+                                assessment["found_features"].append(f"{part_type.title()} found")
+                            else:
+                                assessment["missing_features"].append(f"Missing {part_type}")
+                        
+                        required_count = sum(1 for found in found_parts.values() if found)
+                        total_required = len(required_parts)
+                        assessment["target_match_score"] = required_count / total_required if total_required > 0 else 0.0
+                    
+                    # Generic object check (if no specific match)
+                    else:
+                        # Just check if we have objects
+                        if len(mesh_objects) == 0:
+                            assessment["target_match_score"] = 0.0
+                            assessment["issues"].append("No objects created yet")
+                        elif len(mesh_objects) == 1:
+                            assessment["target_match_score"] = 0.3
+                            assessment["suggestions"].append("Consider if the target object requires multiple parts/components")
+                        else:
+                            assessment["target_match_score"] = 0.5  # Some objects exist
+                    
+                    # Technical quality checks
+                    if active_obj and active_obj.type == 'MESH':
+                        mesh = active_obj.data
+                        assessment["active_object"] = {
+                            "name": active_obj.name,
+                            "vertex_count": len(mesh.vertices),
+                            "face_count": len(mesh.polygons),
+                            "has_modifiers": len(active_obj.modifiers) > 0,
+                            "modifier_count": len(active_obj.modifiers),
+                        }
+                        
+                        # Check if object is just a basic primitive
+                        if len(mesh.vertices) <= 8 and len(mesh.polygons) <= 6:
+                            assessment["issues"].append("Object appears to be a basic primitive - needs refinement")
+                            assessment["suggestions"].append("Use edit mode operations (extrude, inset, loop cut) or modifiers (subdivision surface, bevel) to add detail")
+                        
+                        # Check for modifiers
+                        if len(active_obj.modifiers) == 0:
+                            assessment["issues"].append("No modifiers applied - object may lack detail")
+                            assessment["suggestions"].append("Consider adding modifiers like Subdivision Surface, Bevel, or Array for more detail")
+                        
+                        # Check complexity
+                        if len(mesh.vertices) < 100:
+                            assessment["issues"].append("Low vertex count - may need more geometry for detailed objects")
+                            assessment["suggestions"].append("Use Subdivision Surface modifier or edit mode operations to increase detail")
+                    
+                    # Scene-level assessment
+                    if len(mesh_objects) == 0:
+                        assessment["issues"].append("No mesh objects in scene")
+                    
+                    # Calculate overall quality score (combines technical + target match)
+                    technical_score = 0.0
+                    if assessment["active_object"]:
+                        obj_info = assessment["active_object"]
+                        # Points for complexity
+                        if obj_info["vertex_count"] > 100:
+                            technical_score += 0.2
+                        elif obj_info["vertex_count"] > 20:
+                            technical_score += 0.1
+                        # Points for modifiers
+                        if obj_info["has_modifiers"]:
+                            technical_score += 0.2
+                        # Points for naming
+                        if obj_info["name"] and not obj_info["name"].startswith(("Cube", "Cylinder", "Sphere", "Plane")):
+                            technical_score += 0.1
+                    
+                    # Combine technical (40%) and target match (60%)
+                    assessment["quality_score"] = (technical_score * 0.4) + (assessment["target_match_score"] * 0.6)
+                    
+                    # Final verdict
+                    if assessment["quality_score"] < 0.3:
+                        assessment["issues"].append("CRITICAL: Object does not match target and lacks detail")
+                    elif assessment["quality_score"] < 0.6:
+                        assessment["issues"].append("Object partially matches target but needs more work")
+                    
+                    return assessment
+                except Exception as e:
+                    print(f"[SpeechToBlender] Error assessing object quality: {e}")
+                    import traceback
+                    traceback.print_exc()
+                    return {"error": str(e)}
+            
             def analyze_scene():
                 """RPC method: Analyze entire scene - high-level overview of all objects and their relationships."""
                 try:
@@ -967,9 +1249,12 @@ def _server_loop():
                             vertex_count = len(mesh.vertices)
                             face_count = len(mesh.polygons)
                             
-                            # Quick bounds calculation
+                            # Quick bounds calculation - USE WORLD-SPACE to account for transforms
                             if mesh.vertices:
-                                coords = [v.co for v in mesh.vertices]
+                                # Get world-space coordinates (accounts for all transforms)
+                                import mathutils
+                                matrix_world = obj.matrix_world
+                                coords = [matrix_world @ v.co for v in mesh.vertices]
                                 min_co = tuple(min(c[i] for c in coords) for i in range(3))
                                 max_co = tuple(max(c[i] for c in coords) for i in range(3))
                                 size = tuple(max_co[i] - min_co[i] for i in range(3))
@@ -1125,8 +1410,20 @@ def _server_loop():
                     if scene_objects:
                         mesh_objs = [o for o in scene_objects if o.get("type") == "MESH" and "mesh_summary" in o]
                         if mesh_objs:
-                            largest = max(mesh_objs, key=lambda x: x.get("mesh_summary", {}).get("volume_estimate", 0))
-                            smallest = min(mesh_objs, key=lambda x: x.get("mesh_summary", {}).get("volume_estimate", float('inf')))
+                            # Use a better size metric: for flat objects (volume near 0), use largest dimension
+                            # For 3D objects, use volume. This handles screens/planes correctly.
+                            def get_size_metric(obj):
+                                summary = obj.get("mesh_summary", {})
+                                volume = summary.get("volume_estimate", 0)
+                                size = summary.get("size", (0, 0, 0))
+                                # If volume is very small (flat object), use largest dimension squared as proxy
+                                if volume < 0.001:
+                                    max_dim = max(size) if size else 0
+                                    return max_dim * max_dim  # Surface area proxy for flat objects
+                                return volume
+                            
+                            largest = max(mesh_objs, key=get_size_metric)
+                            smallest = min(mesh_objs, key=get_size_metric)
                             spatial_info["largest_object"] = largest.get("name")
                             spatial_info["smallest_object"] = smallest.get("name")
                     
@@ -1151,13 +1448,17 @@ def _server_loop():
             server.register_function(enqueue_op_safe, "enqueue_op_safe")
             server.register_function(enqueue_op_safe, "enqueue_op")  # Alias
             server.register_function(_rpc_execute, "execute")
+            server.register_function(get_ai_model_provider, "get_ai_model_provider")
             server.register_function(get_openai_api_key, "get_openai_api_key")
+            server.register_function(get_gemini_api_key, "get_gemini_api_key")
             server.register_function(start_voice_command, "start_voice_command")
             server.register_function(get_super_mode_state, "get_super_mode_state")
             server.register_function(get_modeling_context, "get_modeling_context")
             server.register_function(analyze_current_mesh, "analyze_current_mesh")
             server.register_function(analyze_scene, "analyze_scene")
             server.register_function(capture_viewport_screenshot, "capture_viewport_screenshot")
+            server.register_function(rename_active_object, "rename_active_object")
+            server.register_function(assess_object_quality, "assess_object_quality")
             
             def get_voice_listening_state():
                 """RPC method: Get voice listening enabled state."""

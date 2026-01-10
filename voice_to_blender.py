@@ -957,8 +957,89 @@ def _react_observe(request: str) -> str:
                 result += f"\n📸 Screenshot captured ({len(screenshot_data)} bytes)"
             
             return result
+        
+        if req in ("assess_object_quality", "quality", "assessment", "assess"):
+            try:
+                # Extract target_object from request if provided, or use empty string
+                # Format: "assess_object_quality iPhone 16" or just "assess_object_quality"
+                target_object = ""
+                req_parts = request.strip().split(maxsplit=1)
+                if len(req_parts) > 1:
+                    target_object = req_parts[1]
+                
+                assessment = rpc.assess_object_quality(target_object)
+                if assessment and assessment.get("error"):
+                    result = f"Assessment error: {assessment.get('error')}"
+                elif assessment:
+                    # Format assessment in a readable way
+                    result = "📊 OBJECT QUALITY ASSESSMENT:\n\n"
+                    quality_score = assessment.get('quality_score', 0.0)
+                    target_match = assessment.get('target_match_score', 0.0)
+                    result += f"Overall Quality Score: {quality_score:.2f}/1.0\n"
+                    result += f"Target Match Score: {target_match:.2f}/1.0 (how well it matches '{target_object or 'target'}')\n"
+                    result += f"Scene Objects: {assessment.get('scene_summary', {}).get('total_objects', 0)}\n\n"
+                    
+                    # Show found features
+                    found_features = assessment.get("found_features", [])
+                    if found_features:
+                        result += "✅ FOUND FEATURES:\n"
+                        for feature in found_features:
+                            result += f"  - {feature}\n"
+                        result += "\n"
+                    
+                    if assessment.get("active_object"):
+                        obj = assessment["active_object"]
+                        result += f"Active Object: {obj.get('name', 'Unknown')}\n"
+                        result += f"  Vertices: {obj.get('vertex_count', 0)}\n"
+                        result += f"  Faces: {obj.get('face_count', 0)}\n"
+                        result += f"  Modifiers: {obj.get('modifier_count', 0)}\n\n"
+                    
+                    issues = assessment.get("issues", [])
+                    if issues:
+                        result += "⚠️ ISSUES FOUND:\n"
+                        for issue in issues:
+                            result += f"  - {issue}\n"
+                        result += "\n"
+                    
+                    suggestions = assessment.get("suggestions", [])
+                    if suggestions:
+                        result += "💡 SUGGESTIONS:\n"
+                        for suggestion in suggestions:
+                            result += f"  - {suggestion}\n"
+                        result += "\n"
+                    
+                    missing = assessment.get("missing_features", [])
+                    if missing:
+                        result += "❌ MISSING FEATURES:\n"
+                        for feature in missing:
+                            result += f"  - {feature}\n"
+                        result += "\n"
+                    
+                    # Add actionable guidance
+                    quality_score = assessment.get("quality_score", 0.0)
+                    if quality_score < 0.3:
+                        result += "🔧 ACTION REQUIRED: Object is too simple. You should:\n"
+                        result += "  1. Enter EDIT mode: object.mode_set(mode='EDIT')\n"
+                        result += "  2. Add geometry: mesh.loopcut_slide, mesh.subdivide\n"
+                        result += "  3. Shape the object: mesh.extrude_region, transform.translate\n"
+                        result += "  4. Add modifiers: object.modifier_add(type='SUBSURF')\n"
+                    elif quality_score < 0.6:
+                        result += "🔧 REFINEMENT NEEDED: Add more detail using edit mode operations or modifiers.\n"
+                    else:
+                        result += "✅ Quality is acceptable, but continue refining if needed.\n"
+                    
+                    result += f"\nFull assessment data:\n{json.dumps(assessment, indent=2)}"
+                else:
+                    result = "Assessment returned empty result."
+                
+                if screenshot_data:
+                    result += f"\n\n📸 Screenshot captured ({len(screenshot_data)} bytes)"
+                
+                return result
+            except Exception as e:
+                return f"Assessment error: {e}. Make sure there's an active object to assess."
             
-        return f"Unknown observation '{request}'. Try selected_objects, active_object, mesh_analysis, modifiers, scene, scene_analysis, parts. If you need to create objects, use EXECUTE actions instead."
+        return f"Unknown observation '{request}'. Try selected_objects, active_object, mesh_analysis, modifiers, scene, scene_analysis, parts, assess_object_quality. If you need to create objects, use EXECUTE actions instead."
     except Exception as e:
         return f"Observation error: {e}. Consider using EXECUTE actions to create or modify objects instead of observing."
 
@@ -1052,7 +1133,155 @@ def clear_conversation_history():
     global _CONVERSATION_HISTORY
     _CONVERSATION_HISTORY = []
 
-def _react_execute(action_input: str, executed_commands: list) -> str:
+def _generate_semantic_object_name(op: str, thought: str = "", target_object: str = "", executed_commands: list = None) -> str:
+    """
+    Generate a semantic name for an object based on the operation, thought context, and target object.
+    Works for ANY object type by extracting semantic meaning from the AI's thought process.
+    
+    Examples:
+    - "create the phone screen" -> "Phone Screen"
+    - "add a handle to the cup" -> "Handle"
+    - "create the main body" -> "Body" or "{target_object} Body"
+    """
+    if not op:
+        return None
+    
+    # Object creation operations
+    creation_ops = {
+        "mesh.primitive_cube_add": "Cube",
+        "mesh.primitive_uv_sphere_add": "Sphere",
+        "mesh.primitive_ico_sphere_add": "IcoSphere",
+        "mesh.primitive_cylinder_add": "Cylinder",
+        "mesh.primitive_cone_add": "Cone",
+        "mesh.primitive_torus_add": "Torus",
+        "mesh.primitive_plane_add": "Plane",
+    }
+    
+    if op not in creation_ops:
+        return None  # Only name creation operations
+    
+    base_name = creation_ops[op]
+    
+    # Combine all context for analysis
+    context_text = f"{thought} {target_object}".lower()
+    
+    # Step 1: Extract explicit part names from thought text - MORE PRECISE
+    # Only capture 1-3 word part names, stop at common words or punctuation
+    explicit_part_patterns = [
+        # Capture part names after action verbs, stop at common words
+        r"(?:create|add|make|build)\s+(?:the|a|an)?\s+([a-z]+(?:\s+[a-z]+){0,2}?)(?:\s+(?:for|to|of|on|in|with|using|by|and|or|,|\.|;|$))",
+        # Capture part names with descriptors
+        r"(?:the|a|an)\s+([a-z]+(?:\s+[a-z]+){0,2}?)\s+(?:part|component|piece|element|section|detail|button|screen|body|module|handle|leg|wheel)",
+        # Specific multi-word parts (these are important)
+        r"\b(volume\s+(?:up|down)?\s*button)\b",
+        r"\b(home\s+button)\b",
+        r"\b(power\s+button)\b",
+        r"\b(camera\s+module)\b",
+        r"\b(phone\s+screen|iphone\s+screen)\b",
+        r"\b(phone\s+body|iphone\s+body)\b",
+        r"\b(cup\s+body)\b",
+        r"\b(cup\s+handle)\b",
+        r"\b(dynamic\s+island)\b",
+        r"\b(face\s+id)\b",
+    ]
+    
+    explicit_parts = []
+    for pattern in explicit_part_patterns:
+        matches = re.findall(pattern, context_text, re.IGNORECASE)
+        for match in matches:
+            if isinstance(match, tuple):
+                match = match[0] if match else ""
+            part = match.strip()
+            # Filter: max 3 words, not too long, meaningful
+            words = part.split()
+            if len(words) <= 3 and len(part) <= 40 and part not in ["the", "a", "an", "for", "to", "of", "on", "in", "with", "using", "this", "that", "by", "and", "or"]:
+                explicit_parts.append(part)
+    
+    # Step 2: Common part name patterns (general, not object-specific)
+    general_part_patterns = {
+        # Body/main structure
+        r"\b(body|main|base|frame|chassis|structure|core|foundation)\b": "Body",
+        r"\b(screen|display|panel|face|front)\b": "Screen",
+        r"\b(handle|grip|holder)\b": "Handle",
+        r"\b(button|control|switch|key)\b": "Button",
+        r"\b(camera|lens)\b": "Camera",
+        r"\b(speaker|audio|sound)\b": "Speaker",
+        r"\b(lid|cover|top|cap)\b": "Lid",
+        r"\b(base|bottom|foot|stand)\b": "Base",
+        r"\b(rim|edge|lip|border)\b": "Rim",
+        r"\b(side|wall|panel)\b": "Side",
+        r"\b(back|rear|backside)\b": "Back",
+        r"\b(wheel|tire)\b": "Wheel",
+        r"\b(door|gate)\b": "Door",
+        r"\b(window|glass)\b": "Window",
+        r"\b(leg|support|stand)\b": "Leg",
+        r"\b(arm|extension)\b": "Arm",
+        r"\b(head|top|upper)\b": "Head",
+        r"\b(tail|end|tip)\b": "Tail",
+    }
+    
+    # Try to match general patterns first
+    matched_part = None
+    for pattern, part_name in general_part_patterns.items():
+        if re.search(pattern, context_text, re.IGNORECASE):
+            matched_part = part_name
+            break
+    
+    # Step 3: Use explicit parts found in thought text
+    if explicit_parts:
+        # Take the first meaningful explicit part
+        explicit_part = explicit_parts[0].title()  # Capitalize first letter of each word
+        # If we have a target object, combine them intelligently
+        if target_object:
+            # Clean target object name
+            clean_target = re.sub(r'\s*\d+.*$', '', target_object).strip()
+            # Check if explicit part already contains target (e.g., "phone screen" already has "phone")
+            if clean_target.lower() not in explicit_part.lower():
+                return f"{clean_target} {explicit_part}"
+            else:
+                return explicit_part
+        else:
+            return explicit_part
+    
+    # Step 4: Use matched general pattern
+    if matched_part:
+        if target_object:
+            clean_target = re.sub(r'\s*\d+.*$', '', target_object).strip()
+            return f"{clean_target} {matched_part}"
+        else:
+            return matched_part
+    
+    # Step 5: Infer from operation type and target object
+    if target_object:
+        clean_target = re.sub(r'\s*\d+.*$', '', target_object).strip()
+        
+        # Count existing objects of same type to infer if this is main body or detail
+        if executed_commands:
+            same_type_count = sum(1 for cmd in executed_commands 
+                                if isinstance(cmd, dict) and cmd.get("op", "") == op)
+            if same_type_count == 0:
+                # First object of this type - likely the main body
+                return f"{clean_target} Body"
+            else:
+                # Subsequent objects - likely details/parts
+                # Try to infer from primitive type
+                if "cube" in op.lower():
+                    return f"{clean_target} Detail"
+                elif "cylinder" in op.lower():
+                    return f"{clean_target} Component"
+                elif "sphere" in op.lower():
+                    return f"{clean_target} Element"
+                else:
+                    return f"{clean_target} Part"
+        else:
+            # No previous commands - this is likely the main body
+            return f"{clean_target} Body"
+    
+    # Step 6: Final fallback - just use base name
+    return base_name
+
+
+def _react_execute(action_input: str, executed_commands: list, thought: str = "", target_object: str = "") -> str:
     """Execute a command emitted by ReAct loop with error handling."""
     if not action_input:
         return "❌ Execute called with empty input. You must provide valid JSON. Example: {\"op\":\"mesh.primitive_cube_add\",\"kwargs\":{}}"
@@ -1110,6 +1339,54 @@ def _react_execute(action_input: str, executed_commands: list) -> str:
             if result and isinstance(result, str):
                 if "error" in result.lower() or "failed" in result.lower() or "❌" in result:
                     return f"❌ Operation failed: {op} - {result}. Try a different approach."
+            
+            
+            # Check if AI will rename manually (skip auto-naming if so)
+            will_be_renamed = False
+            if isinstance(cmd, list):
+                try:
+                    current_index = cmd.index(single_cmd) if single_cmd in cmd else -1
+                    if current_index >= 0 and current_index + 1 < len(cmd):
+                        next_cmd = cmd[current_index + 1]
+                        if isinstance(next_cmd, dict):
+                            next_op = next_cmd.get("op", "")
+                            next_code = next_cmd.get("kwargs", {}).get("code", "")
+                            if next_op == "execute" and "name" in next_code.lower() and "active_object" in next_code:
+                                will_be_renamed = True
+                except (ValueError, IndexError, AttributeError):
+                    pass  # If we can't check, proceed with auto-naming
+            
+            # Auto-name objects after creation (only if AI won't rename manually)
+            if not will_be_renamed:
+                semantic_name = _generate_semantic_object_name(op, thought, target_object, executed_commands)
+                if CONTEXT_DEBUG:
+                    print(f"[ReAct] Auto-naming check: op={op}, thought={thought[:50] if thought else 'None'}..., target={target_object}, semantic_name={semantic_name}, rpc={rpc is not None}")
+                
+                if semantic_name and rpc:
+                    try:
+                        # Small delay to ensure object is created
+                        time.sleep(0.1)
+                        # Rename the active object (should be the newly created one)
+                        rename_result = rpc.rename_active_object(semantic_name)
+                        if CONTEXT_DEBUG:
+                            print(f"[ReAct] Rename result: {rename_result}")
+                        if rename_result and rename_result.get("ok"):
+                            print(f"[ReAct] ✅ Auto-named object: {semantic_name}")
+                        else:
+                            error_msg = rename_result.get("error", "Unknown error") if rename_result else "No result"
+                            print(f"[ReAct] ⚠️ Rename failed: {error_msg}")
+                    except Exception as e:
+                        print(f"[ReAct] ⚠️ Could not rename object: {e}")
+                        import traceback
+                        traceback.print_exc()
+                elif semantic_name and not rpc:
+                    print(f"[ReAct] ⚠️ Cannot rename: RPC not available")
+                elif not semantic_name:
+                    if CONTEXT_DEBUG:
+                        print(f"[ReAct] No semantic name generated for op: {op}")
+            else:
+                if CONTEXT_DEBUG:
+                    print(f"[ReAct] Skipping auto-naming - AI will rename manually in next command")
             
             return f"✅ Queued {op}: {result}"
         except Exception as e:
@@ -1171,10 +1448,153 @@ def gpt_to_json_react(transcript: str, modeling_context=None, mesh_analysis=None
         "4. Always provide valid JSON in Action Input for execute actions.",
         "5. For complex tasks, start with a PLAN action to outline steps before executing.",
         "",
+        "--- ADVANCED BLENDER OPERATIONS (USE THESE FOR DETAILED OBJECTS) ---",
+        "",
+        "BASIC PRIMITIVES ARE NOT ENOUGH! To create detailed, realistic objects, you MUST use:",
+        "1. Edit Mode operations (extrude, inset, loop cut, bevel, etc.)",
+        "2. Modifiers (Subdivision Surface, Bevel, Array, Mirror, etc.)",
+        "3. Sculpt Mode (for organic shapes)",
+        "4. Multiple refinement passes",
+        "",
+        "EDIT MODE OPERATIONS (Enter edit mode first with object.mode_set):",
+        "- object.mode_set(mode='EDIT') - Enter edit mode",
+        "- mesh.extrude_region - Extrude selected faces/edges/vertices",
+        "- mesh.inset_faces - Create inset on selected faces",
+        "- mesh.loopcut_slide - Add loop cuts for more geometry",
+        "- mesh.bevel - Bevel edges/vertices",
+        "- mesh.subdivide - Subdivide selected geometry",
+        "- mesh.knife_project - Project cuts onto mesh",
+        "- mesh.select_all(action='SELECT') - Select all geometry",
+        "- mesh.select_mode(type='VERT'|'EDGE'|'FACE') - Change selection mode",
+        "",
+        "MODIFIERS (Add with object.modifier_add, then configure):",
+        "- object.modifier_add(type='SUBSURF') - Subdivision Surface for smoothness",
+        "  Then: bpy.context.object.modifiers['Subdivision Surface'].levels = 2",
+        "- object.modifier_add(type='BEVEL') - Bevel modifier for rounded edges",
+        "  Then: bpy.context.object.modifiers['Bevel'].width = 0.01",
+        "- object.modifier_add(type='ARRAY') - Array for repeating elements",
+        "- object.modifier_add(type='MIRROR') - Mirror for symmetry",
+        "- object.modifier_add(type='SOLIDIFY') - Add thickness to planes",
+        "- object.modifier_add(type='SCREW') - Create screw/threaded objects",
+        "",
+        "TRANSFORM OPERATIONS:",
+        "- transform.translate - Move objects/vertices",
+        "- transform.rotate - Rotate objects/vertices",
+        "- transform.resize - Scale objects/vertices",
+        "- transform.shrink_fatten - Shrink/fatten selected geometry",
+        "",
+        "WORKFLOW FOR DETAILED OBJECTS:",
+        "1. Create base primitive (cube, cylinder, etc.)",
+        "2. Enter EDIT mode: object.mode_set(mode='EDIT')",
+        "3. Add geometry: mesh.loopcut_slide, mesh.subdivide",
+        "4. Shape the object: mesh.extrude_region, transform.translate",
+        "5. Add details: mesh.inset_faces, mesh.bevel",
+        "6. Return to OBJECT mode: object.mode_set(mode='OBJECT')",
+        "7. Add modifiers: object.modifier_add(type='SUBSURF'), etc.",
+        "8. Refine and iterate based on visual assessment",
+        "",
+        "VALIDATION AND ASSESSMENT:",
+        "After creating objects, use OBSERVE with 'assess_object_quality' to check:",
+        "- If the object is too simple (just a primitive)",
+        "- If modifiers are needed for detail",
+        "- If edit mode operations are needed",
+        "- What features are missing",
+        "",
+        "Example assessment request:",
+        "Action: observe",
+        "Action Input: assess_object_quality",
+        "",
+        "ITERATIVE REFINEMENT PROCESS:",
+        "1. Create base structure with primitives",
+        "2. Assess quality: observe assess_object_quality",
+        "3. If quality score is low (< 0.5), add detail:",
+        "   - Enter edit mode and add geometry",
+        "   - Add modifiers for smoothness/bevels",
+        "   - Refine proportions and shapes",
+        "4. Re-assess and continue refining until quality is acceptable",
+        "5. Only finish when the object looks like the target object",
+        "",
+        "--- MANDATORY QUALITY CHECK BEFORE FINISHING ---",
+        "CRITICAL: You CANNOT finish until the object matches the target!",
+        "",
+        "Before using Action: finish, you MUST:",
+        "1. Use Action: observe with Action Input: assess_object_quality",
+        "2. Check the quality_score (must be >= 0.5) and target_match_score (must be >= 0.5)",
+        "3. If scores are too low, you MUST continue refining:",
+        "   - Add missing parts/components",
+        "   - Refine existing parts with edit mode or modifiers",
+        "   - Re-assess quality",
+        "4. Only finish when quality_score >= 0.5 AND target_match_score >= 0.5",
+        "",
+        "The system will AUTOMATICALLY check quality when you try to finish.",
+        "If quality is too low, you will be forced to continue refining.",
+        "Do NOT finish until the object actually looks like the target object!",
+        "",
+        "OBJECT NAMING (CRITICAL - MUST DO THIS):",
+        "After creating ANY object with mesh.primitive_*_add, you MUST immediately rename it.",
+        "The object name should reflect what it represents in the model you're building.",
+        "",
+        "EXAMPLES:",
+        "- Creating the main body of an iPhone → name it 'iPhone Body' or 'Phone Body'",
+        "- Creating a screen for a phone → name it 'Phone Screen' or 'Screen'",
+        "- Creating volume buttons → name them 'Volume Up Button' and 'Volume Down Button'",
+        "- Creating a cup body → name it 'Cup Body' or 'Tea Cup Body'",
+        "- Creating a handle → name it 'Handle' or 'Cup Handle'",
+        "- Creating a table leg → name it 'Table Leg' or 'Leg'",
+        "- Creating a car wheel → name it 'Wheel' or 'Car Wheel'",
+        "",
+        "HOW TO RENAME:",
+        "After creating an object, immediately execute Python code to rename it:",
+        "{\"op\":\"execute\",\"kwargs\":{\"code\":\"bpy.context.active_object.name = 'Your Object Name'\"}}",
+        "",
+        "OR combine creation and naming in one execute action:",
+        "[{\"op\":\"mesh.primitive_cube_add\",\"kwargs\":{}},{\"op\":\"execute\",\"kwargs\":{\"code\":\"bpy.context.active_object.name = 'Phone Body'\"}}]",
+        "",
+        "NAMING RULES:",
+        "1. Always name objects based on what they represent (e.g., 'Phone Screen', not 'Cube.001')",
+        "2. Include the target object name when helpful (e.g., 'iPhone Body', 'Coffee Mug Handle')",
+        "3. Use consistent, descriptive names (e.g., 'Volume Up Button', not 'Button 1')",
+        "4. Name objects IMMEDIATELY after creating them - don't wait until later",
+        "5. If creating multiple similar parts, use descriptive names (e.g., 'Left Wheel', 'Right Wheel')",
+        "",
+        "REMEMBER: Unnamed objects (Cube, Cube.001, Cylinder.002, etc.) make it impossible to reference",
+        "specific parts later. Always name objects appropriately based on their purpose in the model.",
+        "",
         "Never output prose outside the required fields. Combine multiple Blender steps into sequential execute actions.",
         "",
         "IMPORTANT: If an operation fails, observe the current state ONCE, then try a different approach or finish.",
         "IMPORTANT: Avoid repeating the same operation with identical parameters (duplicates are skipped).",
+        "IMPORTANT: Always name objects appropriately - unnamed objects (Cube, Cube.001, etc.) make it hard to reference them later.",
+        "",
+        "--- OBJECT-SPECIFIC REASONING (CRITICAL) ---",
+        "Before creating objects, you MUST reason about the specific object being modeled.",
+        "",
+        "REASONING PROCESS:",
+        "1. Consider the exact object name and any version/model numbers",
+        "2. Think about what makes THIS object unique or different from similar objects",
+        "3. Consider version-specific features (e.g., iPhone 16 vs iPhone 8)",
+        "4. Think about what features this object should NOT have (common mistakes)",
+        "5. Consider proper proportions, placement, and relationships between parts",
+        "",
+        "EXAMPLES OF OBJECT-SPECIFIC REASONING:",
+        "- iPhone 16: No home button (uses Face ID), has Dynamic Island, volume buttons on left",
+        "- iPhone 8: Has home button, no notch, Touch ID",
+        "- Coffee Mug: Typically has handle on side, cylindrical body, may have saucer",
+        "- Dining Chair: 4 legs, backrest, seat, typical proportions for sitting",
+        "- Sports Car: Low profile, aerodynamic, wheels at corners, specific proportions",
+        "",
+        "USE YOUR KNOWLEDGE:",
+        "- Draw on your training data about real-world objects",
+        "- Consider historical context (when was this object designed?)",
+        "- Think about functional requirements (what does this object need to do?)",
+        "- Consider design evolution (how has this object changed over time?)",
+        "",
+        "VERIFY IN YOUR THOUGHT:",
+        "Before creating parts, explicitly state in your Thought:",
+        "- What specific features this object should have",
+        "- What features it should NOT have (to avoid mistakes)",
+        "- Where parts should be positioned relative to each other",
+        "- What proportions are appropriate",
     ]
     
     # Add state memory context
@@ -1189,6 +1609,29 @@ def gpt_to_json_react(transcript: str, modeling_context=None, mesh_analysis=None
         if ref_knowledge:
             system_prompt.append(f"\n--- Reference Template: {target_object} ---")
             system_prompt.append(f"Description: {ref_knowledge.get('description', '')}")
+            
+            # ADD: Object-specific details
+            if ref_knowledge.get("object_specifics"):
+                specifics = ref_knowledge["object_specifics"]
+                system_prompt.append(f"\n--- CRITICAL: Object-Specific Information ---")
+                
+                if specifics.get("key_characteristics"):
+                    system_prompt.append("Key Characteristics:")
+                    for char in specifics["key_characteristics"]:
+                        system_prompt.append(f"  - {char}")
+                
+                if specifics.get("version_differences"):
+                    system_prompt.append(f"\nVersion Differences: {specifics['version_differences']}")
+                
+                if specifics.get("common_mistakes"):
+                    system_prompt.append("\nCommon Mistakes to AVOID:")
+                    for mistake in specifics["common_mistakes"]:
+                        system_prompt.append(f"  - DO NOT: {mistake}")
+                
+                if specifics.get("essential_features"):
+                    system_prompt.append("\nEssential Features (MUST include):")
+                    for feature in specifics["essential_features"]:
+                        system_prompt.append(f"  - MUST HAVE: {feature}")
             
             if ref_knowledge.get("typical_geometry"):
                 geom = ref_knowledge["typical_geometry"]
@@ -1438,7 +1881,7 @@ def gpt_to_json_react(transcript: str, modeling_context=None, mesh_analysis=None
             conversation.append({"role": "user", "content": f"Plan received: {action_input}. Now execute the steps sequentially."})
             continue
         elif action == "execute":
-            observation = _react_execute(action_input, executed_commands)
+            observation = _react_execute(action_input, executed_commands, thought=thought, target_object=target_object)
             if "✅" in observation:  # Success
                 last_execute_iteration = iteration
                 
@@ -1633,7 +2076,55 @@ def gpt_to_json_react(transcript: str, modeling_context=None, mesh_analysis=None
         elif action == "finish":
             summary = action_input
             
-            # Post-execution validation (before finishing)
+            # MANDATORY QUALITY ASSESSMENT before finishing
+            quality_check_passed = False
+            if target_object and rpc:
+                try:
+                    print(f"[ReAct] 🔍 Performing mandatory quality assessment before finishing...")
+                    assessment = rpc.assess_object_quality(target_object)
+                    
+                    if assessment and not assessment.get("error"):
+                        quality_score = assessment.get("quality_score", 0.0)
+                        target_match = assessment.get("target_match_score", 0.0)
+                        issues = assessment.get("issues", [])
+                        missing_features = assessment.get("missing_features", [])
+                        
+                        print(f"[ReAct] Quality Score: {quality_score:.2f}/1.0, Target Match: {target_match:.2f}/1.0")
+                        
+                        # Require minimum quality threshold
+                        if quality_score < 0.5 or target_match < 0.5:
+                            quality_check_passed = False
+                            assessment_msg = f"❌ QUALITY CHECK FAILED:\n"
+                            assessment_msg += f"Quality Score: {quality_score:.2f}/1.0 (minimum: 0.5)\n"
+                            assessment_msg += f"Target Match: {target_match:.2f}/1.0 (minimum: 0.5)\n\n"
+                            
+                            if missing_features:
+                                assessment_msg += f"Missing Features: {', '.join(missing_features)}\n"
+                            if issues:
+                                assessment_msg += f"Issues: {'; '.join(issues[:3])}\n"
+                            
+                            assessment_msg += f"\nYou MUST fix these issues before finishing. The object does not yet look like '{target_object}'."
+                            assessment_msg += f"\n\nRequired actions:\n"
+                            assessment_msg += f"1. Add missing parts/components\n"
+                            assessment_msg += f"2. Refine existing parts with edit mode or modifiers\n"
+                            assessment_msg += f"3. Re-assess quality before finishing\n"
+                            
+                            print(f"[ReAct] ⚠️ {assessment_msg}")
+                            conversation.append({"role": "user", "content": f"Observation: {assessment_msg}"})
+                        else:
+                            quality_check_passed = True
+                            print(f"[ReAct] ✅ Quality check passed! Object matches target '{target_object}'")
+                    else:
+                        # If assessment failed, still require manual check
+                        print(f"[ReAct] ⚠️ Quality assessment unavailable, requiring manual verification")
+                        conversation.append({"role": "user", "content": f"Observation: Before finishing, verify the object looks like '{target_object}'. Use 'observe assess_object_quality' to check. If quality is low, continue refining."})
+                        quality_check_passed = False
+                except Exception as e:
+                    print(f"[ReAct] ⚠️ Quality assessment error: {e}")
+                    conversation.append({"role": "user", "content": f"Observation: Quality check failed ({e}). Before finishing, verify the object looks like '{target_object}'. Use 'observe assess_object_quality' to check."})
+                    quality_check_passed = False
+            
+            # Also run legacy validation for backwards compatibility
             validation_failed = False
             if target_object and executed_commands:
                 try:
@@ -1642,16 +2133,15 @@ def gpt_to_json_react(transcript: str, modeling_context=None, mesh_analysis=None
                     validation_msg = _validate_object_after_execution(target_object, fresh_analysis)
                     if validation_msg:
                         print(f"[ReAct] ⚠️ Validation warning: {validation_msg}")
-                        # If validation fails, add it as an observation and continue loop
                         conversation.append({"role": "user", "content": f"Observation: {validation_msg}. Please fix this issue before finishing."})
                         validation_failed = True
                 except Exception as e:
                     if VERBOSE_DEBUG:
                         print(f"[ReAct] Validation error: {e}")
             
-            # If validation failed, continue the loop instead of finishing
-            if validation_failed:
-                print(f"[ReAct] Continuing due to validation issue...")
+            # If quality check or validation failed, continue the loop instead of finishing
+            if not quality_check_passed or validation_failed:
+                print(f"[ReAct] Continuing due to quality/validation issues...")
                 continue
             
             # Validation passed or no validation needed - finish
@@ -2559,11 +3049,17 @@ def _get_reference_knowledge(target_object: str, use_gpt=True):
                 from openai import OpenAI
                 client = OpenAI(api_key=api_key)
                 
-                prompt = f"""You are a 3D modeling expert specializing in Blender. Generate comprehensive reference knowledge for modeling a "{target_object}" in Blender.
+                prompt = f"""You are a 3D modeling expert. Provide detailed information about: {target_object}
 
 Provide a JSON response with this exact structure:
 {{
     "description": "Brief 1-2 sentence description of the object",
+    "object_specifics": {{
+        "key_characteristics": ["Characteristic 1", "Characteristic 2", "Characteristic 3"],
+        "version_differences": "Important differences from similar objects (e.g., 'iPhone 16 has no home button, uses Dynamic Island instead')",
+        "common_mistakes": ["Common mistake 1 to avoid", "Common mistake 2 to avoid"],
+        "essential_features": ["Feature that must be included", "Another essential feature"]
+    }},
     "typical_geometry": {{
         "shape": "Overall shape description (e.g., 'cylindrical', 'rectangular prism', 'organic curved')",
         "proportions": "Typical size ratios and dimensions (e.g., 'roughly 1:1:1 (height ≈ diameter), approximately 3-4 units in Blender scale')",
@@ -2592,6 +3088,13 @@ Provide a JSON response with this exact structure:
     "common_operations": ["mesh.primitive_cube_add", "mesh.bevel", "transform.resize"]
 }}
 
+CRITICAL: Include object-specific details:
+- For phones: Which model has home buttons vs Face ID, notch vs Dynamic Island, button placement, camera module design
+- For furniture: Typical dimensions, material characteristics, structural requirements, ergonomic considerations
+- For vehicles: Wheel placement, proportions, key design elements, aerodynamic features
+- For any object: Version-specific features, common variations, what NOT to include, historical context
+
+Be specific about what makes THIS object unique or different from similar objects.
 Guidelines:
 - Be specific about Blender operations and operators
 - Include realistic proportions and dimensions
@@ -2599,7 +3102,7 @@ Guidelines:
 - Provide step-by-step workflow that's actually achievable in Blender
 - Use proper Blender operator names (mesh.*, object.*, transform.*)
 - Consider both OBJECT and EDIT modes where appropriate
-"""
+- Include version/model-specific details when relevant (e.g., iPhone 16 vs iPhone 8)"""
                 
                 response = client.chat.completions.create(
                     model="gpt-4o",
