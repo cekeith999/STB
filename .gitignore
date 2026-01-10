@@ -28,5 +28,21 @@ desktop.ini
 .env
 .env.*
 
-
 artifacts/
+
+# Distribution packages (too large for git)
+*.zip
+SpeechToBlender_*.zip
+
+# Bundled runtime (too large, users get it from releases)
+stb_runtime/
+
+# Packaging scripts (dev tools)
+package_mvp.ps1
+test_install.ps1
+
+# Large documentation/export files
+cursor_detailed_model_communication_out.md
+
+# Temporary packaging directories
+*_MVP_temp/
