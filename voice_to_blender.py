@@ -1134,6 +1134,7 @@ def gpt_to_json_react(transcript: str, modeling_context=None, mesh_analysis=None
     
     # Check if we have a valid model provider and API key
     provider, openai_key, gemini_key = _get_ai_model_config()
+    original_provider = provider  # Store original for logging
     if provider.startswith("openai") and not openai_key:
         print("⚠️ ReAct: Missing OpenAI API key.")
         return None
@@ -1339,9 +1340,8 @@ def gpt_to_json_react(transcript: str, modeling_context=None, mesh_analysis=None
     action_history = []  # Track action history for loop detection
     last_execute_iteration = -1  # Track when we last executed something
     
-    # Track if we've tried fallback to OpenAI
-    tried_openai_fallback = False
-    original_provider = provider
+    # Track if we've switched to OpenAI fallback (once switched, use OpenAI for all remaining iterations)
+    using_openai_fallback = False
     
     for iteration in range(max_iterations):
         output = None
@@ -1352,21 +1352,8 @@ def gpt_to_json_react(transcript: str, modeling_context=None, mesh_analysis=None
             if screenshot_data:
                 print(f"[ReAct] User message includes screenshot: {len(screenshot_data):,} bytes")
         
-        # Try primary provider
-        try:
-            output = _call_unified_ai_api(
-                messages=conversation,
-                system_prompt=system_prompt_text,
-                temperature=0
-            )
-        except Exception as e:
-            print(f"[ReAct] ⚠️ Primary provider ({provider}) error: {e}")
-            output = None
-        
-        # If primary provider failed and we haven't tried OpenAI fallback, try it
-        if not output and not tried_openai_fallback and provider.startswith("google") and openai_key:
-            print(f"[ReAct] ⚠️ Gemini failed, trying OpenAI fallback...")
-            tried_openai_fallback = True
+        # If we've already switched to OpenAI fallback, use it directly
+        if using_openai_fallback:
             try:
                 output = _call_unified_ai_api(
                     messages=conversation,
@@ -1374,14 +1361,40 @@ def gpt_to_json_react(transcript: str, modeling_context=None, mesh_analysis=None
                     temperature=0,
                     model_override="openai-gpt-4o"
                 )
-                if output:
-                    print(f"[ReAct] ✅ OpenAI fallback succeeded")
-            except Exception as e2:
-                print(f"[ReAct] ⚠️ OpenAI fallback also failed: {e2}")
+            except Exception as e:
+                print(f"[ReAct] ⚠️ OpenAI fallback error: {e}")
                 output = None
+        else:
+            # Try primary provider first
+            try:
+                output = _call_unified_ai_api(
+                    messages=conversation,
+                    system_prompt=system_prompt_text,
+                    temperature=0
+                )
+            except Exception as e:
+                print(f"[ReAct] ⚠️ Primary provider ({provider}) error: {e}")
+                output = None
+            
+            # If primary provider failed and we haven't switched to OpenAI fallback, try it
+            if not output and not using_openai_fallback and provider.startswith("google") and openai_key:
+                print(f"[ReAct] ⚠️ Gemini failed, switching to OpenAI fallback for remaining iterations...")
+                using_openai_fallback = True
+                try:
+                    output = _call_unified_ai_api(
+                        messages=conversation,
+                        system_prompt=system_prompt_text,
+                        temperature=0,
+                        model_override="openai-gpt-4o"
+                    )
+                    if output:
+                        print(f"[ReAct] ✅ OpenAI fallback succeeded, will use OpenAI for remaining iterations")
+                except Exception as e2:
+                    print(f"[ReAct] ⚠️ OpenAI fallback also failed: {e2}")
+                    output = None
         
         if not output:
-            print(f"⚠️ ReAct AI error: No response (tried {provider} and {'OpenAI' if tried_openai_fallback else 'no fallback'})")
+            print(f"⚠️ ReAct AI error: No response (tried {provider if not using_openai_fallback else 'OpenAI'})")
             return None
         
         if CONTEXT_DEBUG:
