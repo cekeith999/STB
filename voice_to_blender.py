@@ -1339,28 +1339,53 @@ def gpt_to_json_react(transcript: str, modeling_context=None, mesh_analysis=None
     action_history = []  # Track action history for loop detection
     last_execute_iteration = -1  # Track when we last executed something
     
+    # Track if we've tried fallback to OpenAI
+    tried_openai_fallback = False
+    original_provider = provider
+    
     for iteration in range(max_iterations):
+        output = None
+        
+        if CONTEXT_DEBUG and iteration == 0:
+            print(f"[ReAct] Iteration {iteration+1}: Calling AI with {len(conversation)} messages")
+            print(f"[ReAct] System prompt: {len(system_prompt_text):,} characters")
+            if screenshot_data:
+                print(f"[ReAct] User message includes screenshot: {len(screenshot_data):,} bytes")
+        
+        # Try primary provider
         try:
-            if CONTEXT_DEBUG and iteration == 0:
-                print(f"[ReAct] Iteration {iteration+1}: Calling AI with {len(conversation)} messages")
-                print(f"[ReAct] System prompt: {len(system_prompt_text):,} characters")
-                if screenshot_data:
-                    print(f"[ReAct] User message includes screenshot: {len(screenshot_data):,} bytes")
-            
             output = _call_unified_ai_api(
                 messages=conversation,
                 system_prompt=system_prompt_text,
                 temperature=0
             )
-            if not output:
-                print(f"⚠️ ReAct AI error: No response")
-                return None
-            
-            if CONTEXT_DEBUG:
-                print(f"[ReAct] Iteration {iteration+1}: Received response ({len(output):,} characters)")
         except Exception as e:
-            print(f"⚠️ ReAct AI error: {e}")
+            print(f"[ReAct] ⚠️ Primary provider ({provider}) error: {e}")
+            output = None
+        
+        # If primary provider failed and we haven't tried OpenAI fallback, try it
+        if not output and not tried_openai_fallback and provider.startswith("google") and openai_key:
+            print(f"[ReAct] ⚠️ Gemini failed, trying OpenAI fallback...")
+            tried_openai_fallback = True
+            try:
+                output = _call_unified_ai_api(
+                    messages=conversation,
+                    system_prompt=system_prompt_text,
+                    temperature=0,
+                    model_override="openai-gpt-4o"
+                )
+                if output:
+                    print(f"[ReAct] ✅ OpenAI fallback succeeded")
+            except Exception as e2:
+                print(f"[ReAct] ⚠️ OpenAI fallback also failed: {e2}")
+                output = None
+        
+        if not output:
+            print(f"⚠️ ReAct AI error: No response (tried {provider} and {'OpenAI' if tried_openai_fallback else 'no fallback'})")
             return None
+        
+        if CONTEXT_DEBUG:
+            print(f"[ReAct] Iteration {iteration+1}: Received response ({len(output):,} characters)")
         
         conversation.append({"role": "assistant", "content": output})
         
