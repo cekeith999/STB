@@ -86,6 +86,333 @@ def _clear_api_key_cache():
 _CACHED_API_KEY = None
 _CACHE_VALID = False
 
+# Warmup context cache (prepared during speech detection)
+_WARMUP_CONTEXT_CACHE = {"ready": False}
+
+# Cached model provider and Gemini key
+_CACHED_MODEL_PROVIDER = None
+_CACHED_GEMINI_KEY = None
+_CACHE_MODEL_VALID = False
+
+def _get_ai_model_config():
+    """Get AI model provider and API keys from RPC (preferences)."""
+    global _CACHED_MODEL_PROVIDER, _CACHED_GEMINI_KEY, _CACHE_MODEL_VALID, _CACHED_API_KEY, _CACHE_VALID
+    
+    if _CACHE_MODEL_VALID and _CACHED_MODEL_PROVIDER:
+        return _CACHED_MODEL_PROVIDER, _CACHED_API_KEY, _CACHED_GEMINI_KEY
+    
+    provider = "openai-gpt-4o"  # Default
+    openai_key = ""
+    gemini_key = ""
+    
+    if rpc is not None:
+        try:
+            provider = rpc.get_ai_model_provider() or "openai-gpt-4o"
+            openai_key = _get_openai_api_key()  # Uses existing function
+            gemini_key = rpc.get_gemini_api_key() or ""
+            
+            # Cache values
+            _CACHED_MODEL_PROVIDER = provider
+            _CACHED_API_KEY = openai_key
+            _CACHED_GEMINI_KEY = gemini_key
+            _CACHE_MODEL_VALID = True
+            _CACHE_VALID = True
+            
+            print(f"[AI] Using model provider: {provider}")
+        except Exception as e:
+            if VERBOSE_DEBUG:
+                print(f"[DEBUG] Error getting AI model config: {e}")
+            # Fall back to defaults
+            provider = "openai-gpt-4o"
+            openai_key = _get_openai_api_key()
+    
+    return provider, openai_key, gemini_key
+
+def _clear_model_cache():
+    """Clear cached model config (call when RPC stops)."""
+    global _CACHED_MODEL_PROVIDER, _CACHED_GEMINI_KEY, _CACHE_MODEL_VALID
+    _CACHED_MODEL_PROVIDER = None
+    _CACHED_GEMINI_KEY = None
+    _CACHE_MODEL_VALID = False
+
+def _call_unified_ai_api(messages, system_prompt=None, temperature=0, model_override=None):
+    """
+    Unified API call function that supports both OpenAI and Google Gemini.
+    
+    Args:
+        messages: List of message dicts with 'role' and 'content' (or content list for images)
+        system_prompt: Optional system prompt (will be prepended to messages)
+        temperature: Temperature setting (default 0)
+        model_override: Optional model override (e.g., "openai-gpt-4o", "google-gemini-3-pro")
+    
+    Returns:
+        Response text or None on error
+    """
+    provider, openai_key, gemini_key = _get_ai_model_config()
+    
+    # Allow model override
+    if model_override:
+        provider = model_override
+    
+    # Prepare messages with system prompt
+    if system_prompt:
+        all_messages = [{"role": "system", "content": system_prompt}] + messages
+    else:
+        all_messages = messages
+    
+    try:
+        if provider.startswith("openai"):
+            # OpenAI API
+            if not openai_key:
+                print("⚠️ OpenAI API key not set")
+                return None
+            
+            try:
+                from openai import OpenAI
+            except ImportError:
+                print("⚠️ openai package not available; pip install openai")
+                return None
+            
+            client = OpenAI(api_key=openai_key)
+            
+            # Determine model name
+            model_name = "gpt-4o"  # Default
+            if provider == "openai-gpt-4o":
+                model_name = "gpt-4o"
+            # Add more OpenAI models here if needed
+            
+            # OpenAI expects messages in their format
+            resp = client.chat.completions.create(
+                model=model_name,
+                messages=all_messages,
+                temperature=temperature,
+            )
+            return (resp.choices[0].message.content or "").strip()
+            
+        elif provider.startswith("google"):
+            # Google Gemini API
+            if not gemini_key:
+                print("⚠️ Google Gemini API key not set")
+                return None
+            
+            # Try new google.genai first (recommended)
+            use_new_library = False
+            try:
+                import google.genai as genai
+                use_new_library = True
+                print("[AI] Using google.genai (new library)")
+                client = genai.Client(api_key=gemini_key)
+            except ImportError:
+                # Fallback to deprecated google.generativeai
+                try:
+                    import google.generativeai as genai
+                    print("[AI] ⚠️ Using deprecated google.generativeai - consider upgrading to google.genai")
+                    genai.configure(api_key=gemini_key)
+                except ImportError:
+                    print("⚠️ google.genai package not available; pip install google-genai")
+                    return None
+            
+            # Determine model name - try to auto-detect available models
+            model_name = "gemini-1.5-pro"  # Default fallback
+            
+            # Try to list available models to find the correct name
+            try:
+                if use_new_library:
+                    # New library API
+                    available_models = client.models.list()
+                    model_names = [m.name.split('/')[-1] for m in available_models]
+                else:
+                    # Old library API
+                    available_models = genai.list_models()
+                    model_names = [m.name.split('/')[-1] for m in available_models if 'generateContent' in m.supported_generation_methods]
+                
+                print(f"[AI] 🔍 Available models: {', '.join(model_names[:10])}")
+                
+                # Look for Gemini 3 models (try various naming patterns including "preview")
+                if provider == "google-gemini-3-pro":
+                    # Try different possible names - check for "3" AND "pro" (may include "preview")
+                    found = False
+                    # First try to find preview models (they're the latest)
+                    preview_models = [name for name in model_names if 'gemini' in name.lower() and '3' in name and 'pro' in name.lower() and 'preview' in name.lower()]
+                    if preview_models:
+                        model_name = preview_models[0]
+                        print(f"[AI] ✅ Found Gemini 3 Pro Preview model: {model_name}")
+                        found = True
+                    else:
+                        # Fallback to any Gemini 3 Pro model
+                        for name in model_names:
+                            name_lower = name.lower()
+                            # Look for models with both "3" and "pro" in the name
+                            if 'gemini' in name_lower and '3' in name and 'pro' in name_lower:
+                                model_name = name
+                                print(f"[AI] ✅ Found Gemini 3 Pro model: {model_name}")
+                                found = True
+                                break
+                    
+                    if not found:
+                        # Fallback: try gemini-2.0-flash-exp or gemini-1.5-pro
+                        if "gemini-2.0-flash-exp" in model_names:
+                            model_name = "gemini-2.0-flash-exp"
+                            print(f"[AI] ⚠️ Gemini 3 Pro not found, using fallback: {model_name}")
+                        else:
+                            model_name = "gemini-1.5-pro"
+                            print(f"[AI] ⚠️ Gemini 3 Pro not found, using default: {model_name}")
+                            
+                elif provider == "google-gemini-3-fast":
+                    # Try different possible names - check for "3" AND ("fast" OR "flash") (may include "preview")
+                    found = False
+                    # First try to find preview models (they're the latest)
+                    preview_models = [name for name in model_names if 'gemini' in name.lower() and '3' in name and ('fast' in name.lower() or 'flash' in name.lower()) and 'preview' in name.lower()]
+                    if preview_models:
+                        model_name = preview_models[0]
+                        print(f"[AI] ✅ Found Gemini 3 Fast Preview model: {model_name}")
+                        found = True
+                    else:
+                        # Fallback to any Gemini 3 Fast/Flash model
+                        for name in model_names:
+                            name_lower = name.lower()
+                            # Look for models with "3" and "fast" or "flash" in the name
+                            if 'gemini' in name_lower and '3' in name and ('fast' in name_lower or 'flash' in name_lower):
+                                model_name = name
+                                print(f"[AI] ✅ Found Gemini 3 Fast model: {model_name}")
+                                found = True
+                                break
+                    
+                    if not found:
+                        # Fallback: try gemini-2.0-flash-exp or gemini-1.5-flash
+                        if "gemini-2.0-flash-exp" in model_names:
+                            model_name = "gemini-2.0-flash-exp"
+                            print(f"[AI] ⚠️ Gemini 3 Fast not found, using fallback: {model_name}")
+                        elif "gemini-1.5-flash" in model_names:
+                            model_name = "gemini-1.5-flash"
+                            print(f"[AI] ⚠️ Gemini 3 Fast not found, using fallback: {model_name}")
+                        else:
+                            model_name = "gemini-1.5-pro"
+                            print(f"[AI] ⚠️ Gemini 3 Fast not found, using default: {model_name}")
+                            
+            except Exception as e:
+                print(f"[AI] ⚠️ Could not list models: {e}")
+                # Fall back to defaults
+                if provider == "google-gemini-3-pro":
+                    model_name = "gemini-1.5-pro"
+                    print(f"[AI] Using default model: {model_name}")
+                elif provider == "google-gemini-3-fast":
+                    model_name = "gemini-1.5-flash"
+                    print(f"[AI] Using default model: {model_name}")
+            
+            # Convert messages to Gemini format
+            gemini_messages = []
+            for msg in all_messages:
+                role = msg.get("role", "user")
+                content = msg.get("content", "")
+                
+                # Handle content that might be a list (for images) or string
+                if isinstance(content, list):
+                    # Content is a list with text and images
+                    parts = []
+                    for part in content:
+                        if part.get("type") == "text":
+                            parts.append(part.get("text", ""))
+                        elif part.get("type") == "image_url":
+                            # Gemini expects base64 image data
+                            img_url = part.get("image_url", {}).get("url", "")
+                            if img_url.startswith("data:image"):
+                                import base64
+                                if "," in img_url:
+                                    header, data = img_url.split(",", 1)
+                                    parts.append({
+                                        "mime_type": "image/png",
+                                        "data": base64.b64decode(data)
+                                    })
+                    gemini_content = " ".join([p for p in parts if isinstance(p, str)]) if parts else ""
+                    gemini_parts = [p for p in parts if not isinstance(p, str)]
+                    if gemini_content:
+                        gemini_parts.insert(0, gemini_content)
+                    if not gemini_parts:
+                        gemini_parts = [gemini_content] if gemini_content else [""]
+                else:
+                    # Content is a string
+                    gemini_parts = [content] if content else [""]
+                
+                # Map roles: system -> user (Gemini doesn't have system role), assistant -> model, user -> user
+                if role == "system":
+                    # For system prompts, prepend to first user message
+                    if not gemini_messages or gemini_messages[-1]["role"] != "user":
+                        gemini_messages.append({"role": "user", "parts": gemini_parts})
+                    else:
+                        gemini_messages[-1]["parts"] = gemini_parts + gemini_messages[-1]["parts"]
+                elif role == "assistant":
+                    gemini_messages.append({"role": "model", "parts": gemini_parts})
+                else:  # user
+                    gemini_messages.append({"role": "user", "parts": gemini_parts})
+            
+            # Call Gemini API
+            if use_new_library:
+                # New library API - convert messages format
+                from google.genai.types import Content, Part
+                import base64
+                
+                contents = []
+                system_instruction = None
+                
+                for msg in all_messages:
+                    role = msg.get("role", "user")
+                    content = msg.get("content", "")
+                    
+                    parts = []
+                    if isinstance(content, list):
+                        for part_item in content:
+                            if part_item.get("type") == "text":
+                                parts.append(Part(text=part_item.get("text", "")))
+                            elif part_item.get("type") == "image_url":
+                                img_url = part_item.get("image_url", {}).get("url", "")
+                                if img_url.startswith("data:image") and "," in img_url:
+                                    header, data = img_url.split(",", 1)
+                                    parts.append(Part(inline_data={"mime_type": "image/png", "data": base64.b64decode(data)}))
+                    else:
+                        parts.append(Part(text=content))
+                    
+                    if role == "system":
+                        if parts:
+                            system_instruction = parts[0].text
+                    elif role == "assistant":
+                        contents.append(Content(role="model", parts=parts))
+                    else:
+                        contents.append(Content(role="user", parts=parts))
+                
+                print(f"[AI] Calling Gemini API with model: {model_name}")
+                # New library API - system_instruction should be passed differently or included in first message
+                # If we have system instruction, prepend it to the first user message
+                if system_instruction and contents and contents[0].role == "user":
+                    # Add system instruction as first part of first user message
+                    contents[0].parts.insert(0, Part(text=f"System: {system_instruction}\n\n"))
+                
+                response = client.models.generate_content(
+                    model=model_name,
+                    contents=contents,
+                    config={"temperature": temperature}
+                )
+                return response.text.strip() if response.text else None
+            else:
+                # Old library API
+                print(f"[AI] Calling Gemini API with model: {model_name}")
+                model = genai.GenerativeModel(model_name)
+                response = model.generate_content(
+                    gemini_messages,
+                    generation_config=genai.types.GenerationConfig(temperature=temperature)
+                )
+                return response.text.strip() if response.text else None
+            
+        else:
+            print(f"⚠️ Unknown AI model provider: {provider}")
+            return None
+            
+    except Exception as e:
+        print(f"⚠️ AI API error ({provider}): {e}")
+        import traceback
+        traceback.print_exc()
+        return None
+
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # The add-on launcher passes STB_PYTHON_EXE and (if present) WHISPER_CLI.
@@ -104,6 +431,7 @@ RPC_URL = "http://127.0.0.1:8765/RPC2"
 # Feature flags / verbosity
 ENABLE_GPT_FALLBACK = True   # GPT-4o fallback for natural language understanding
 VERBOSE_DEBUG = False        # debug prints for import matcher (set True for debugging)
+CONTEXT_DEBUG = True         # Show detailed context analysis (mesh, scene, screenshots) at each step
 
 # Modeling target / reasoning state (from Blender)
 SUPER_MODE_TARGET = ""
@@ -305,6 +633,111 @@ def _capture_screen_local():
         return None
 
 
+def _log_context_data(modeling_context, mesh_analysis, scene_analysis, screenshot_data, step_name="Context"):
+    """Log detailed context information for debugging."""
+    if not CONTEXT_DEBUG:
+        return
+    
+    print("")
+    print(f"[{step_name}] " + "=" * 70)
+    
+    # Modeling Context
+    if modeling_context:
+        print(f"[{step_name}] 📋 Modeling Context:")
+        if modeling_context.get("active_object"):
+            ao = modeling_context["active_object"]
+            print(f"  Active Object: {ao.get('name', 'N/A')} (type: {ao.get('type', 'N/A')}, mode: {ao.get('mode', 'N/A')})")
+        selected = modeling_context.get("selected_objects", [])
+        print(f"  Selected Objects: {len(selected)}")
+        for i, obj in enumerate(selected[:5], 1):  # Show first 5
+            print(f"    {i}. {obj.get('name', 'N/A')} ({obj.get('type', 'N/A')}) at {obj.get('location', 'N/A')}")
+        if len(selected) > 5:
+            print(f"    ... and {len(selected) - 5} more")
+        print(f"  Current Mode: {modeling_context.get('current_mode', 'N/A')}")
+        mods = modeling_context.get("modifiers", [])
+        if mods:
+            print(f"  Modifiers: {len(mods)} - {', '.join([m.get('name', 'N/A') for m in mods[:3]])}")
+            if len(mods) > 3:
+                print(f"    ... and {len(mods) - 3} more")
+    else:
+        print(f"[{step_name}] 📋 Modeling Context: None")
+    
+    # Mesh Analysis
+    if mesh_analysis:
+        if mesh_analysis.get("error"):
+            print(f"[{step_name}] 📐 Mesh Analysis: ERROR - {mesh_analysis.get('error')}")
+        else:
+            print(f"[{step_name}] 📐 Mesh Analysis:")
+            print(f"  Object: {mesh_analysis.get('object_name', 'N/A')}")
+            print(f"  Vertices: {mesh_analysis.get('vertex_count', 0):,}")
+            print(f"  Edges: {mesh_analysis.get('edge_count', 0):,}")
+            print(f"  Faces: {mesh_analysis.get('face_count', 0):,}")
+            
+            bounds = mesh_analysis.get("bounds")
+            if bounds:
+                size = bounds.get("size", (0, 0, 0))
+                print(f"  Size: {size[0]:.2f} x {size[1]:.2f} x {size[2]:.2f}")
+                if bounds.get("shape_class"):
+                    print(f"  Shape: {bounds['shape_class']}")
+            
+            selection = mesh_analysis.get("selection", {})
+            if selection:
+                sel_v = len(selection.get("vertices", []))
+                sel_e = len(selection.get("edges", []))
+                sel_f = len(selection.get("faces", []))
+                if sel_v > 0 or sel_e > 0 or sel_f > 0:
+                    print(f"  Selection: {sel_v} vertices, {sel_e} edges, {sel_f} faces")
+            
+            # Show sample of vertex data (first 3)
+            all_verts = mesh_analysis.get("all_vertices", [])
+            if all_verts and len(all_verts) > 0:
+                print(f"  Vertex Data: {len(all_verts)} total vertices")
+                print(f"    Sample (first 3):")
+                for i, v in enumerate(all_verts[:3], 1):
+                    co = v.get("co", (0, 0, 0))
+                    print(f"      {i}. Index {v.get('index', 'N/A')}: ({co[0]:.3f}, {co[1]:.3f}, {co[2]:.3f})")
+    else:
+        print(f"[{step_name}] 📐 Mesh Analysis: None")
+    
+    # Scene Analysis
+    if scene_analysis:
+        if scene_analysis.get("error"):
+            print(f"[{step_name}] 🎬 Scene Analysis: ERROR - {scene_analysis.get('error')}")
+        else:
+            print(f"[{step_name}] 🎬 Scene Analysis:")
+            summary = scene_analysis.get("scene_summary", {})
+            print(f"  Total Objects: {summary.get('total_objects', 0)}")
+            print(f"  Mesh Objects: {summary.get('mesh_objects', 0)}")
+            print(f"  Collections: {summary.get('collection_count', 0)}")
+            print(f"  Materials: {summary.get('material_count', 0)}")
+            
+            objects_by_type = scene_analysis.get("objects_by_type", {})
+            if objects_by_type:
+                print(f"  Objects by Type:")
+                for obj_type, names in list(objects_by_type.items())[:5]:
+                    print(f"    {obj_type}: {len(names)} objects - {', '.join(names[:3])}")
+                    if len(names) > 3:
+                        print(f"      ... and {len(names) - 3} more")
+            
+            spatial = scene_analysis.get("spatial_info", {})
+            if spatial:
+                if spatial.get("largest_object"):
+                    print(f"  Largest Object: {spatial['largest_object']}")
+                if spatial.get("smallest_object"):
+                    print(f"  Smallest Object: {spatial['smallest_object']}")
+    else:
+        print(f"[{step_name}] 🎬 Scene Analysis: None")
+    
+    # Screenshot
+    if screenshot_data:
+        print(f"[{step_name}] 📸 Screenshot: {len(screenshot_data):,} bytes (base64 encoded)")
+    else:
+        print(f"[{step_name}] 📸 Screenshot: None")
+    
+    print(f"[{step_name}] " + "=" * 70)
+    print("")
+
+
 def _fetch_context_for_gpt(include_screenshot: bool = True):
     """Helper to fetch modeling context + mesh analysis + scene analysis + screenshot via RPC."""
     modeling_context = None
@@ -314,13 +747,21 @@ def _fetch_context_for_gpt(include_screenshot: bool = True):
     if rpc is None:
         return modeling_context, mesh_analysis, scene_analysis, screenshot_data
     try:
+        if CONTEXT_DEBUG:
+            print("[Context] Fetching modeling context from Blender...")
         modeling_context = rpc.get_modeling_context()
+        
         if modeling_context and modeling_context.get("active_object"):
             ao = modeling_context["active_object"]
             if ao.get("type") == "MESH":
+                if CONTEXT_DEBUG:
+                    print("[Context] Active object is a mesh, analyzing geometry...")
                 mesh_analysis = rpc.analyze_current_mesh()
+        
         # Always fetch scene analysis for context
         try:
+            if CONTEXT_DEBUG:
+                print("[Context] Analyzing scene...")
             scene_analysis = rpc.analyze_scene()
         except Exception as e:
             print(f"[Context] ⚠️ Error analyzing scene: {e}")
@@ -330,10 +771,12 @@ def _fetch_context_for_gpt(include_screenshot: bool = True):
         # Do this even if context fetching failed
         if include_screenshot:
             try:
-                print("📸 Capturing viewport screenshot...")
+                if CONTEXT_DEBUG:
+                    print("[Context] Capturing viewport screenshot...")
                 screenshot_data = _capture_screen_local()
                 if screenshot_data:
-                    print(f"✅ Screenshot captured: {len(screenshot_data)} bytes (base64)")
+                    if CONTEXT_DEBUG:
+                        print(f"[Context] ✅ Screenshot captured: {len(screenshot_data):,} bytes (base64)")
                 else:
                     print("⚠️ Screenshot capture returned None - check [Screenshot] messages above for details")
             except Exception as e:
@@ -353,6 +796,10 @@ def _fetch_context_for_gpt(include_screenshot: bool = True):
                     print(f"✅ Screenshot captured after error: {len(screenshot_data)} bytes (base64)")
             except Exception as e2:
                 print(f"⚠️ Screenshot capture also failed: {e2}")
+    
+    # Log the captured context data
+    _log_context_data(modeling_context, mesh_analysis, scene_analysis, screenshot_data, "Context Capture")
+    
     return modeling_context, mesh_analysis, scene_analysis, screenshot_data
 
 
@@ -372,51 +819,145 @@ def _resolve_local_sequence(command_parts):
 
 
 def _react_observe(request: str) -> str:
-    """Perform observation requests for ReAct loop with actionable error messages."""
+    """Perform observation requests for ReAct loop with actionable error messages and full context."""
     if rpc is None:
         return "RPC unavailable; cannot observe. You should EXECUTE actions instead."
     req = (request or "").strip().lower()
+    
+    # Always capture fresh context for observations
+    screenshot_data = None
+    mesh_analysis = None
+    scene_analysis = None
+    
+    try:
+        if CONTEXT_DEBUG:
+            print("[Observe] Capturing context for observation...")
+        
+        # Capture screenshot
+        screenshot_data = _capture_screen_local()
+        
+        # Get modeling context
+        modeling_context = None
+        if rpc:
+            try:
+                modeling_context = rpc.get_modeling_context()
+            except Exception:
+                pass
+        
+        # Get mesh and scene analysis
+        if rpc:
+            try:
+                mesh_analysis = rpc.analyze_current_mesh()
+            except Exception:
+                pass
+            try:
+                scene_analysis = rpc.analyze_scene()
+            except Exception:
+                pass
+        
+        # Log the captured context
+        if CONTEXT_DEBUG:
+            _log_context_data(modeling_context, mesh_analysis, scene_analysis, screenshot_data, "Observe Context")
+    except Exception as e:
+        if CONTEXT_DEBUG:
+            print(f"[Observe] ⚠️ Error capturing context: {e}")
+    
     try:
         if req in ("selected_objects", "selection", "selected"):
             ctx = rpc.get_modeling_context()
             selected = ctx.get("selected_objects", [])
             if not selected:
-                return "No objects are currently selected. You may need to create objects first using EXECUTE actions."
-            return json.dumps(selected, indent=2)
+                result = "No objects are currently selected. You may need to create objects first using EXECUTE actions."
+            else:
+                result = json.dumps(selected, indent=2)
+            
+            # Add context summary
+            if scene_analysis:
+                result += f"\n\n📊 Scene Summary: {scene_analysis.get('total_objects', 0)} total objects"
+            if screenshot_data:
+                result += f"\n📸 Screenshot captured ({len(screenshot_data)} bytes)"
+            
+            return result
+            
         if req in ("active_object", "active", "current_object"):
             ctx = rpc.get_modeling_context()
             active = ctx.get("active_object")
             if not active:
-                return "No active object. You may need to create an object first using EXECUTE actions like mesh.primitive_cube_add."
-            return json.dumps(active, indent=2)
+                result = "No active object. You may need to create an object first using EXECUTE actions like mesh.primitive_cube_add."
+            else:
+                result = json.dumps(active, indent=2)
+            
+            # Add mesh analysis if available
+            if mesh_analysis and not mesh_analysis.get("error"):
+                result += f"\n\n📐 Mesh: {mesh_analysis.get('vertex_count', 0)} vertices, {mesh_analysis.get('face_count', 0)} faces"
+            if screenshot_data:
+                result += f"\n📸 Screenshot captured ({len(screenshot_data)} bytes)"
+            
+            return result
+            
         if req in ("mesh_analysis", "mesh", "geometry"):
             try:
                 analysis = rpc.analyze_current_mesh()
                 if analysis and analysis.get("error"):
-                    return f"Mesh analysis error: {analysis.get('error')}. There may be no active mesh object. Create one first using EXECUTE actions."
-                if analysis:
-                    return json.dumps(analysis, indent=2)
-                return "Mesh analysis returned empty result. There may be no active mesh object."
+                    result = f"Mesh analysis error: {analysis.get('error')}. There may be no active mesh object. Create one first using EXECUTE actions."
+                elif analysis:
+                    result = json.dumps(analysis, indent=2)
+                else:
+                    result = "Mesh analysis returned empty result. There may be no active mesh object."
+                
+                # Add screenshot info
+                if screenshot_data:
+                    result += f"\n📸 Screenshot captured ({len(screenshot_data)} bytes)"
+                
+                return result
             except Exception as e:
                 error_msg = str(e)
                 if "TypeError" in error_msg or "dictionary key" in error_msg:
                     return f"Mesh analysis error (serialization issue): {error_msg}. Try executing an action to create or select a mesh object first."
                 return f"Mesh analysis error: {error_msg}. There may be no active mesh object or the object is in an invalid state."
+                
         if req in ("modifiers", "mods"):
             ctx = rpc.get_modeling_context()
             mods = ctx.get("modifiers", [])
             if not mods:
-                return "No modifiers on active object. You can add modifiers using EXECUTE with object.modifier_add."
-            return json.dumps(mods, indent=2)
+                result = "No modifiers on active object. You can add modifiers using EXECUTE with object.modifier_add."
+            else:
+                result = json.dumps(mods, indent=2)
+            
+            if screenshot_data:
+                result += f"\n📸 Screenshot captured ({len(screenshot_data)} bytes)"
+            
+            return result
+            
         if req in ("scene", "scene_info", "scene_analysis"):
-            analysis = rpc.analyze_scene()
-            return json.dumps(analysis, indent=2)
+            if scene_analysis:
+                result = json.dumps(scene_analysis, indent=2)
+            else:
+                analysis = rpc.analyze_scene()
+                result = json.dumps(analysis, indent=2)
+            
+            if screenshot_data:
+                result += f"\n📸 Screenshot captured ({len(screenshot_data)} bytes)"
+            
+            return result
+            
         if req in ("parts", "categorized_parts", "object_parts"):
-            analysis = rpc.analyze_scene()
-            parts = analysis.get("categorized_parts", {})
+            if scene_analysis:
+                parts = scene_analysis.get("categorized_parts", {})
+            else:
+                analysis = rpc.analyze_scene()
+                parts = analysis.get("categorized_parts", {})
+            
             if not any(parts.values()):
-                return "No categorized parts found. You may need to create objects first using EXECUTE actions."
-            return json.dumps(parts, indent=2)
+                result = "No categorized parts found. You may need to create objects first using EXECUTE actions."
+            else:
+                result = json.dumps(parts, indent=2)
+            
+            if screenshot_data:
+                result += f"\n📸 Screenshot captured ({len(screenshot_data)} bytes)"
+            
+            return result
+            
         return f"Unknown observation '{request}'. Try selected_objects, active_object, mesh_analysis, modifiers, scene, scene_analysis, parts. If you need to create objects, use EXECUTE actions instead."
     except Exception as e:
         return f"Observation error: {e}. Consider using EXECUTE actions to create or modify objects instead of observing."
@@ -590,14 +1131,14 @@ def gpt_to_json_react(transcript: str, modeling_context=None, mesh_analysis=None
     """Use ReAct loop (Thought/Action/Observation) to execute complex commands."""
     if not ENABLE_GPT_FALLBACK:
         return None
-    api_key = _get_openai_api_key()
-    if not api_key:
+    
+    # Check if we have a valid model provider and API key
+    provider, openai_key, gemini_key = _get_ai_model_config()
+    if provider.startswith("openai") and not openai_key:
         print("⚠️ ReAct: Missing OpenAI API key.")
         return None
-    try:
-        from openai import OpenAI
-    except Exception as e:
-        print(f"⚠️ ReAct: Failed to import OpenAI: {e}")
+    elif provider.startswith("google") and not gemini_key:
+        print("⚠️ ReAct: Missing Google Gemini API key.")
         return None
     
     # Get reference knowledge with step-by-step templates
@@ -607,20 +1148,27 @@ def gpt_to_json_react(transcript: str, modeling_context=None, mesh_analysis=None
         "You are a Blender automation agent that must follow the ReAct (Reason + Action) format.",
         "Respond ONLY with blocks containing:",
         "Thought: <reasoning>",
-        "Action: <execute|observe|finish>",
+        "Action: <execute|observe|finish|plan>",
         "Action Input: <JSON or observation request>",
         "",
         "Action rules:",
+        "- plan: Break down complex tasks into step-by-step plan (use this FIRST for multi-step tasks)",
         "- execute: run a Blender operator via JSON, e.g. {\"op\":\"mesh.primitive_cube_add\",\"kwargs\":{}}.",
         "- observe: ask for data (selected_objects, active_object, mesh_analysis, modifiers, scene).",
         "- finish: task done, provide short summary.",
+        "",
+        "WORKFLOW FOR COMPLEX TASKS:",
+        "1. First, use Action: plan to break down the task into steps",
+        "2. Then execute each step sequentially",
+        "3. Observe after each major step to verify progress",
+        "4. Finish when all steps are complete",
         "",
         "CRITICAL RULES:",
         "1. DO NOT observe more than 2 times in a row. After observing, you MUST execute an action.",
         "2. If an operation fails, try a DIFFERENT approach, don't just observe again.",
         "3. If you're stuck, simplify your approach or finish with what you have.",
         "4. Always provide valid JSON in Action Input for execute actions.",
-        "5. If you need to create objects, use EXECUTE with mesh.primitive_*_add operators.",
+        "5. For complex tasks, start with a PLAN action to outline steps before executing.",
         "",
         "Never output prose outside the required fields. Combine multiple Blender steps into sequential execute actions.",
         "",
@@ -674,6 +1222,8 @@ def gpt_to_json_react(transcript: str, modeling_context=None, mesh_analysis=None
     if modeling_context:
         system_prompt.append(f"\n--- Current Modeling Context ---")
         system_prompt.append(json.dumps(modeling_context, indent=2))
+        if CONTEXT_DEBUG:
+            print("[ReAct] ✅ Added modeling context to system prompt")
     
     if mesh_analysis and not mesh_analysis.get("error"):
         system_prompt.append(f"\n--- Current Mesh Analysis ---")
@@ -701,10 +1251,34 @@ def gpt_to_json_react(transcript: str, modeling_context=None, mesh_analysis=None
             face_desc = ", ".join([f"{count} {int(v)}-gons" if int(v) > 4 else f"{count} {'triangles' if int(v) == 3 else 'quads'}" 
                                   for v, count in sorted(face_types.items(), key=lambda x: int(x[0]))])
             system_prompt.append(f"Face Types: {face_desc}")
+        
+        if CONTEXT_DEBUG:
+            print(f"[ReAct] ✅ Added mesh analysis to system prompt ({ma.get('vertex_count', 0)} vertices, {ma.get('face_count', 0)} faces)")
+    
+    # Add scene analysis summary to system prompt
+    if scene_analysis and not scene_analysis.get("error"):
+        system_prompt.append(f"\n--- Current Scene Analysis ---")
+        sa = scene_analysis
+        summary = sa.get("scene_summary", {})
+        system_prompt.append(f"Total Objects: {summary.get('total_objects', 0)}")
+        system_prompt.append(f"Mesh Objects: {summary.get('mesh_objects', 0)}")
+        system_prompt.append(f"Collections: {summary.get('collection_count', 0)}")
+        system_prompt.append(f"Materials: {summary.get('material_count', 0)}")
+        
+        objects_by_type = sa.get("objects_by_type", {})
+        if objects_by_type:
+            type_summary = ", ".join([f"{obj_type}: {len(names)}" for obj_type, names in list(objects_by_type.items())[:5]])
+            system_prompt.append(f"Objects by Type: {type_summary}")
+        
+        if CONTEXT_DEBUG:
+            print(f"[ReAct] ✅ Added scene analysis to system prompt ({summary.get('total_objects', 0)} objects)")
     
     system_prompt_text = "\n".join(system_prompt)
     
-    client = OpenAI(api_key=api_key)
+    if CONTEXT_DEBUG:
+        print(f"[ReAct] System prompt length: {len(system_prompt_text):,} characters")
+        print(f"[ReAct] System prompt preview (first 500 chars):")
+        print("  " + system_prompt_text[:500].replace("\n", "\n  ") + "...")
     
     # Build initial conversation with history and optional screenshot
     conversation = []
@@ -745,12 +1319,20 @@ def gpt_to_json_react(transcript: str, modeling_context=None, mesh_analysis=None
                 }
             }
         ]
-        print(f"📸 Including viewport screenshot in ReAct GPT call ({len(screenshot_data)} bytes)")
+        print(f"📸 Including viewport screenshot in ReAct AI call ({len(screenshot_data):,} bytes)")
+        if CONTEXT_DEBUG:
+            print(f"[ReAct] User message includes: text + screenshot image")
     else:
         user_content = task_content
-        print("⚠️ No screenshot available for ReAct GPT call")
+        print("⚠️ No screenshot available for ReAct AI call")
+        if CONTEXT_DEBUG:
+            print(f"[ReAct] User message includes: text only")
     
     conversation.append({"role": "user", "content": user_content})
+    
+    if CONTEXT_DEBUG:
+        print(f"[ReAct] Conversation has {len(conversation)} messages")
+        print(f"[ReAct] Sending to AI model with system prompt ({len(system_prompt_text):,} chars) and user message")
     
     executed_commands = []
     max_iterations = 25
@@ -759,16 +1341,27 @@ def gpt_to_json_react(transcript: str, modeling_context=None, mesh_analysis=None
     
     for iteration in range(max_iterations):
         try:
-            resp = client.chat.completions.create(
-                model="gpt-4o",
-                messages=[{"role": "system", "content": system_prompt_text}, *conversation],
-                temperature=0,
+            if CONTEXT_DEBUG and iteration == 0:
+                print(f"[ReAct] Iteration {iteration+1}: Calling AI with {len(conversation)} messages")
+                print(f"[ReAct] System prompt: {len(system_prompt_text):,} characters")
+                if screenshot_data:
+                    print(f"[ReAct] User message includes screenshot: {len(screenshot_data):,} bytes")
+            
+            output = _call_unified_ai_api(
+                messages=conversation,
+                system_prompt=system_prompt_text,
+                temperature=0
             )
+            if not output:
+                print(f"⚠️ ReAct AI error: No response")
+                return None
+            
+            if CONTEXT_DEBUG:
+                print(f"[ReAct] Iteration {iteration+1}: Received response ({len(output):,} characters)")
         except Exception as e:
-            print(f"⚠️ ReAct GPT error: {e}")
+            print(f"⚠️ ReAct AI error: {e}")
             return None
         
-        output = (resp.choices[0].message.content or "").strip()
         conversation.append({"role": "assistant", "content": output})
         
         thought_match = re.search(r"Thought:\s*(.+?)(?=Action:|$)", output, re.DOTALL)
@@ -801,15 +1394,204 @@ def gpt_to_json_react(transcript: str, modeling_context=None, mesh_analysis=None
             print(f"[ReAct] Iteration {iteration+1} - Thought: {thought[:200]}{'...' if len(thought) > 200 else ''}")
         print(f"[ReAct] Iteration {iteration+1} - Action: {action.upper()}"); sys.stdout.flush()
         
-        if action == "execute":
+        if action == "plan":
+            # Store plan in conversation and continue
+            print(f"[ReAct] 📋 Plan: {action_input[:200]}...")
+            conversation.append({"role": "user", "content": f"Plan received: {action_input}. Now execute the steps sequentially."})
+            continue
+        elif action == "execute":
             observation = _react_execute(action_input, executed_commands)
             if "✅" in observation:  # Success
                 last_execute_iteration = iteration
+                
+                # After successful execution, capture updated context (screenshot + mesh analysis)
+                print("[ReAct] 📸 Capturing updated context after execution...")
+                post_execute_screenshot = None
+                post_execute_mesh = None
+                post_execute_scene = None
+                post_execute_context = None
+                
+                try:
+                    # Get fresh modeling context
+                    if rpc:
+                        try:
+                            post_execute_context = rpc.get_modeling_context()
+                        except Exception as e:
+                            if CONTEXT_DEBUG:
+                                print(f"[ReAct] ⚠️ Context fetch error: {e}")
+                    
+                    # Capture fresh screenshot
+                    post_execute_screenshot = _capture_screen_local()
+                    if post_execute_screenshot:
+                        print(f"[ReAct] ✅ Captured screenshot: {len(post_execute_screenshot):,} bytes")
+                    
+                    # Get fresh mesh analysis
+                    if rpc:
+                        try:
+                            post_execute_mesh = rpc.analyze_current_mesh()
+                            if post_execute_mesh and not post_execute_mesh.get("error"):
+                                print(f"[ReAct] ✅ Analyzed mesh: {post_execute_mesh.get('vertex_count', 0)} vertices, {post_execute_mesh.get('face_count', 0)} faces")
+                        except Exception as e:
+                            if CONTEXT_DEBUG:
+                                print(f"[ReAct] ⚠️ Mesh analysis error: {e}")
+                        
+                        # Get fresh scene analysis
+                        try:
+                            post_execute_scene = rpc.analyze_scene()
+                        except Exception as e:
+                            if CONTEXT_DEBUG:
+                                print(f"[ReAct] ⚠️ Scene analysis error: {e}")
+                    
+                    # Log the updated context
+                    if CONTEXT_DEBUG:
+                        _log_context_data(post_execute_context, post_execute_mesh, post_execute_scene, post_execute_screenshot, "Post-Execute Context")
+                except Exception as e:
+                    print(f"[ReAct] ⚠️ Error capturing post-execute context: {e}")
+                
+                # Build enhanced observation with visual and mesh context
+                enhanced_observation = observation
+                
+                # Add detailed mesh analysis to observation (including vertex data)
+                if post_execute_mesh and not post_execute_mesh.get("error"):
+                    mesh_summary = f"\n\n📊 Current Mesh State:\n"
+                    mesh_summary += f"- Vertices: {post_execute_mesh.get('vertex_count', 0)}\n"
+                    mesh_summary += f"- Edges: {post_execute_mesh.get('edge_count', 0)}\n"
+                    mesh_summary += f"- Faces: {post_execute_mesh.get('face_count', 0)}\n"
+                    
+                    if post_execute_mesh.get("bounds"):
+                        bounds = post_execute_mesh["bounds"]
+                        size = bounds.get("size", (0, 0, 0))
+                        mesh_summary += f"- Size: {size[0]:.2f} x {size[1]:.2f} x {size[2]:.2f}\n"
+                        if bounds.get("shape_class"):
+                            mesh_summary += f"- Shape: {bounds['shape_class']}\n"
+                    
+                    if post_execute_mesh.get("selection"):
+                        sel = post_execute_mesh["selection"]
+                        sel_counts = []
+                        if sel.get("vertices"):
+                            sel_counts.append(f"{len(sel['vertices'])} vertices")
+                        if sel.get("edges"):
+                            sel_counts.append(f"{len(sel['edges'])} edges")
+                        if sel.get("faces"):
+                            sel_counts.append(f"{len(sel['faces'])} faces")
+                        if sel_counts:
+                            mesh_summary += f"- Selected: {', '.join(sel_counts)}\n"
+                    
+                    # Include full mesh data (vertices, edges, faces) for detailed analysis
+                    # Limit vertex/edge/face data to avoid token limits, but include key details
+                    if post_execute_mesh.get("all_vertices"):
+                        vertices = post_execute_mesh["all_vertices"]
+                        # Include first 20 vertices as sample, plus summary
+                        vertex_sample = vertices[:20]
+                        mesh_summary += f"\n📐 Vertex Data (showing {len(vertex_sample)} of {len(vertices)} vertices):\n"
+                        for v in vertex_sample:
+                            co = v.get("co", (0, 0, 0))
+                            mesh_summary += f"  Vertex {v.get('index', '?')}: ({co[0]:.3f}, {co[1]:.3f}, {co[2]:.3f})"
+                            if v.get("select"):
+                                mesh_summary += " [SELECTED]"
+                            mesh_summary += "\n"
+                        if len(vertices) > 20:
+                            mesh_summary += f"  ... and {len(vertices) - 20} more vertices\n"
+                    
+                    if post_execute_mesh.get("all_faces"):
+                        faces = post_execute_mesh["all_faces"]
+                        # Include first 10 faces as sample
+                        face_sample = faces[:10]
+                        mesh_summary += f"\n🔷 Face Data (showing {len(face_sample)} of {len(faces)} faces):\n"
+                        for f in face_sample:
+                            verts = f.get("vertices", [])
+                            mesh_summary += f"  Face {f.get('index', '?')}: {len(verts)} vertices {list(verts)}"
+                            if f.get("select"):
+                                mesh_summary += " [SELECTED]"
+                            mesh_summary += "\n"
+                        if len(faces) > 10:
+                            mesh_summary += f"  ... and {len(faces) - 10} more faces\n"
+                    
+                    enhanced_observation += mesh_summary
+                
+                # Add scene analysis summary
+                if post_execute_scene:
+                    scene_summary = f"\n\n🌐 Current Scene State:\n"
+                    scene_summary += f"- Total Objects: {post_execute_scene.get('total_objects', 0)}\n"
+                    scene_summary += f"- Mesh Objects: {post_execute_scene.get('mesh_objects', 0)}\n"
+                    if post_execute_scene.get("selected_objects"):
+                        sel_objs = post_execute_scene["selected_objects"]
+                        scene_summary += f"- Selected Objects: {len(sel_objs)} ({', '.join([o.get('name', '?') for o in sel_objs[:3]])}{'...' if len(sel_objs) > 3 else ''})\n"
+                    enhanced_observation = enhanced_observation + scene_summary
+                
+                # Create observation message with screenshot if available
+                if post_execute_screenshot:
+                    # Include screenshot in the observation
+                    observation_content = [
+                        {"type": "text", "text": enhanced_observation},
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:image/png;base64,{post_execute_screenshot}"
+                            }
+                        }
+                    ]
+                    conversation.append({
+                        "role": "user",
+                        "content": observation_content
+                    })
+                    print(f"[ReAct] 📸 Added screenshot to next iteration context")
+                else:
+                    # No screenshot, just text observation
+                    conversation.append({
+                        "role": "user",
+                        "content": f"Observation: {enhanced_observation}"
+                    })
+                
+                # Continue to next iteration (skip the default observation append at end)
+                continue
         elif action == "observe":
             observation = _react_observe(action_input)
+            
+            # Capture screenshot and mesh data for observe actions
+            observe_screenshot = None
+            observe_mesh = None
+            try:
+                observe_screenshot = _capture_screen_local()
+                if rpc:
+                    try:
+                        observe_mesh = rpc.analyze_current_mesh()
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+            
+            # Build enhanced observation with visual context
+            enhanced_observation = observation
+            if observe_mesh and not observe_mesh.get("error"):
+                enhanced_observation += f"\n\n📐 Current Mesh: {observe_mesh.get('vertex_count', 0)} vertices, {observe_mesh.get('face_count', 0)} faces"
+            
             # If we've been observing for 5+ iterations without executing, warn
             if iteration - last_execute_iteration >= 5 and last_execute_iteration >= 0:
-                observation += " ⚠️ You've been observing for 5+ iterations. You must EXECUTE an action soon or FINISH."
+                enhanced_observation += " ⚠️ You've been observing for 5+ iterations. You must EXECUTE an action soon or FINISH."
+            
+            # Add observation to conversation with screenshot if available
+            if observe_screenshot:
+                observation_content = [
+                    {"type": "text", "text": enhanced_observation},
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": f"data:image/png;base64,{observe_screenshot}"
+                        }
+                    }
+                ]
+                conversation.append({
+                    "role": "user",
+                    "content": observation_content
+                })
+                print(f"[ReAct] 📸 Added screenshot to observation context")
+            else:
+                conversation.append({
+                    "role": "user",
+                    "content": f"Observation: {enhanced_observation}"
+                })
+            continue
         elif action == "finish":
             summary = action_input
             
@@ -868,6 +1650,7 @@ def record_until_silence():
     consecutive_silence_blocks = 0
     max_silence_blocks = int(SILENCE_HOLD / BLOCK_SEC)
     detected_speech = False
+    context_prepared = False  # Track if we've started preparing context
     
     # Get the current default input device (respects system settings when headphones are plugged in)
     # Query each time to pick up device changes
@@ -897,6 +1680,30 @@ def record_until_silence():
                 spoken_sec += BLOCK_SEC
                 silence_sec = 0.0
                 consecutive_silence_blocks = 0
+                
+                # 🔥 NEW: Start preparing context as soon as speech is detected
+                if not context_prepared and spoken_sec >= 0.3:  # After 0.3s of speech
+                    context_prepared = True
+                    # Start context gathering in background thread
+                    import threading
+                    def prepare_context():
+                        try:
+                            print("[Warmup] 🔥 Starting context preparation...")
+                            modeling_context_cache, mesh_analysis_cache, scene_analysis_cache, screenshot_cache = _fetch_context_for_gpt(include_screenshot=True)
+                            # Store in global cache for later use
+                            global _WARMUP_CONTEXT_CACHE
+                            _WARMUP_CONTEXT_CACHE = {
+                                "modeling": modeling_context_cache,
+                                "mesh": mesh_analysis_cache,
+                                "scene": scene_analysis_cache,
+                                "screenshot": screenshot_cache,
+                                "ready": True
+                            }
+                            print("[Warmup] ✅ Context prepared and cached")
+                        except Exception as e:
+                            print(f"[Warmup] ⚠️ Context preparation error: {e}")
+                    
+                    threading.Thread(target=prepare_context, daemon=True).start()
             else:
                 silence_sec += BLOCK_SEC
                 consecutive_silence_blocks += 1
@@ -1859,11 +2666,15 @@ def _get_best_practices_guidance(modeling_context, mesh_analysis, target_object)
         ma = mesh_analysis
         face_types = ma.get("face_topology", {}).get("face_types", {})
         
-        n_gon_count = sum(count for v, count in face_types.items() if v > 4)
+        # Keys are strings from XML-RPC, convert to int for comparison
+        n_gon_count = sum(count for v, count in face_types.items() if int(v) > 4)
         if n_gon_count > 0:
             practices.append(f"Warning: {n_gon_count} n-gon(s) detected - consider converting to quads/triangles")
         
-        if face_types.get(3, 0) > face_types.get(4, 0) * 2:
+        # Convert string keys to int for comparison
+        tri_count = face_types.get("3", 0) or face_types.get(3, 0)
+        quad_count = face_types.get("4", 0) or face_types.get(4, 0)
+        if tri_count > quad_count * 2:
             practices.append("Many triangles detected - consider retopology for better subdivision")
     
     if target_object:
@@ -1929,6 +2740,10 @@ def gpt_to_json(transcript: str, modeling_context=None, mesh_analysis=None, targ
     mode_ops = _get_mode_aware_operations(current_mode, has_mesh)
     best_practices = _get_best_practices_guidance(modeling_context, mesh_analysis, target_object)
     
+    # Log context data before formatting
+    if CONTEXT_DEBUG:
+        _log_context_data(modeling_context, mesh_analysis, None, screenshot_data, "GPT Context")
+    
     # Add context information if available
     if modeling_context or mesh_analysis or target_object:
         system_parts.append("\n--- Current Scene Context ---")
@@ -1937,6 +2752,8 @@ def gpt_to_json(transcript: str, modeling_context=None, mesh_analysis=None, targ
             system_parts.append(f"Target Object: {target_object} (this is what we're building/modifying)")
             if ref_knowledge:
                 system_parts.append(f"Reference Knowledge: {ref_knowledge.get('description', '')}")
+            if CONTEXT_DEBUG:
+                print(f"[GPT] ✅ Added target object '{target_object}' to system prompt")
         
         if modeling_context and not modeling_context.get("error"):
             ctx = modeling_context
@@ -1957,6 +2774,9 @@ def gpt_to_json(transcript: str, modeling_context=None, mesh_analysis=None, targ
                 system_parts.append(f"Modifiers on active object: {len(mods)}")
                 for mod in mods[:5]:  # Show first 5
                     system_parts.append(f"  - {mod.get('name')} ({mod.get('type')})")
+            
+            if CONTEXT_DEBUG:
+                print(f"[GPT] ✅ Added modeling context to system prompt")
         
         if mesh_analysis and not mesh_analysis.get("error"):
             ma = mesh_analysis
@@ -1971,8 +2791,9 @@ def gpt_to_json(transcript: str, modeling_context=None, mesh_analysis=None, targ
             
             if ma.get("face_topology", {}).get("face_types"):
                 face_types = ma["face_topology"]["face_types"]
-                face_desc = ", ".join([f"{count} {v}-gons" if v > 4 else f"{count} {'triangles' if v == 3 else 'quads'}" 
-                                      for v, count in sorted(face_types.items())])
+                # Keys are strings from XML-RPC, convert to int for comparison
+                face_desc = ", ".join([f"{count} {int(v)}-gons" if int(v) > 4 else f"{count} {'triangles' if int(v) == 3 else 'quads'}" 
+                                      for v, count in sorted(face_types.items(), key=lambda x: int(x[0]))])
                 system_parts.append(f"Face Types: {face_desc}")
             
             if ma.get("selection"):
@@ -1991,6 +2812,9 @@ def gpt_to_json(transcript: str, modeling_context=None, mesh_analysis=None, targ
             if ma.get("edge_loops"):
                 loops = ma["edge_loops"]
                 system_parts.append(f"Edge Loops: {len(loops)} potential loop(s) detected")
+            
+            if CONTEXT_DEBUG:
+                print(f"[GPT] ✅ Added mesh analysis to system prompt ({ma.get('vertex_count', 0)} vertices, {ma.get('face_count', 0)} faces)")
         
         # Phase 3: Add mode-aware operation suggestions
         system_parts.append(f"\n--- Recommended Operations (Mode: {current_mode}) ---")
@@ -2098,6 +2922,11 @@ def gpt_to_json(transcript: str, modeling_context=None, mesh_analysis=None, targ
     
     system = "\n".join(system_parts)
     user = f"Instruction: {transcript}\nReturn JSON only."
+    
+    if CONTEXT_DEBUG:
+        print(f"[GPT] System prompt length: {len(system):,} characters")
+        print(f"[GPT] System prompt preview (first 500 chars):")
+        print("  " + system[:500].replace("\n", "\n  ") + "...")
 
     print("🧠 GPT mapping…")
     try:
@@ -2176,6 +3005,9 @@ def gpt_to_json(transcript: str, modeling_context=None, mesh_analysis=None, targ
                 })
         
         # Add current user message with optional screenshot
+        if CONTEXT_DEBUG:
+            print(f"[GPT] Building user message with screenshot: {screenshot_data is not None}")
+        
         if screenshot_data:
             user_content = [
                 {"type": "text", "text": user},
@@ -2186,12 +3018,22 @@ def gpt_to_json(transcript: str, modeling_context=None, mesh_analysis=None, targ
                     }
                 }
             ]
-            print(f"📸 Including viewport screenshot in GPT call ({len(screenshot_data)} bytes)")
+            print(f"📸 Including viewport screenshot in GPT call ({len(screenshot_data):,} bytes)")
+            if CONTEXT_DEBUG:
+                print(f"[GPT] User message includes: text + screenshot image")
         else:
             user_content = user
             print("⚠️ No screenshot available for this GPT call")
+            if CONTEXT_DEBUG:
+                print(f"[GPT] User message includes: text only")
         
         messages.append({"role": "user", "content": user_content})
+        
+        if CONTEXT_DEBUG:
+            print(f"[GPT] Sending to AI model with {len(messages)} messages")
+            print(f"[GPT] System prompt: {len(system):,} characters")
+            if screenshot_data:
+                print(f"[GPT] User message includes screenshot: {len(screenshot_data):,} bytes")
         
         resp = client.chat.completions.create(
             model="gpt-4o",
@@ -2393,6 +3235,7 @@ if __name__ == "__main__":
 
                 all_commands = []
 
+                # Step 1: Try local sequence first (fast, offline)
                 local_sequence = None
                 if not has_references:
                     local_sequence = _resolve_local_sequence(command_parts)
@@ -2400,73 +3243,82 @@ if __name__ == "__main__":
                 if local_sequence:
                     all_commands = local_sequence
                 else:
-                    react_attempted = False
-                    if USE_REACT_REASONING and ENABLE_GPT_FALLBACK:
-                        ensure_context()
-                        react_result = gpt_to_json_react(
-                            text,
-                            modeling_context=context_cache["modeling"],
-                            mesh_analysis=context_cache["mesh"],
-                            scene_analysis=context_cache.get("scene"),
-                            target_object=SUPER_MODE_TARGET,
-                            screenshot_data=context_cache.get("screenshot"),
-                        )
-                        react_attempted = True
-                        if react_result:
-                            executed = len(react_result.get("commands", []))
-                            iterations = react_result.get("iterations", "?")
-                            print(f"[ReAct] Executed {executed} commands in {iterations} iterations")
-                            continue
-                        else:
-                            print("[ReAct] No plan returned, falling back to standard GPT")
-
-                    if has_references and ENABLE_GPT_FALLBACK:
-                        local_cmds = []
-                        for part in command_parts:
-                            cmd = try_io_rules(part)
-                            cmd = cmd or try_local_rules(part)
-                            if cmd:
-                                if isinstance(cmd, list):
-                                    local_cmds.extend(cmd)
-                                else:
-                                    local_cmds.append(cmd)
-                        
-                        ensure_context()
-                        gpt_cmd = gpt_to_json(
-                            text,
-                            modeling_context=context_cache["modeling"],
-                            mesh_analysis=context_cache["mesh"],
-                            target_object=SUPER_MODE_TARGET,
-                            screenshot_data=context_cache.get("screenshot"),
-                        )
-                        
-                        if gpt_cmd:
-                            if isinstance(gpt_cmd, list):
-                                all_commands.extend(gpt_cmd)
+                    # Step 2: Try local I/O rules
+                    local_cmds = []
+                    for part in command_parts:
+                        cmd = try_io_rules(part)
+                        cmd = cmd or try_local_rules(part)
+                        if cmd:
+                            if isinstance(cmd, list):
+                                local_cmds.extend(cmd)
                             else:
-                                all_commands.append(gpt_cmd)
-                        else:
-                            all_commands.extend(local_cmds)
+                                local_cmds.append(cmd)
+                    
+                    if local_cmds:
+                        all_commands = local_cmds
                     else:
-                        for part in command_parts:
-                            cmd = try_io_rules(part)
-                            cmd = cmd or try_local_rules(part)
-                            
-                            if not cmd and ENABLE_GPT_FALLBACK:
+                        # Step 3: Only use API (ReAct or GPT) if local rules failed
+                        react_attempted = False
+                        
+                        # Check if ReAct is enabled (only for API calls)
+                        if USE_REACT_REASONING and ENABLE_GPT_FALLBACK:
+                            # Use warmup context if available, otherwise fetch fresh
+                            if _WARMUP_CONTEXT_CACHE.get("ready"):
+                                print("[Context] Using pre-warmed context")
+                                modeling_context = _WARMUP_CONTEXT_CACHE.get("modeling")
+                                mesh_analysis = _WARMUP_CONTEXT_CACHE.get("mesh")
+                                scene_analysis = _WARMUP_CONTEXT_CACHE.get("scene")
+                                screenshot_data = _WARMUP_CONTEXT_CACHE.get("screenshot")
+                                # Clear warmup cache after use
+                                _WARMUP_CONTEXT_CACHE = {"ready": False}
+                            else:
                                 ensure_context()
-                                cmd = gpt_to_json(
-                                    part,
-                                    modeling_context=context_cache["modeling"],
-                                    mesh_analysis=context_cache["mesh"],
-                                    target_object=SUPER_MODE_TARGET,
-                                    screenshot_data=context_cache.get("screenshot"),
-                                )
+                                modeling_context, mesh_analysis, scene_analysis, screenshot_data = ensure_context()
                             
-                            if cmd:
-                                if isinstance(cmd, list):
-                                    all_commands.extend(cmd)
+                            react_result = gpt_to_json_react(
+                                text,
+                                modeling_context=modeling_context,
+                                mesh_analysis=mesh_analysis,
+                                scene_analysis=scene_analysis,
+                                target_object=SUPER_MODE_TARGET,
+                                screenshot_data=screenshot_data,
+                            )
+                            react_attempted = True
+                            if react_result:
+                                executed = len(react_result.get("commands", []))
+                                iterations = react_result.get("iterations", "?")
+                                print(f"[ReAct] Executed {executed} commands in {iterations} iterations")
+                                continue
+                            else:
+                                print("[ReAct] No plan returned, falling back to standard GPT")
+                        
+                        # Step 4: Fallback to standard GPT
+                        if ENABLE_GPT_FALLBACK:
+                            if _WARMUP_CONTEXT_CACHE.get("ready"):
+                                print("[Context] Using pre-warmed context")
+                                modeling_context = _WARMUP_CONTEXT_CACHE.get("modeling")
+                                mesh_analysis = _WARMUP_CONTEXT_CACHE.get("mesh")
+                                screenshot_data = _WARMUP_CONTEXT_CACHE.get("screenshot")
+                                _WARMUP_CONTEXT_CACHE = {"ready": False}
+                            else:
+                                ensure_context()
+                                modeling_context, mesh_analysis, scene_analysis, screenshot_data = ensure_context()
+                            
+                            gpt_cmd = gpt_to_json(
+                                text,
+                                modeling_context=modeling_context,
+                                mesh_analysis=mesh_analysis,
+                                target_object=SUPER_MODE_TARGET,
+                                screenshot_data=screenshot_data,
+                            )
+                            
+                            if gpt_cmd:
+                                if isinstance(gpt_cmd, list):
+                                    all_commands.extend(gpt_cmd)
                                 else:
-                                    all_commands.append(cmd)
+                                    all_commands.append(gpt_cmd)
+                            elif local_cmds:
+                                all_commands.extend(local_cmds)
                 
                 if all_commands:
                     listening_enabled = True
