@@ -1,0 +1,42 @@
+feat: Add target-aware quality assessment and mandatory quality checks
+
+Enhances object creation workflow with comprehensive quality assessment
+that checks if objects actually match the target (iPhone, car, cup, etc.)
+and prevents finishing until quality thresholds are met.
+
+Changes:
+- Enhanced assess_object_quality() RPC method with target-specific checks
+  - iPhone: requires body, screen, camera; checks for buttons, speaker, port
+  - Car: requires body, 4 wheels; checks for windows, lights, spoiler
+  - Cup/Mug: requires body, handle
+  - Calculates target_match_score (0.0-1.0) based on required parts found
+  - Combines technical quality (40%) + target match (60%) for overall score
+- Added mandatory quality check before finishing
+  - Automatically runs assessment when AI tries to finish
+  - Requires quality_score >= 0.5 AND target_match_score >= 0.5
+  - Forces AI to continue refining if quality is too low
+  - Shows missing features and actionable guidance
+- Enhanced system prompt with quality check requirements
+  - Added "MANDATORY QUALITY CHECK BEFORE FINISHING" section
+  - Instructs AI to check quality before finishing
+  - Emphasizes object must match target before completion
+- Improved assessment display
+  - Shows both overall quality and target match scores
+  - Lists found features and missing features separately
+  - Provides actionable guidance based on scores
+
+Why:
+- User reported AI was creating basic primitives without checking if they
+  looked like the target object (e.g., iPhone)
+- Previous assessment only checked technical metrics (vertex count, modifiers)
+- No validation that object actually matched the requested target
+- AI could finish with incomplete objects that didn't resemble target
+
+Safety:
+- Backward compatible (assessment optional, only blocks finish if target provided)
+- No network at import
+- Lazy imports preserved
+- Quality checks only run when target_object is provided
+
+Testing:
+- ⚠️ NOT YET TESTED - User reminder: Test quality checks with iPhone 16 creation

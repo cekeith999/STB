@@ -1162,12 +1162,15 @@ def _server_loop():
                             assessment["issues"].append("Object appears to be a basic primitive - needs refinement")
                             assessment["suggestions"].append("Use edit mode operations (extrude, inset, loop cut) or modifiers (subdivision surface, bevel) to add detail")
                         
-                        # Check for modifiers
-                        if len(active_obj.modifiers) == 0:
-                            assessment["issues"].append("No modifiers applied - object may lack detail")
-                            assessment["suggestions"].append("Consider adding modifiers like Subdivision Surface, Bevel, or Array for more detail")
+                        # Check for detail (workflow-agnostic - modifiers OR high vertex count)
+                        has_active_modifiers = len(active_obj.modifiers) > 0
+                        has_high_detail = len(mesh.vertices) > 100 or len(mesh.polygons) > 200
                         
-                        # Check complexity
+                        if not has_active_modifiers and not has_high_detail:
+                            assessment["issues"].append("Object may lack detail - consider adding geometry or modifiers")
+                            assessment["suggestions"].append("Add detail via edit mode operations, modifiers, or subdivision")
+                        
+                        # Check complexity (workflow-agnostic)
                         if len(mesh.vertices) < 100:
                             assessment["issues"].append("Low vertex count - may need more geometry for detailed objects")
                             assessment["suggestions"].append("Use Subdivision Surface modifier or edit mode operations to increase detail")
@@ -1176,18 +1179,22 @@ def _server_loop():
                     if len(mesh_objects) == 0:
                         assessment["issues"].append("No mesh objects in scene")
                     
-                    # Calculate overall quality score (combines technical + target match)
+                    # Calculate overall quality score (workflow-agnostic - focuses on actual detail, not workflow)
                     technical_score = 0.0
                     if assessment["active_object"]:
                         obj_info = assessment["active_object"]
-                        # Points for complexity
-                        if obj_info["vertex_count"] > 100:
+                        # Points for actual geometry detail (not workflow-specific)
+                        if obj_info["vertex_count"] > 500:
+                            technical_score += 0.3
+                        elif obj_info["vertex_count"] > 100:
                             technical_score += 0.2
                         elif obj_info["vertex_count"] > 20:
                             technical_score += 0.1
-                        # Points for modifiers
-                        if obj_info["has_modifiers"]:
+                        
+                        # Points for detail (modifiers OR high vertex count - both are valid)
+                        if obj_info["has_modifiers"] or obj_info["vertex_count"] > 100:
                             technical_score += 0.2
+                        
                         # Points for naming
                         if obj_info["name"] and not obj_info["name"].startswith(("Cube", "Cylinder", "Sphere", "Plane")):
                             technical_score += 0.1
@@ -1917,6 +1924,209 @@ class STB_PT_RPCBridge(Panel):
             layout.operator("stb.rpc_start", icon="PLAY", text="Start RPC")
 
 
+class STB_OT_MarkLastRunSuccess(bpy.types.Operator):
+    """Mark the last run as a confirmed success"""
+    bl_idname = "stb.mark_last_run_success"
+    bl_label = "Mark Last Run as Success"
+    bl_description = "Manually mark the most recent run as a confirmed success"
+    
+    def execute(self, context):
+        try:
+            import sys
+            import os
+            addon_path = os.path.dirname(os.path.abspath(__file__))
+            if addon_path not in sys.path:
+                sys.path.insert(0, addon_path)
+            
+            from success_library import BlenderSuccessLibrary
+            
+            library = BlenderSuccessLibrary()
+            last_run = library.get_last_run_info()
+            
+            if not last_run:
+                self.report({'WARNING'}, "No recent runs found to mark as success")
+                return {'CANCELLED'}
+            
+            # Promote to confirmed
+            run_id = last_run.get("run_id")
+            if library.promote_candidate_to_confirmed(run_id):
+                self.report({'INFO'}, f"Marked run '{run_id}' as confirmed success")
+            else:
+                # If not a candidate, store as new confirmed
+                screenshot_path = library.storage_path / last_run.get("screenshot_path", "")
+                if screenshot_path.exists():
+                    with open(screenshot_path, "rb") as f:
+                        screenshot = f.read()
+                    
+                    library.store_run(
+                        target_object=last_run.get("target_object", ""),
+                        screenshot=screenshot,
+                        commands=last_run.get("commands", []),
+                        quality_score=last_run.get("quality_score", 0.0),
+                        target_match_score=last_run.get("target_match_score", 0.0),
+                        scene_analysis=last_run.get("scene_analysis", {}),
+                        mesh_analysis=last_run.get("mesh_analysis", {}),
+                        transcript=last_run.get("transcript", ""),
+                        summary=last_run.get("summary", ""),
+                        iterations=last_run.get("iterations", 0),
+                        status="confirmed"
+                    )
+                    self.report({'INFO'}, f"Stored run as confirmed success")
+                else:
+                    self.report({'WARNING'}, "Could not find screenshot for last run")
+                    return {'CANCELLED'}
+            
+            return {'FINISHED'}
+        except Exception as e:
+            self.report({'ERROR'}, f"Error marking success: {e}")
+            import traceback
+            traceback.print_exc()
+            return {'CANCELLED'}
+
+
+class STB_OT_DeleteRun(bpy.types.Operator):
+    """Delete a run from the success library"""
+    bl_idname = "stb.delete_run"
+    bl_label = "Delete Run"
+    bl_description = "Delete a run from the success library (for removing falsely marked successes)"
+    bl_options = {'REGISTER', 'UNDO'}
+    
+    run_id: bpy.props.StringProperty(name="Run ID", description="ID of the run to delete")
+    
+    def execute(self, context):
+        try:
+            import sys
+            import os
+            addon_path = os.path.dirname(os.path.abspath(__file__))
+            if addon_path not in sys.path:
+                sys.path.insert(0, addon_path)
+            
+            from success_library import BlenderSuccessLibrary
+            
+            library = BlenderSuccessLibrary()
+            
+            if library.delete_run(self.run_id):
+                self.report({'INFO'}, f"Deleted run '{self.run_id}'")
+            else:
+                self.report({'WARNING'}, f"Run '{self.run_id}' not found")
+            
+            return {'FINISHED'}
+        except Exception as e:
+            self.report({'ERROR'}, f"Error deleting run: {e}")
+            return {'CANCELLED'}
+
+
+class STB_OT_DeleteLastRun(bpy.types.Operator):
+    """Delete the last run from the success library"""
+    bl_idname = "stb.delete_last_run"
+    bl_label = "Delete Last Run"
+    bl_description = "Delete the most recent run (for removing falsely marked successes)"
+    bl_options = {'REGISTER', 'UNDO'}
+    
+    def execute(self, context):
+        try:
+            import sys
+            import os
+            addon_path = os.path.dirname(os.path.abspath(__file__))
+            if addon_path not in sys.path:
+                sys.path.insert(0, addon_path)
+            
+            from success_library import BlenderSuccessLibrary
+            
+            library = BlenderSuccessLibrary()
+            last_run = library.get_last_run_info()
+            
+            if not last_run:
+                self.report({'WARNING'}, "No recent runs found to delete")
+                return {'CANCELLED'}
+            
+            run_id = last_run.get("run_id")
+            if library.delete_run(run_id):
+                self.report({'INFO'}, f"Deleted run '{run_id}'")
+            else:
+                self.report({'WARNING'}, f"Could not delete run '{run_id}'")
+            
+            return {'FINISHED'}
+        except Exception as e:
+            self.report({'ERROR'}, f"Error deleting run: {e}")
+            return {'CANCELLED'}
+
+
+class STB_PT_SuccessLibrary(Panel):
+    """Success Library Panel"""
+    bl_space_type = "VIEW_3D"
+    bl_region_type = "UI"
+    bl_category = "STB"
+    bl_label = "Success Library"
+    bl_options = {'DEFAULT_CLOSED'}
+    
+    def draw(self, context):
+        layout = self.layout
+        
+        try:
+            import sys
+            import os
+            addon_path = os.path.dirname(os.path.abspath(__file__))
+            if addon_path not in sys.path:
+                sys.path.insert(0, addon_path)
+            
+            from success_library import BlenderSuccessLibrary
+            library = BlenderSuccessLibrary()
+            
+            # Show last run info
+            last_run = library.get_last_run_info()
+            if last_run:
+                box = layout.box()
+                box.label(text=f"Last Run: {last_run.get('target_object', 'Unknown')}", icon="MESH_DATA")
+                box.label(text=f"Quality: {last_run.get('quality_score', 0):.2f}")
+                box.label(text=f"Target Match: {last_run.get('target_match_score', 0):.2f}")
+                box.label(text=f"Status: {last_run.get('status', 'unknown')}")
+                box.label(text=f"Run ID: {last_run.get('run_id', 'unknown')[:20]}...")
+                
+                layout.separator()
+                
+                if last_run.get('status') != 'confirmed':
+                    layout.operator("stb.mark_last_run_success", icon="CHECKMARK", text="Mark as Success")
+                else:
+                    layout.label(text="✓ Already confirmed", icon="CHECKMARK")
+                
+                layout.operator("stb.delete_last_run", icon="TRASH", text="Delete Last Run")
+            else:
+                layout.label(text="No recent runs", icon="INFO")
+            
+            # Show stats
+            layout.separator()
+            confirmed_count = len(list(library.confirmed_path.glob("*_metadata.json")))
+            candidate_count = len(list(library.candidates_path.glob("*_metadata.json")))
+            
+            stats_box = layout.box()
+            stats_box.label(text="Library Stats", icon="BOOKMARKS")
+            stats_box.label(text=f"Confirmed: {confirmed_count}", icon="CHECKMARK")
+            stats_box.label(text=f"Candidates: {candidate_count}", icon="OUTLINER_OB_MESH")
+            
+            # Show recent runs list
+            if confirmed_count > 0 or candidate_count > 0:
+                layout.separator()
+                recent_box = layout.box()
+                recent_box.label(text="Recent Runs:", icon="TIME")
+                
+                all_runs = library.get_all_runs()[:5]  # Show last 5
+                for run in all_runs:
+                    row = recent_box.row()
+                    status_icon = "CHECKMARK" if run.get("status") == "confirmed" else "QUESTION"
+                    row.label(text=f"{run.get('target_object', 'Unknown')[:20]}", icon=status_icon)
+                    row.label(text=f"Q:{run.get('quality_score', 0):.2f}")
+                    
+                    # Delete button for each run
+                    op = row.operator("stb.delete_run", text="", icon="TRASH")
+                    op.run_id = run.get("run_id", "")
+            
+        except Exception as e:
+            layout.label(text=f"Error: {e}", icon="ERROR")
+            import traceback
+            traceback.print_exc()
+
+
 class STB_PT_VoiceMode(Panel):
     bl_space_type = "VIEW_3D"
     bl_region_type = "UI"
@@ -1975,11 +2185,19 @@ _CLASSES = (
     STB_OT_ToggleVoiceListening,
     STB_PT_RPCBridge,
     STB_PT_VoiceMode,
+    STB_OT_MarkLastRunSuccess,
+    STB_OT_DeleteRun,
+    STB_OT_DeleteLastRun,
+    STB_PT_SuccessLibrary,
 )
 
 def register():
     # 1) prefs first
     bpy.utils.register_class(STB_AddonPreferences)
+    bpy.utils.register_class(STB_OT_MarkLastRunSuccess)
+    bpy.utils.register_class(STB_OT_DeleteRun)
+    bpy.utils.register_class(STB_OT_DeleteLastRun)
+    bpy.utils.register_class(STB_PT_SuccessLibrary)
 
     # 2) ensure WM props before any panel draw
     if not hasattr(bpy.types.WindowManager, "stb_meshy_prompt"):

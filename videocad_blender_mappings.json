@@ -1,0 +1,116 @@
+{
+  "high_level_operations": {
+    "extrude": {
+      "blender_op": "mesh.extrude_region",
+      "description": "Extrude selected faces/edges",
+      "parameters": {
+        "distance": {
+          "type": "float",
+          "default": 1.0,
+          "blender_code": "bpy.ops.transform.translate(value=(0, 0, {distance}))"
+        },
+        "direction": {
+          "type": "enum",
+          "options": ["X", "Y", "Z"],
+          "default": "Z"
+        }
+      }
+    },
+    "sketch": {
+      "blender_op": "mesh.primitive_cube_add",
+      "description": "Create a sketch plane (approximated as primitive)",
+      "note": "Blender doesn't have direct sketch equivalent - use primitives or manual mesh"
+    },
+    "revolve": {
+      "blender_op": "mesh.spin",
+      "description": "Revolve around an axis",
+      "parameters": {
+        "angle": {
+          "type": "float",
+          "default": 360.0
+        },
+        "axis": {
+          "type": "enum",
+          "options": ["X", "Y", "Z"],
+          "default": "Z"
+        }
+      }
+    },
+    "fillet": {
+      "blender_op": "mesh.bevel",
+      "description": "Round edges",
+      "parameters": {
+        "radius": {
+          "type": "float",
+          "default": 0.1
+        }
+      }
+    },
+    "chamfer": {
+      "blender_op": "mesh.bevel",
+      "description": "Bevel edges (chamfer equivalent)",
+      "parameters": {
+        "distance": {
+          "type": "float",
+          "default": 0.1
+        }
+      }
+    },
+    "loft": {
+      "blender_op": "mesh.bridge_edge_loops",
+      "description": "Connect two edge loops",
+      "note": "Requires two selected edge loops"
+    },
+    "sweep": {
+      "blender_op": "custom",
+      "description": "Sweep along path (manual implementation needed)",
+      "note": "Blender doesn't have direct sweep - use array modifier or manual mesh"
+    }
+  },
+  "action_class_mappings": {
+    "0": {
+      "name": "mouse_click",
+      "description": "Mouse click - context dependent",
+      "possible_operations": [
+        "selection",
+        "tool_activation",
+        "parameter_setting"
+      ]
+    },
+    "1": {
+      "name": "mouse_drag",
+      "description": "Mouse drag - usually transform or extrude",
+      "blender_ops": [
+        "transform.translate",
+        "transform.rotate",
+        "transform.resize"
+      ]
+    },
+    "2": {
+      "name": "keyboard",
+      "description": "Keyboard shortcut",
+      "common_shortcuts": {
+        "E": "extrude",
+        "G": "grab/move",
+        "R": "rotate",
+        "S": "scale",
+        "X": "delete",
+        "Tab": "edit_mode_toggle"
+      }
+    },
+    "3": {
+      "name": "typed_input",
+      "description": "Numeric input for dimensions/parameters",
+      "usage": "Set parameter values"
+    }
+  },
+  "onshape_to_blender_shortcuts": {
+    "E": "Extrude (same in both)",
+    "G": "Grab/Move (same in both)",
+    "R": "Rotate (same in both)",
+    "S": "Scale (same in both)",
+    "F": "Fillet (Onshape) vs Face (Blender)",
+    "Tab": "Edit mode toggle (Blender) vs Feature tree (Onshape)"
+  }
+}
+

@@ -1308,6 +1308,7 @@ def _react_execute(action_input: str, executed_commands: list, thought: str = ""
         
         # Operations that should be allowed to run multiple times (state-changing operations)
         # These operations modify selection/state and may need to be repeated
+        # Modifier operations are object-specific, so they should be allowed to repeat on different objects
         allow_repeat_ops = {
             "object.select_all",
             "object.select_by_type",
@@ -1316,6 +1317,9 @@ def _react_execute(action_input: str, executed_commands: list, thought: str = ""
             "mesh.select_all",
             "mesh.select_mode",
             "object.mode_set",
+            "object.modifier_add",  # Can be applied to different objects
+            "object.modifier_remove",  # Can be applied to different objects
+            "object.modifier_apply",  # Can be applied to different objects
         }
         
         # Check for duplicate operations (same op + same kwargs)
@@ -1333,7 +1337,13 @@ def _react_execute(action_input: str, executed_commands: list, thought: str = ""
                 cmd_signature = (op, json.dumps(kwargs, sort_keys=True))
                 _REACT_STATE_MEMORY["executed_ops"].append(cmd_signature)
             result = send_to_blender(single_cmd)
-            time.sleep(0.15)  # Give Blender a moment to process before next observation
+            
+            # Extra delay for transform operations that affect mesh analysis
+            # Transforms need more time to apply before mesh analysis reads the result
+            if op in ("transform.resize", "transform.translate", "transform.rotate", "object.scale", "transform.scale"):
+                time.sleep(0.3)  # Longer delay for transforms to ensure they're applied
+            else:
+                time.sleep(0.15)  # Standard delay for other operations
             
             # Check if result indicates failure
             if result and isinstance(result, str):
@@ -1518,44 +1528,113 @@ def gpt_to_json_react(transcript: str, modeling_context=None, mesh_analysis=None
         "CRITICAL: You CANNOT finish until the object matches the target!",
         "",
         "Before using Action: finish, you MUST:",
-        "1. Use Action: observe with Action Input: assess_object_quality",
+        "1. Use Action: observe with Action Input: assess_object_quality [target_object]",
+        "   Example: Action: observe, Action Input: assess_object_quality [the target object name]",
+        "   This will return a quality assessment with scores and missing features",
+        "",
         "2. Check the quality_score (must be >= 0.5) and target_match_score (must be >= 0.5)",
+        "   Example output format:",
+        "   📊 OBJECT QUALITY ASSESSMENT:",
+        "   Overall Quality Score: 0.75/1.0",
+        "   Target Match Score: 0.67/1.0",
+        "   ✅ FOUND FEATURES: [list of found components]",
+        "   ❌ MISSING FEATURES: [list of missing components]",
+        "   💡 Suggestions: [actionable suggestions]",
+        "",
         "3. If scores are too low, you MUST continue refining:",
-        "   - Add missing parts/components",
+        "   - Add missing parts/components (use execute to create them)",
         "   - Refine existing parts with edit mode or modifiers",
-        "   - Re-assess quality",
+        "   - Re-assess quality: observe assess_object_quality [target_object]",
+        "",
         "4. Only finish when quality_score >= 0.5 AND target_match_score >= 0.5",
         "",
         "The system will AUTOMATICALLY check quality when you try to finish.",
         "If quality is too low, you will be forced to continue refining.",
         "Do NOT finish until the object actually looks like the target object!",
         "",
+        "--- OBJECT PLACEMENT GUIDELINES (CRITICAL FOR ACCURACY) ---",
+        "Always position objects RELATIVE to the most relevant reference object, not using absolute coordinates.",
+        "",
+        "GENERAL POSITIONING PRINCIPLE:",
+        "1. Identify the main/reference object (usually the largest or first object created)",
+        "2. Get its position and dimensions from scene analysis or mesh analysis",
+        "3. Calculate relative positions based on the reference object's bounds",
+        "",
+        "CALCULATION METHOD:",
+        "For a reference object at [ref_x, ref_y, ref_z] with size [width, height, depth]:",
+        "  * Reference center: [ref_x, ref_y, ref_z]",
+        "  * Left edge: X = ref_x - (width / 2)",
+        "  * Right edge: X = ref_x + (width / 2)",
+        "  * Top edge: Y = ref_y + (height / 2)",
+        "  * Bottom edge: Y = ref_y - (height / 2)",
+        "  * Front face: Z = ref_z + (depth / 2)",
+        "  * Back face: Z = ref_z - (depth / 2)",
+        "",
+        "POSITIONING RULES FOR ATTACHED COMPONENTS:",
+        "  * Components attached to edges: position = edge_position ± small_offset",
+        "  * Components on surfaces: position = surface_position + small_offset (toward outside)",
+        "  * Multiple similar components: space them evenly (typically 0.01-0.02 units apart)",
+        "  * Nested components: position relative to their parent component, not the main object",
+        "",
+        "EXAMPLES (general principles, not object-specific):",
+        "  * If creating buttons on a device: position relative to device body edges",
+        "  * If creating wheels on a vehicle: position relative to vehicle body/chassis",
+        "  * If creating a handle on a cup: position relative to cup body",
+        "  * If creating lenses on a camera module: position relative to camera module, not main body",
+        "",
+        "Always calculate positions relative to the most relevant reference object's dimensions!",
+        "Use scene analysis to get the reference object's position and size before positioning new objects.",
+        "",
+        "--- SCALE AND DIMENSIONS (CRITICAL) ---",
+        "Blender uses METERS as the default unit. Always convert dimensions correctly.",
+        "",
+        "CONVERSION EXAMPLES:",
+        "  * iPhone 16: 71.6mm width = 0.0716 Blender units (NOT 0.72!)",
+        "  * 1 meter = 1.0 Blender unit",
+        "  * 1 millimeter = 0.001 Blender unit",
+        "  * 1 centimeter = 0.01 Blender unit",
+        "",
+        "COMMON MISTAKES TO AVOID:",
+        "  * Using 0.72 instead of 0.0716 (10x error!)",
+        "  * Forgetting to convert mm to meters (divide by 1000)",
+        "  * Using raw dimensions without conversion",
+        "",
+        "ALWAYS:",
+        "  1. Get target object dimensions (usually in mm or cm)",
+        "  2. Convert to meters: mm / 1000, cm / 100",
+        "  3. Use converted values in Blender operations",
+        "",
+        "Example: iPhone 16 is 71.6mm x 147.6mm x 7.8mm",
+        "  Correct: [0.0716, 0.1476, 0.0078]",
+        "  Wrong: [0.72, 1.48, 0.08] or [71.6, 147.6, 7.8]",
+        "",
         "OBJECT NAMING (CRITICAL - MUST DO THIS):",
         "After creating ANY object with mesh.primitive_*_add, you MUST immediately rename it.",
         "The object name should reflect what it represents in the model you're building.",
         "",
         "EXAMPLES:",
-        "- Creating the main body of an iPhone → name it 'iPhone Body' or 'Phone Body'",
-        "- Creating a screen for a phone → name it 'Phone Screen' or 'Screen'",
-        "- Creating volume buttons → name them 'Volume Up Button' and 'Volume Down Button'",
-        "- Creating a cup body → name it 'Cup Body' or 'Tea Cup Body'",
-        "- Creating a handle → name it 'Handle' or 'Cup Handle'",
+        "- Creating the main body of any object → name it '[Object] Body' or 'Body'",
+        "- Creating a screen/display → name it 'Screen' or '[Object] Screen'",
+        "- Creating buttons/controls → name them descriptively: 'Volume Up Button', 'Power Button', etc.",
+        "- Creating a cup/mug body → name it 'Cup Body' or 'Mug Body'",
+        "- Creating a handle → name it 'Handle' or '[Object] Handle'",
         "- Creating a table leg → name it 'Table Leg' or 'Leg'",
         "- Creating a car wheel → name it 'Wheel' or 'Car Wheel'",
+        "- Creating camera lenses → name them 'Camera Lens' or 'Top Lens', 'Bottom Lens'",
         "",
         "HOW TO RENAME:",
         "After creating an object, immediately execute Python code to rename it:",
         "{\"op\":\"execute\",\"kwargs\":{\"code\":\"bpy.context.active_object.name = 'Your Object Name'\"}}",
         "",
         "OR combine creation and naming in one execute action:",
-        "[{\"op\":\"mesh.primitive_cube_add\",\"kwargs\":{}},{\"op\":\"execute\",\"kwargs\":{\"code\":\"bpy.context.active_object.name = 'Phone Body'\"}}]",
+ "[{\"op\":\"mesh.primitive_cube_add\",\"kwargs\":{}},{\"op\":\"execute\",\"kwargs\":{\"code\":\"bpy.context.active_object.name = '[Object] Body'\"}}]",
         "",
         "NAMING RULES:",
-        "1. Always name objects based on what they represent (e.g., 'Phone Screen', not 'Cube.001')",
-        "2. Include the target object name when helpful (e.g., 'iPhone Body', 'Coffee Mug Handle')",
-        "3. Use consistent, descriptive names (e.g., 'Volume Up Button', not 'Button 1')",
+        "1. Always name objects based on what they represent (e.g., 'Screen', 'Handle', 'Wheel', not 'Cube.001')",
+        "2. Include the target object name when helpful for clarity (e.g., '[Object] Body', '[Object] Handle')",
+        "3. Use consistent, descriptive names (e.g., 'Volume Up Button', 'Top Lens', not 'Button 1', 'Lens 1')",
         "4. Name objects IMMEDIATELY after creating them - don't wait until later",
-        "5. If creating multiple similar parts, use descriptive names (e.g., 'Left Wheel', 'Right Wheel')",
+        "5. If creating multiple similar parts, use descriptive names (e.g., 'Left Wheel', 'Right Wheel', 'Front Left Wheel')",
         "",
         "REMEMBER: Unnamed objects (Cube, Cube.001, Cylinder.002, etc.) make it impossible to reference",
         "specific parts later. Always name objects appropriately based on their purpose in the model.",
@@ -1782,6 +1861,7 @@ def gpt_to_json_react(transcript: str, modeling_context=None, mesh_analysis=None
     max_iterations = 25
     action_history = []  # Track action history for loop detection
     last_execute_iteration = -1  # Track when we last executed something
+    consecutive_finish_attempts = 0  # Track consecutive finish attempts that failed quality check
     
     # Track if we've switched to OpenAI fallback (once switched, use OpenAI for all remaining iterations)
     using_openai_fallback = False
@@ -1802,8 +1882,26 @@ def gpt_to_json_react(transcript: str, modeling_context=None, mesh_analysis=None
                     messages=conversation,
                     system_prompt=system_prompt_text,
                     temperature=0,
-                    model_override="openai-gpt-4o"
+                    model_override="openai-gpt-4o",
+                    screenshot_data=screenshot_data if iteration == 0 else None
                 )
+                
+                # Validate response is not empty
+                if not output or len(output.strip()) < 10:
+                    print(f"[ReAct] ⚠️ OpenAI returned empty response, retrying...")
+                    time.sleep(1)
+                    output = _call_unified_ai_api(
+                        messages=conversation,
+                        system_prompt=system_prompt_text,
+                        temperature=0,
+                        model_override="openai-gpt-4o",
+                        screenshot_data=screenshot_data if iteration == 0 else None
+                    )
+                
+                if not output or len(output.strip()) < 10:
+                    print(f"[ReAct] ❌ OpenAI fallback failed - empty response after retry")
+                    output = None
+                    
             except Exception as e:
                 print(f"[ReAct] ⚠️ OpenAI fallback error: {e}")
                 output = None
@@ -1828,10 +1926,28 @@ def gpt_to_json_react(transcript: str, modeling_context=None, mesh_analysis=None
                         messages=conversation,
                         system_prompt=system_prompt_text,
                         temperature=0,
-                        model_override="openai-gpt-4o"
+                        model_override="openai-gpt-4o",
+                        screenshot_data=screenshot_data if iteration == 0 else None
                     )
-                    if output:
+                    
+                    # Validate response is not empty
+                    if output and len(output.strip()) >= 10:
                         print(f"[ReAct] ✅ OpenAI fallback succeeded, will use OpenAI for remaining iterations")
+                    else:
+                        print(f"[ReAct] ⚠️ OpenAI fallback returned empty response, retrying...")
+                        time.sleep(1)
+                        output = _call_unified_ai_api(
+                            messages=conversation,
+                            system_prompt=system_prompt_text,
+                            temperature=0,
+                            model_override="openai-gpt-4o",
+                            screenshot_data=screenshot_data if iteration == 0 else None
+                        )
+                        if output and len(output.strip()) >= 10:
+                            print(f"[ReAct] ✅ OpenAI fallback succeeded after retry")
+                        else:
+                            print(f"[ReAct] ❌ OpenAI fallback failed - empty response")
+                            output = None
                 except Exception as e2:
                     print(f"[ReAct] ⚠️ OpenAI fallback also failed: {e2}")
                     output = None
@@ -1884,6 +2000,8 @@ def gpt_to_json_react(transcript: str, modeling_context=None, mesh_analysis=None
             observation = _react_execute(action_input, executed_commands, thought=thought, target_object=target_object)
             if "✅" in observation:  # Success
                 last_execute_iteration = iteration
+                # Reset finish attempt counter since AI is taking action
+                consecutive_finish_attempts = 0
                 
                 # After successful execution, capture updated context (screenshot + mesh analysis)
                 print("[ReAct] 📸 Capturing updated context after execution...")
@@ -2094,35 +2212,62 @@ def gpt_to_json_react(transcript: str, modeling_context=None, mesh_analysis=None
                         # Require minimum quality threshold
                         if quality_score < 0.5 or target_match < 0.5:
                             quality_check_passed = False
-                            assessment_msg = f"❌ QUALITY CHECK FAILED:\n"
-                            assessment_msg += f"Quality Score: {quality_score:.2f}/1.0 (minimum: 0.5)\n"
-                            assessment_msg += f"Target Match: {target_match:.2f}/1.0 (minimum: 0.5)\n\n"
+                            
+                            # Get suggestions from assessment
+                            suggestions = assessment.get("suggestions", [])
+                            found_features = assessment.get("found_features", [])
+                            
+                            assessment_msg = f"❌ QUALITY CHECK FAILED - CANNOT FINISH YET:\n\n"
+                            assessment_msg += f"Quality Score: {quality_score:.2f}/1.0 (minimum: 0.5) ❌\n"
+                            assessment_msg += f"Target Match: {target_match:.2f}/1.0 (minimum: 0.5) ❌\n\n"
+                            
+                            if found_features:
+                                assessment_msg += f"✅ Found: {', '.join(found_features)}\n"
                             
                             if missing_features:
-                                assessment_msg += f"Missing Features: {', '.join(missing_features)}\n"
-                            if issues:
-                                assessment_msg += f"Issues: {'; '.join(issues[:3])}\n"
+                                assessment_msg += f"\n❌ MISSING REQUIRED PARTS:\n"
+                                for missing in missing_features:
+                                    assessment_msg += f"  - {missing}\n"
                             
-                            assessment_msg += f"\nYou MUST fix these issues before finishing. The object does not yet look like '{target_object}'."
-                            assessment_msg += f"\n\nRequired actions:\n"
-                            assessment_msg += f"1. Add missing parts/components\n"
-                            assessment_msg += f"2. Refine existing parts with edit mode or modifiers\n"
-                            assessment_msg += f"3. Re-assess quality before finishing\n"
+                            if issues:
+                                assessment_msg += f"\n⚠️ Issues:\n"
+                                for issue in issues[:5]:  # Show up to 5 issues
+                                    assessment_msg += f"  - {issue}\n"
+                            
+                            if suggestions:
+                                assessment_msg += f"\n💡 Suggestions:\n"
+                                for suggestion in suggestions[:3]:  # Show up to 3 suggestions
+                                    assessment_msg += f"  - {suggestion}\n"
+                            
+                            assessment_msg += f"\n🚫 ACTION REQUIRED: You CANNOT finish until quality_score >= 0.5 AND target_match_score >= 0.5.\n"
+                            assessment_msg += f"You MUST:\n"
+                            assessment_msg += f"1. Use 'execute' to ADD the missing parts listed above\n"
+                            assessment_msg += f"2. Use 'execute' to REFINE existing parts if needed\n"
+                            assessment_msg += f"3. Use 'observe assess_object_quality' to check progress\n"
+                            assessment_msg += f"4. Only use 'finish' AFTER quality check passes\n\n"
+                            assessment_msg += f"DO NOT try to finish again until you have actually added the missing parts!"
                             
                             print(f"[ReAct] ⚠️ {assessment_msg}")
                             conversation.append({"role": "user", "content": f"Observation: {assessment_msg}"})
                         else:
                             quality_check_passed = True
                             print(f"[ReAct] ✅ Quality check passed! Object matches target '{target_object}'")
+                            # Store quality scores for success library
+                            final_quality = quality_score
+                            final_target_match = target_match
                     else:
                         # If assessment failed, still require manual check
                         print(f"[ReAct] ⚠️ Quality assessment unavailable, requiring manual verification")
                         conversation.append({"role": "user", "content": f"Observation: Before finishing, verify the object looks like '{target_object}'. Use 'observe assess_object_quality' to check. If quality is low, continue refining."})
                         quality_check_passed = False
+                        final_quality = 0.0
+                        final_target_match = 0.0
                 except Exception as e:
                     print(f"[ReAct] ⚠️ Quality assessment error: {e}")
                     conversation.append({"role": "user", "content": f"Observation: Quality check failed ({e}). Before finishing, verify the object looks like '{target_object}'. Use 'observe assess_object_quality' to check."})
                     quality_check_passed = False
+                    final_quality = 0.0
+                    final_target_match = 0.0
             
             # Also run legacy validation for backwards compatibility
             validation_failed = False
@@ -2141,11 +2286,89 @@ def gpt_to_json_react(transcript: str, modeling_context=None, mesh_analysis=None
             
             # If quality check or validation failed, continue the loop instead of finishing
             if not quality_check_passed or validation_failed:
-                print(f"[ReAct] Continuing due to quality/validation issues...")
+                consecutive_finish_attempts += 1
+                print(f"[ReAct] Continuing due to quality/validation issues... (attempt {consecutive_finish_attempts})")
+                
+                # After 2 failed finish attempts, force the AI to take action
+                if consecutive_finish_attempts >= 2:
+                    print(f"[ReAct] ⚠️ Multiple finish attempts failed - forcing action requirement")
+                    force_action_msg = f"\n🚨 CRITICAL: You have tried to finish {consecutive_finish_attempts} times but quality check keeps failing.\n"
+                    force_action_msg += f"You MUST use 'execute' to add the missing parts BEFORE trying to finish again.\n"
+                    force_action_msg += f"DO NOT use 'finish' again until you have executed commands to fix the issues.\n"
+                    force_action_msg += f"Next action MUST be 'execute' (not 'finish' or 'observe').\n"
+                    conversation.append({"role": "user", "content": f"Observation: {force_action_msg}"})
+                
                 continue
+            else:
+                # Quality check passed - reset counter
+                consecutive_finish_attempts = 0
             
             # Validation passed or no validation needed - finish
             print(f"[ReAct] Finished: {summary}"); sys.stdout.flush()
+            
+            # AUTO-DETECT SUCCESS CANDIDATE
+            # Use quality scores from quality check if available, otherwise try to get them
+            if 'final_quality' not in locals() or 'final_target_match' not in locals():
+                final_quality = 0.0
+                final_target_match = 0.0
+                # Try to get final quality assessment
+                try:
+                    if rpc and target_object:
+                        assessment = rpc.assess_object_quality(target_object)
+                        if assessment:
+                            final_quality = assessment.get('quality_score', 0.0)
+                            final_target_match = assessment.get('target_match_score', 0.0)
+                except Exception as e:
+                    if VERBOSE_DEBUG:
+                        print(f"[Success Library] Could not get final assessment: {e}")
+            
+            try:
+                import sys
+                import os
+                addon_path = os.path.dirname(os.path.abspath(__file__))
+                if addon_path not in sys.path:
+                    sys.path.insert(0, addon_path)
+                
+                from success_library import BlenderSuccessLibrary
+                library = BlenderSuccessLibrary()
+                
+                # Check if this should be auto-detected as success
+                is_success = library.auto_detect_success(
+                    target_object=target_object,
+                    quality_score=final_quality,
+                    target_match_score=final_target_match,
+                    finished_successfully=True
+                )
+                
+                if is_success:
+                    # Capture final screenshot
+                    final_screenshot = _capture_screen_local()
+                    if final_screenshot:
+                        # Get final scene/mesh analysis
+                        final_scene = rpc.analyze_scene() if rpc else {}
+                        final_mesh = rpc.analyze_current_mesh() if rpc else {}
+                        
+                        # Store as candidate
+                        run_id = library.store_run(
+                            target_object=target_object,
+                            screenshot=final_screenshot,
+                            commands=executed_commands,
+                            quality_score=final_quality,
+                            target_match_score=final_target_match,
+                            scene_analysis=final_scene,
+                            mesh_analysis=final_mesh,
+                            transcript=transcript,
+                            summary=summary,
+                            iterations=iteration+1,
+                            status="candidate"
+                        )
+                        print(f"[Success Library] ✅ Auto-detected success candidate: {run_id}")
+                        print(f"[Success Library] Quality: {final_quality:.2f}, Target Match: {final_target_match:.2f}")
+                        print(f"[Success Library] Review in UI panel to confirm or delete if incorrect")
+            except Exception as e:
+                print(f"[Success Library] ⚠️ Error storing success: {e}")
+                import traceback
+                traceback.print_exc()
             
             # Update state memory
             _REACT_STATE_MEMORY["last_summary"] = summary

@@ -952,3 +952,88 @@ Next Steps:
 - State-changing operations (select, join, delete) should be allowed to repeat
 - Screenshot capture works best with PIL.ImageGrab or mss (faster than Blender render)
 - Conversation history helps GPT maintain context across multiple commands
+
+---
+
+## January 10, 2025 - Consistency Fixes & Success Library
+
+### Major Accomplishments:
+
+1. **Scale & Dimension Guidance (Fix 1)**:
+   - Problem: AI was using incorrect scale conversions (e.g., using 0.72 instead of 0.0716 for 71.6mm)
+   - Solution: Added comprehensive "SCALE AND DIMENSIONS" section to system prompt:
+     - Clear conversion examples (mm to meters: divide by 1000)
+     - Common mistakes documented (10x errors from forgetting conversion)
+     - Explicit instructions to always convert dimensions before use
+     - Example: iPhone 16 is 71.6mm x 147.6mm x 7.8mm = [0.0716, 0.1476, 0.0078] in Blender
+
+2. **Workflow-Agnostic Quality Assessment (Fix 2)**:
+   - Problem: Quality checks were biased toward modifier-based workflows, penalizing high-vertex-count direct modeling
+   - Solution: Updated quality assessment to accept EITHER:
+     - Modifiers applied (subdivision, bevel, etc.), OR
+     - High vertex count (>100 vertices)
+   - Quality scoring now focuses on actual detail, not workflow method
+   - More flexible scoring: 500+ vertices = 0.3 points, 100+ = 0.2 points, 20+ = 0.1 points
+
+3. **OpenAI Fallback Empty Response Fix (Fix 3)**:
+   - Problem: When Gemini failed and system switched to OpenAI fallback, sometimes received empty responses causing loops
+   - Solution: Added response validation:
+     - Checks response length (minimum 10 characters)
+     - Retries once if empty response received
+     - Properly handles screenshot data in fallback calls
+     - Prevents infinite loops from empty API responses
+
+4. **Success Library System**:
+   - Created `success_library.py` module for storing and learning from successful runs
+   - Auto-detection: Runs with quality >= 0.7 or target_match >= 0.7 are automatically stored as candidates
+   - Storage includes: screenshots, commands, quality scores, scene/mesh analysis, transcript, summary
+   - Two-tier system: `candidates/` (auto-detected) and `confirmed/` (manually verified)
+   - Integrated into finish section: automatically stores successful runs when quality checks pass
+
+5. **Success Library UI Panel**:
+   - Added `STB_PT_SuccessLibrary` panel in Blender UI (STB category)
+   - Shows last run info: target object, quality scores, status, run ID
+   - Library stats: confirmed vs candidates count
+   - Recent runs list with delete buttons for each run
+   - Operators:
+     - `STB_OT_MarkLastRunSuccess`: Manually confirm a candidate as success
+     - `STB_OT_DeleteLastRun`: Delete the most recent run
+     - `STB_OT_DeleteRun`: Delete any run by ID (for removing falsely marked successes)
+
+6. **Infinite Loop Prevention Improvements**:
+   - Enhanced `consecutive_finish_attempts` counter logic
+   - After 2 failed finish attempts, AI is forced to use `execute` before trying `finish` again
+   - Prevents endless retry loops when quality checks keep failing
+   - Counter resets on successful execution or quality pass
+
+### Files Changed:
+- `voice_to_blender.py`: Scale guidance, OpenAI fallback fix, success library integration, infinite loop prevention
+- `__init__.py`: Workflow-agnostic quality assessment, success library UI panel and operators
+- `success_library.py`: New module for storing successful runs
+
+### Current Status:
+- ✅ Scale guidance added to system prompt
+- ✅ Quality assessment is workflow-agnostic
+- ✅ OpenAI fallback handles empty responses
+- ✅ Success library auto-detects and stores successful runs
+- ✅ UI panel for managing success library
+- ✅ Delete functionality for removing bad runs
+- ⚠️ **NOT YET TESTED** - All new features need testing
+
+### Next Steps:
+1. **Test Scale Guidance**: Create iPhone 16 and verify correct dimensions (0.0716m width, not 0.72m)
+2. **Test Quality Assessment**: Verify it accepts both modifier-based and high-vertex-count workflows
+3. **Test Success Library**: 
+   - Create a good run (quality >= 0.7) and verify it's auto-detected
+   - Check UI panel shows the run correctly
+   - Test delete functionality for bad runs
+   - Test manual confirmation of candidates
+4. **Test OpenAI Fallback**: Trigger fallback scenario and verify empty response handling works
+5. **Test Infinite Loop Prevention**: Verify AI doesn't get stuck in retry loops
+
+### Technical Notes:
+- Success library stores runs in `success_library/` directory
+- Candidates are auto-detected, confirmed requires manual verification
+- Quality scores are captured from final quality check before finish
+- Screenshots are stored as PNG files alongside JSON metadata
+- All changes follow lazy import pattern for Blender compatibility
