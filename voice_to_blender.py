@@ -462,8 +462,7 @@ rpc = xmlrpc.client.ServerProxy(RPC_URL, allow_none=True)
 
 def _dbg(*args):
     if VERBOSE_DEBUG:
-        print("[VOICE-IO]", *args)
-        sys.stdout.flush()
+        print("[VOICE-IO]", *args, flush=True)
 
 def rms_int16(block: np.ndarray) -> float:
     return float(np.sqrt(np.mean(block.astype(np.int32)**2)))
@@ -1989,7 +1988,7 @@ def gpt_to_json_react(transcript: str, modeling_context=None, mesh_analysis=None
         # Log reasoning (Thought content) to console
         if thought:
             print(f"[ReAct] Iteration {iteration+1} - Thought: {thought[:200]}{'...' if len(thought) > 200 else ''}")
-        print(f"[ReAct] Iteration {iteration+1} - Action: {action.upper()}"); sys.stdout.flush()
+        print(f"[ReAct] Iteration {iteration+1} - Action: {action.upper()}", flush=True)
         
         if action == "plan":
             # Store plan in conversation and continue
@@ -2304,7 +2303,7 @@ def gpt_to_json_react(transcript: str, modeling_context=None, mesh_analysis=None
                 consecutive_finish_attempts = 0
             
             # Validation passed or no validation needed - finish
-            print(f"[ReAct] Finished: {summary}"); sys.stdout.flush()
+            print(f"[ReAct] Finished: {summary}", flush=True)
             
             # AUTO-DETECT SUCCESS CANDIDATE
             # Use quality scores from quality check if available, otherwise try to get them
@@ -3847,18 +3846,18 @@ def gpt_to_json(transcript: str, modeling_context=None, mesh_analysis=None, targ
 
 def send_to_blender(cmd: dict):
     if not isinstance(cmd, dict):
-        print("⚠️ command is not a dict:", cmd); sys.stdout.flush(); return
+        print("⚠️ command is not a dict:", cmd, flush=True); return
     op = cmd.get("op"); kwargs = cmd.get("kwargs", {}) or {}
     if not op or not isinstance(op, str):
-        print("⚠️ Missing/invalid 'op' in command:", cmd); sys.stdout.flush(); return
+        print("⚠️ Missing/invalid 'op' in command:", cmd, flush=True); return
     if rpc is None:
-        print("❌ RPC not available - cannot send command"); sys.stdout.flush(); return
+        print("❌ RPC not available - cannot send command", flush=True); return
     try:
-        print(f"➡️ enqueue {op} {kwargs}"); sys.stdout.flush()
+        print(f"➡️ enqueue {op} {kwargs}", flush=True)
         # NOTE: If your bridge exposes a different method name, swap below accordingly,
         # e.g. rpc.enqueue_op or rpc.enqueue
         res = rpc.enqueue_op_safe(op, kwargs)
-        print("✅ RPC:", res); sys.stdout.flush()
+        print("✅ RPC:", res, flush=True)
         return res
     except Exception as e:
         print("❌ RPC failed:", e)
@@ -3916,41 +3915,72 @@ if __name__ == "__main__":
             except Exception:
                 pass
 
+        # Text queue file path (for typed commands from Blender UI)
+        import tempfile
+        text_queue_file = os.path.join(tempfile.gettempdir(), "stb_text_queue.txt")
+        
+        def check_text_queue():
+            """Check for typed text commands from Blender UI"""
+            try:
+                if os.path.exists(text_queue_file):
+                    with open(text_queue_file, "r", encoding="utf-8") as f:
+                        lines = f.readlines()
+                    # Clear the file after reading
+                    with open(text_queue_file, "w", encoding="utf-8") as f:
+                        pass  # Clear file
+                    # Return first non-empty line
+                    for line in lines:
+                        line = line.strip()
+                        if line:
+                            return line
+            except Exception as e:
+                if VERBOSE_DEBUG:
+                    print(f"[DEBUG] Error reading text queue: {e}")
+            return None
+        
         while True:
             try:
-                listening_enabled = True
-                if rpc is not None:
-                    try:
-                        state = rpc.get_voice_listening_state()
-                        listening_enabled = state.get("enabled", True)
-                    except Exception:
-                        listening_enabled = True
-                
-                if not listening_enabled:
-                    time.sleep(0.1)
-                    continue
-                
-                wav = record_until_silence()
-                if not wav:
-                    continue
-                
-                listening_enabled = True
-                if rpc is not None:
-                    try:
-                        state = rpc.get_voice_listening_state()
-                        listening_enabled = state.get("enabled", True)
-                    except Exception:
-                        listening_enabled = True
-                
-                if not listening_enabled:
-                    print("⏸️ Listening disabled - skipping audio processing"); sys.stdout.flush()
-                    continue
-                
-                text = transcribe(wav)
-                if not text:
-                    print("⚠️ No transcription."); sys.stdout.flush()
-                    continue
-                print("📝 Transcript ->", text); sys.stdout.flush()
+                # First, check for typed text commands (priority over voice)
+                typed_text = check_text_queue()
+                if typed_text:
+                    print(f"📝 Typed Command -> {typed_text}", flush=True)
+                    text = typed_text
+                    # Skip audio recording and transcription, go straight to processing
+                else:
+                    # No typed text, proceed with voice recording
+                    listening_enabled = True
+                    if rpc is not None:
+                        try:
+                            state = rpc.get_voice_listening_state()
+                            listening_enabled = state.get("enabled", True)
+                        except Exception:
+                            listening_enabled = True
+                    
+                    if not listening_enabled:
+                        time.sleep(0.1)
+                        continue
+                    
+                    wav = record_until_silence()
+                    if not wav:
+                        continue
+                    
+                    listening_enabled = True
+                    if rpc is not None:
+                        try:
+                            state = rpc.get_voice_listening_state()
+                            listening_enabled = state.get("enabled", True)
+                        except Exception:
+                            listening_enabled = True
+                    
+                    if not listening_enabled:
+                        print("⏸️ Listening disabled - skipping audio processing", flush=True)
+                        continue
+                    
+                    text = transcribe(wav)
+                    if not text:
+                        print("⚠️ No transcription.", flush=True)
+                        continue
+                    print("📝 Transcript ->", text, flush=True)
 
                 if rpc is not None:
                     try:
@@ -4094,13 +4124,13 @@ if __name__ == "__main__":
                             listening_enabled = True
                     
                     if not listening_enabled:
-                        print("⏸️ Listening disabled - skipping command execution"); sys.stdout.flush()
+                        print("⏸️ Listening disabled - skipping command execution", flush=True)
                     else:
                         for single in all_commands:
                             send_to_blender(single)
                             time.sleep(0.01)
                 else:
-                    print("🤷 No command derived for:", text); sys.stdout.flush()
+                    print("🤷 No command derived for:", text, flush=True)
 
                     time.sleep(0.05)
 

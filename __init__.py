@@ -2127,6 +2127,42 @@ class STB_PT_SuccessLibrary(Panel):
             traceback.print_exc()
 
 
+class STB_OT_SubmitTextCommand(bpy.types.Operator):
+    """Submit typed text command to voice processing"""
+    bl_idname = "stb.submit_text_command"
+    bl_label = "Submit Text Command"
+    bl_options = {'INTERNAL'}
+    
+    def execute(self, context):
+        wm = context.window_manager
+        text = getattr(wm, "stb_text_input", "").strip()
+        
+        if not text:
+            self.report({'WARNING'}, "Please enter a command")
+            return {'CANCELLED'}
+        
+        # Write text to a file that the voice script can read
+        try:
+            import tempfile
+            temp_dir = tempfile.gettempdir()
+            text_queue_file = os.path.join(temp_dir, "stb_text_queue.txt")
+            
+            # Append to queue file (voice script will read and clear)
+            with open(text_queue_file, "a", encoding="utf-8") as f:
+                f.write(text + "\n")
+            
+            # Clear the input field
+            wm.stb_text_input = ""
+            
+            self.report({'INFO'}, f"Command submitted: {text[:50]}...")
+            print(f"[SpeechToBlender] Text command submitted: {text}")
+            return {'FINISHED'}
+        except Exception as e:
+            self.report({'ERROR'}, f"Failed to submit: {str(e)}")
+            print(f"[SpeechToBlender] Error submitting text command: {e}")
+            return {'CANCELLED'}
+
+
 class STB_PT_VoiceMode(Panel):
     bl_space_type = "VIEW_3D"
     bl_region_type = "UI"
@@ -2172,6 +2208,15 @@ class STB_PT_VoiceMode(Panel):
         col.label(text="• Smart operation selection", icon="BLANK1")
         col.separator()
         col.label(text="⚠ Uses API credits when GPT is needed", icon="INFO")
+        
+        # Text input section
+        col.separator()
+        col.separator()
+        text_box = col.box()
+        text_col = text_box.column(align=True)
+        text_col.label(text="📝 Type Command (for users without microphone)", icon="TEXT")
+        text_col.prop(wm, "stb_text_input", text="", icon="CONSOLE")
+        text_col.operator("stb.submit_text_command", text="Submit Command", icon="PLAY")
 
 
 # ───────── Safe stub: lazy import inside register, timers last ─────────
@@ -2211,6 +2256,12 @@ def register():
             default=False,
             options={'HIDDEN'},
         )
+    if not hasattr(bpy.types.WindowManager, "stb_text_input"):
+        bpy.types.WindowManager.stb_text_input = StringProperty(
+            name="Text Command",
+            default="",
+            description="Type your command here if you can't use the microphone",
+        )
     # 3) operators and panels
     bpy.utils.register_class(STB_OT_MeshyGenerate)
     bpy.utils.register_class(STB_PT_MeshyTools)
@@ -2218,6 +2269,7 @@ def register():
     bpy.utils.register_class(STB_OT_RPCStart)
     bpy.utils.register_class(STB_OT_RPCStop)
     bpy.utils.register_class(STB_OT_ToggleVoiceListening)
+    bpy.utils.register_class(STB_OT_SubmitTextCommand)
     bpy.utils.register_class(STB_PT_RPCBridge)
     bpy.utils.register_class(STB_PT_VoiceMode)
     
