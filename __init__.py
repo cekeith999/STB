@@ -473,6 +473,14 @@ def _server_loop():
             server.register_introspection_functions()
             server.register_multicall_functions()
             
+            # Focus Stack data (shared state for reference resolution)
+            _FOCUS_STACK_DATA = {
+                "last_created": None,
+                "last_modified": None,
+                "last_mentioned": None,
+                "command_history": [],
+            }
+            
             # Register RPC methods
             def ping():
                 return "pong"
@@ -871,58 +879,30 @@ def _server_loop():
                     
                     print("[SpeechToBlender] 📸 Starting viewport screenshot capture (screen capture method)...")
                     
-                    # Try multiple methods for screen capture
+                    # Ensure viewport is in Material Preview mode so materials are visible
+                    try:
+                        context = bpy.context
+                        viewport_area = None
+                        for area in context.screen.areas:
+                            if area.type == 'VIEW_3D':
+                                viewport_area = area
+                                break
+                        
+                        if viewport_area:
+                            # Set viewport shading to Material Preview
+                            for space in viewport_area.spaces:
+                                if space.type == 'VIEW_3D':
+                                    if hasattr(space, 'shading'):
+                                        old_mode = space.shading.type
+                                        space.shading.type = 'MATERIAL'
+                                        print(f"[SpeechToBlender] 📸 Set viewport shading to Material Preview (was: {old_mode})")
+                                    break
+                    except Exception as e:
+                        print(f"[SpeechToBlender] ⚠️ Could not set viewport shading mode: {e}")
+                    
                     screenshot_data = None
                     
-                    # Method 1: Try using PIL/Pillow with screen capture (if available)
-                    try:
-                        from PIL import ImageGrab
-                        print("[SpeechToBlender] 📸 Attempting PIL.ImageGrab screen capture...")
-                        # Capture entire screen
-                        screenshot = ImageGrab.grab()
-                        temp_path = tempfile.mktemp(suffix='.png')
-                        screenshot.save(temp_path, 'PNG')
-                        
-                        with open(temp_path, 'rb') as f:
-                            image_data = f.read()
-                            screenshot_data = base64.b64encode(image_data).decode('utf-8')
-                        
-                        os.remove(temp_path)
-                        print(f"[SpeechToBlender] ✅ Captured screenshot using PIL.ImageGrab: {len(image_data)} bytes raw, {len(screenshot_data)} chars base64")
-                        return {"image_base64": screenshot_data, "format": "png"}
-                    except ImportError as e:
-                        print(f"[SpeechToBlender] ⚠️ PIL/Pillow not available: {e}, trying mss...")
-                    except Exception as e:
-                        print(f"[SpeechToBlender] ⚠️ PIL.ImageGrab failed: {e}, trying mss...")
-                        import traceback
-                        traceback.print_exc()
-                    
-                    # Method 2: Try using mss (if available) - faster and more reliable
-                    try:
-                        import mss
-                        print("[SpeechToBlender] 📸 Attempting mss screen capture...")
-                        with mss.mss() as sct:
-                            # Capture entire screen
-                            screenshot = sct.grab(sct.monitors[0])  # Primary monitor
-                            temp_path = tempfile.mktemp(suffix='.png')
-                            mss.tools.to_png(screenshot.rgb, screenshot.size, output=temp_path)
-                            
-                            with open(temp_path, 'rb') as f:
-                                image_data = f.read()
-                                screenshot_data = base64.b64encode(image_data).decode('utf-8')
-                            
-                            os.remove(temp_path)
-                            print(f"[SpeechToBlender] ✅ Captured screenshot using mss: {len(image_data)} bytes raw, {len(screenshot_data)} chars base64")
-                            return {"image_base64": screenshot_data, "format": "png"}
-                    except ImportError as e:
-                        print(f"[SpeechToBlender] ⚠️ mss not available: {e}, trying Blender render method...")
-                    except Exception as e:
-                        print(f"[SpeechToBlender] ⚠️ mss failed: {e}, trying Blender render method...")
-                        import traceback
-                        traceback.print_exc()
-                    
-                    # Method 3: Fallback to Blender render (if screen capture libraries not available)
-                    # This runs synchronously on the RPC thread but should work
+                    # Method 1: Try Blender render.opengl (captures viewport only, preferred)
                     try:
                         context = bpy.context
                         
@@ -955,7 +935,7 @@ def _server_loop():
                         # Get the rendered image from Render Result
                         render_result = bpy.data.images.get('Render Result')
                         if not render_result:
-                            return {"error": "Could not get Render Result image"}
+                            raise Exception("Could not get Render Result image")
                         
                         print(f"[SpeechToBlender] ✅ Got Render Result: {render_result.size[0]}x{render_result.size[1]}")
                         
@@ -980,8 +960,60 @@ def _server_loop():
                         
                         return {"image_base64": screenshot_data, "format": "png"}
                     except Exception as e:
-                        print(f"[SpeechToBlender] ⚠️ Blender render method failed: {e}")
-                        return {"error": f"All screenshot methods failed. Last error: {str(e)}. Install Pillow (pip install Pillow) or mss (pip install mss) for better screen capture."}
+                        print(f"[SpeechToBlender] ⚠️ Blender render method failed: {e}, falling back to screen capture...")
+                        import traceback
+                        traceback.print_exc()
+                    
+                    # Method 2: Fallback to screen capture (captures entire screen)
+                    # Try using PIL/Pillow with screen capture (if available)
+                    try:
+                        from PIL import ImageGrab
+                        print("[SpeechToBlender] 📸 Attempting PIL.ImageGrab screen capture (entire screen)...")
+                        # Capture entire screen
+                        screenshot = ImageGrab.grab()
+                        temp_path = tempfile.mktemp(suffix='.png')
+                        screenshot.save(temp_path, 'PNG')
+                        
+                        with open(temp_path, 'rb') as f:
+                            image_data = f.read()
+                            screenshot_data = base64.b64encode(image_data).decode('utf-8')
+                        
+                        os.remove(temp_path)
+                        print(f"[SpeechToBlender] ⚠️ Captured entire screen using PIL.ImageGrab: {len(image_data)} bytes raw, {len(screenshot_data)} chars base64")
+                        return {"image_base64": screenshot_data, "format": "png"}
+                    except ImportError as e:
+                        print(f"[SpeechToBlender] ⚠️ PIL/Pillow not available: {e}, trying mss...")
+                    except Exception as e:
+                        print(f"[SpeechToBlender] ⚠️ PIL.ImageGrab failed: {e}, trying mss...")
+                        import traceback
+                        traceback.print_exc()
+                    
+                    # Method 3: Try using mss (if available) - faster and more reliable
+                    try:
+                        import mss
+                        print("[SpeechToBlender] 📸 Attempting mss screen capture (entire screen)...")
+                        with mss.mss() as sct:
+                            # Capture entire screen
+                            screenshot = sct.grab(sct.monitors[0])  # Primary monitor
+                            temp_path = tempfile.mktemp(suffix='.png')
+                            mss.tools.to_png(screenshot.rgb, screenshot.size, output=temp_path)
+                            
+                            with open(temp_path, 'rb') as f:
+                                image_data = f.read()
+                                screenshot_data = base64.b64encode(image_data).decode('utf-8')
+                            
+                            os.remove(temp_path)
+                            print(f"[SpeechToBlender] ⚠️ Captured entire screen using mss: {len(image_data)} bytes raw, {len(screenshot_data)} chars base64")
+                            return {"image_base64": screenshot_data, "format": "png"}
+                    except ImportError as e:
+                        print(f"[SpeechToBlender] ⚠️ mss not available: {e}")
+                    except Exception as e:
+                        print(f"[SpeechToBlender] ⚠️ mss failed: {e}")
+                        import traceback
+                        traceback.print_exc()
+                    
+                    # All methods failed
+                    return {"error": f"All screenshot methods failed. Install Pillow (pip install Pillow) or mss (pip install mss) for screen capture."}
                     
                 except Exception as e:
                     print(f"[SpeechToBlender] ❌ Error capturing screenshot: {e}")
@@ -1466,6 +1498,46 @@ def _server_loop():
             server.register_function(capture_viewport_screenshot, "capture_viewport_screenshot")
             server.register_function(rename_active_object, "rename_active_object")
             server.register_function(assess_object_quality, "assess_object_quality")
+            
+            def get_focus_context():
+                """RPC method: Get focus stack for reference resolution."""
+                context = bpy.context
+                
+                selected = [obj.name for obj in context.view_layer.objects.selected]
+                active = context.view_layer.objects.active.name if context.view_layer.objects.active else None
+                
+                return {
+                    "selected_objects": selected,
+                    "active_object": active,
+                    "last_created": _FOCUS_STACK_DATA.get("last_created"),
+                    "last_modified": _FOCUS_STACK_DATA.get("last_modified"),
+                    "last_mentioned": _FOCUS_STACK_DATA.get("last_mentioned"),
+                    "recent_commands": _FOCUS_STACK_DATA.get("command_history", [])[-5:],
+                }
+            
+            def update_focus_stack(event_type: str, object_name: str, command_text: str = ""):
+                """RPC method: Update focus stack after operations."""
+                
+                if event_type == "created":
+                    _FOCUS_STACK_DATA["last_created"] = object_name
+                    _FOCUS_STACK_DATA["last_modified"] = object_name
+                elif event_type == "modified":
+                    _FOCUS_STACK_DATA["last_modified"] = object_name
+                elif event_type == "mentioned":
+                    _FOCUS_STACK_DATA["last_mentioned"] = object_name
+                
+                if command_text:
+                    _FOCUS_STACK_DATA["command_history"].append({
+                        "command": command_text,
+                        "target": object_name,
+                        "timestamp": time.time()
+                    })
+                    _FOCUS_STACK_DATA["command_history"] = _FOCUS_STACK_DATA["command_history"][-20:]
+                
+                return "OK"
+            
+            server.register_function(get_focus_context, "get_focus_context")
+            server.register_function(update_focus_stack, "update_focus_stack")
             
             def get_voice_listening_state():
                 """RPC method: Get voice listening enabled state."""

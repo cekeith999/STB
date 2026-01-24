@@ -15,6 +15,38 @@ from datetime import datetime
 import traceback  # keep tracebacks visible instead of killing process
 import webrtcvad
 
+# Phase 1: Multi-agent architecture imports
+try:
+    from analyzers.focus_stack import get_focus_stack
+    FOCUS_STACK_AVAILABLE = True
+except ImportError:
+    FOCUS_STACK_AVAILABLE = False
+    print("[Warning] Focus Stack not available - reference resolution will use GPT inference only")
+
+# Phase 2: Language Translator imports
+# Add current directory to Python path if needed (for Blender addon context)
+import sys
+_script_dir = os.path.dirname(os.path.abspath(__file__))
+if _script_dir not in sys.path:
+    sys.path.insert(0, _script_dir)
+
+try:
+    from agents import get_language_translator
+    LANGUAGE_TRANSLATOR_AVAILABLE = True
+    print("[LanguageTranslator] ✅ Import successful")
+except ImportError as e:
+    LANGUAGE_TRANSLATOR_AVAILABLE = False
+    print(f"[Warning] Language Translator not available - import failed: {e}")
+    print(f"[Warning] Script dir: {_script_dir}")
+    print(f"[Warning] Python path: {sys.path[:3]}...")  # Show first 3 entries
+    import traceback
+    traceback.print_exc()
+except Exception as e:
+    LANGUAGE_TRANSLATOR_AVAILABLE = False
+    print(f"[Warning] Language Translator not available - unexpected error: {e}")
+    import traceback
+    traceback.print_exc()
+
 # ========= CONFIG (portable paths) =========
 def _get_openai_api_key():
     """Get OpenAI API key from cache, RPC (preferences), or environment variable (fallback)."""
@@ -430,6 +462,7 @@ RPC_URL = "http://127.0.0.1:8765/RPC2"
 
 # Feature flags / verbosity
 ENABLE_GPT_FALLBACK = True   # GPT-4o fallback for natural language understanding
+ENABLE_LANGUAGE_TRANSLATOR = True  # Phase 2: Use Language Translator agent for intent parsing
 VERBOSE_DEBUG = False        # debug prints for import matcher (set True for debugging)
 CONTEXT_DEBUG = True         # Show detailed context analysis (mesh, scene, screenshots) at each step
 
@@ -766,8 +799,7 @@ def _fetch_context_for_gpt(include_screenshot: bool = True):
             print(f"[Context] ⚠️ Error analyzing scene: {e}")
             scene_analysis = None
         
-        # Capture screenshot if requested (use local screen capture, not Blender RPC)
-        # Do this even if context fetching failed
+        # Capture screenshot if requested (captures entire Blender window)
         if include_screenshot:
             try:
                 if CONTEXT_DEBUG:
@@ -956,7 +988,7 @@ def _react_observe(request: str) -> str:
                 result += f"\n📸 Screenshot captured ({len(screenshot_data)} bytes)"
             
             return result
-        
+            
         if req in ("assess_object_quality", "quality", "assessment", "assess"):
             try:
                 # Extract target_object from request if provided, or use empty string
@@ -1296,7 +1328,32 @@ def _react_execute(action_input: str, executed_commands: list, thought: str = ""
     try:
         cmd = json.loads(cleaned)
     except json.JSONDecodeError as e:
-        return f"❌ JSON parse error in execute: {e}. Input: {cleaned[:120]}. Make sure your JSON is valid. Example: {{\"op\":\"mesh.primitive_cube_add\",\"kwargs\":{{}}}}"
+        # Try to extract just the JSON portion if there's trailing text
+        json_start = -1
+        for i, char in enumerate(cleaned):
+            if char in '{[':
+                json_start = i
+                break
+        
+        if json_start != -1:
+            # Find the matching closing bracket
+            bracket_stack = []
+            json_end = len(cleaned)
+            for i, char in enumerate(cleaned[json_start:], json_start):
+                if char in '{[':
+                    bracket_stack.append(char)
+                elif char in '}]':
+                    if bracket_stack:
+                        bracket_stack.pop()
+                        if not bracket_stack:
+                            json_end = i + 1
+                            break
+            try:
+                cmd = json.loads(cleaned[json_start:json_end])
+            except json.JSONDecodeError:
+                return f"❌ JSON parse error in execute: {e}. Input: {cleaned[:120]}. Make sure your JSON is valid. Example: {{\"op\":\"mesh.primitive_cube_add\",\"kwargs\":{{}}}}"
+        else:
+            return f"❌ JSON parse error in execute: {e}. Input: {cleaned[:120]}. Make sure your JSON is valid. Example: {{\"op\":\"mesh.primitive_cube_add\",\"kwargs\":{{}}}}"
     
     def _exec_single(single_cmd):
         if not isinstance(single_cmd, dict) or "op" not in single_cmd:
@@ -1366,6 +1423,7 @@ def _react_execute(action_input: str, executed_commands: list, thought: str = ""
                     pass  # If we can't check, proceed with auto-naming
             
             # Auto-name objects after creation (only if AI won't rename manually)
+            created_object_name = None
             if not will_be_renamed:
                 semantic_name = _generate_semantic_object_name(op, thought, target_object, executed_commands)
                 if CONTEXT_DEBUG:
@@ -1373,14 +1431,62 @@ def _react_execute(action_input: str, executed_commands: list, thought: str = ""
                 
                 if semantic_name and rpc:
                     try:
-                        # Small delay to ensure object is created
-                        time.sleep(0.1)
-                        # Rename the active object (should be the newly created one)
+                        # Longer delay to ensure object is created and becomes active
+                        time.sleep(0.2)
+                        
+                        # Get expected object type from operation
+                        expected_base_name = None
+                        if "cube" in op.lower():
+                            expected_base_name = "Cube"
+                        elif "sphere" in op.lower():
+                            expected_base_name = "Sphere"
+                        elif "cylinder" in op.lower():
+                            expected_base_name = "Cylinder"
+                        elif "cone" in op.lower():
+                            expected_base_name = "Cone"
+                        elif "torus" in op.lower():
+                            expected_base_name = "Torus"
+                        elif "plane" in op.lower():
+                            expected_base_name = "Plane"
+                        
+                        # Get scene to find the newly created object
+                        scene = rpc.analyze_scene()
+                        if scene and not scene.get("error") and expected_base_name:
+                            objects = scene.get("objects", [])
+                            # Find the newest object matching the expected type
+                            # Objects are typically listed in creation order, so the last matching one is newest
+                            matching_objects = [obj for obj in objects if obj.get("name", "").startswith(expected_base_name)]
+                            if matching_objects:
+                                newest_obj = matching_objects[-1]  # Last one is newest
+                                newest_name = newest_obj.get("name", "")
+                                
+                                # Get current active object
+                                context = rpc.get_modeling_context()
+                                active = context.get("active_object")
+                                active_name = active.get("name", "") if active else ""
+                                
+                                # If active object is not the newly created one, select the correct one
+                                if active_name != newest_name:
+                                    try:
+                                        # Deselect all first
+                                        rpc.enqueue_op_safe("object.select_all", {"action": "DESELECT"})
+                                        time.sleep(0.05)
+                                        # Select and activate the newly created object by name
+                                        select_code = f"obj = bpy.data.objects.get('{newest_name}'); bpy.context.view_layer.objects.active = obj if obj else None; obj.select_set(True) if obj else None"
+                                        rpc.execute({"code": select_code})
+                                        time.sleep(0.1)
+                                        print(f"[ReAct] Selected newly created object: {newest_name} (was: {active_name})")
+                                    except Exception as e:
+                                        print(f"[ReAct] ⚠️ Could not select new object: {e}")
+                        
+                        # Rename the active object (should now be the newly created one)
                         rename_result = rpc.rename_active_object(semantic_name)
                         if CONTEXT_DEBUG:
                             print(f"[ReAct] Rename result: {rename_result}")
                         if rename_result and rename_result.get("ok"):
-                            print(f"[ReAct] ✅ Auto-named object: {semantic_name}")
+                            old_name = rename_result.get("old_name", "")
+                            print(f"[ReAct] ✅ Auto-named object: {old_name} -> {semantic_name}")
+                            created_object_name = semantic_name
                         else:
                             error_msg = rename_result.get("error", "Unknown error") if rename_result else "No result"
                             print(f"[ReAct] ⚠️ Rename failed: {error_msg}")
@@ -1396,6 +1502,46 @@ def _react_execute(action_input: str, executed_commands: list, thought: str = ""
             else:
                 if CONTEXT_DEBUG:
                     print(f"[ReAct] Skipping auto-naming - AI will rename manually in next command")
+            
+            # Phase 1: Track object creation/modification in Focus Stack
+            if FOCUS_STACK_AVAILABLE and rpc is not None:
+                try:
+                    # Check if this is an object creation operation
+                    creation_ops = ["mesh.primitive_cube_add", "mesh.primitive_uv_sphere_add", 
+                                   "mesh.primitive_ico_sphere_add", "mesh.primitive_cylinder_add",
+                                   "mesh.primitive_cone_add", "mesh.primitive_torus_add",
+                                   "mesh.primitive_plane_add", "mesh.primitive_grid_add"]
+                    
+                    if op in creation_ops:
+                        # Object was created - get its name
+                        if not created_object_name and rpc:
+                            try:
+                                # Try to get active object name
+                                context = rpc.get_modeling_context()
+                                active = context.get("active_object")
+                                if active:
+                                    created_object_name = active.get("name")
+                            except:
+                                pass
+                        
+                        if created_object_name:
+                            rpc.update_focus_stack("created", created_object_name, "")
+                            print(f"[Focus Stack] Tracked creation: {created_object_name}")
+                    else:
+                        # Object was modified - get active object name
+                        if rpc:
+                            try:
+                                context = rpc.get_modeling_context()
+                                active = context.get("active_object")
+                                if active:
+                                    modified_name = active.get("name")
+                                    if modified_name:
+                                        rpc.update_focus_stack("modified", modified_name, "")
+                                        print(f"[Focus Stack] Tracked modification: {modified_name}")
+                            except:
+                                pass
+                except Exception as e:
+                    print(f"[Focus Stack] Error tracking operation: {e}")
             
             return f"✅ Queued {op}: {result}"
         except Exception as e:
@@ -1428,6 +1574,135 @@ def gpt_to_json_react(transcript: str, modeling_context=None, mesh_analysis=None
         print("⚠️ ReAct: Missing Google Gemini API key.")
         return None
     
+    # Phase 2: Language Translator - Parse intent and create TaskSpec
+    task_spec = None
+    print(f"[LanguageTranslator] Debug: Checking conditions...")
+    print(f"   ENABLE_LANGUAGE_TRANSLATOR: {ENABLE_LANGUAGE_TRANSLATOR}")
+    print(f"   LANGUAGE_TRANSLATOR_AVAILABLE: {LANGUAGE_TRANSLATOR_AVAILABLE}")
+    print(f"   provider: {provider}")
+    print(f"   provider.startswith('openai'): {provider.startswith('openai') if provider else False}")
+    print(f"   has openai_key: {bool(openai_key)}")
+    
+    if ENABLE_LANGUAGE_TRANSLATOR and LANGUAGE_TRANSLATOR_AVAILABLE and provider.startswith("openai") and openai_key:
+        print("[LanguageTranslator] ✅ All conditions met, attempting to parse intent...")
+        try:
+            from openai import OpenAI
+            print("[LanguageTranslator] ✅ OpenAI imported successfully")
+            openai_client = OpenAI(api_key=openai_key)
+            print("[LanguageTranslator] ✅ OpenAI client created")
+            translator = get_language_translator(openai_client)
+            print("[LanguageTranslator] ✅ Language Translator instance created")
+            
+            # Get selected objects and active object from modeling context
+            selected_objects = []
+            active_object = None
+            if modeling_context and not modeling_context.get("error"):
+                selected = modeling_context.get("selected_objects", [])
+                selected_objects = [o.get("name", "") for o in selected if o.get("name")]
+                active = modeling_context.get("active_object")
+                if active:
+                    active_object = active.get("name")
+            
+            print(f"[LanguageTranslator] Calling translate() with transcript: '{transcript[:50]}...'")
+            print(f"   selected_objects: {selected_objects}")
+            print(f"   active_object: {active_object}")
+            
+            # Translate transcript to TaskSpec
+            task_spec = translator.translate(
+                transcript=transcript,
+                scene_context=scene_analysis,
+                selected_objects=selected_objects,
+                active_object=active_object,
+                modeling_context=modeling_context
+            )
+            
+            print("[LanguageTranslator] ✅ translate() completed successfully")
+            
+            # Log TaskSpec for debugging
+            print(f"[LanguageTranslator] ✅ Parsed intent:")
+            print(f"   Task Type: {task_spec.task_type.value}")
+            print(f"   User Intent: {task_spec.user_intent}")
+            print(f"   Target Objects: {task_spec.target_objects}")
+            if task_spec.target_concept:
+                print(f"   Target Concept: {task_spec.target_concept}")
+            if task_spec.inferred_operations:
+                print(f"   Inferred Operations: {len(task_spec.inferred_operations)}")
+                for i, op in enumerate(task_spec.inferred_operations[:3], 1):  # Show first 3
+                    print(f"      {i}. {op.action} on {op.target}: {op.reason[:60]}...")
+            print(f"   Confidence: {task_spec.confidence:.2f}")
+            if task_spec.ambiguities:
+                print(f"   Ambiguities: {', '.join(task_spec.ambiguities)}")
+            
+            # Use resolved target objects from TaskSpec if available
+            if task_spec.target_objects:
+                # Update target_object for downstream processing
+                if not target_object and len(task_spec.target_objects) == 1:
+                    target_object = task_spec.target_objects[0]
+                    print(f"[LanguageTranslator] Using resolved target: {target_object}")
+        except Exception as e:
+            print(f"[LanguageTranslator] ⚠️ Failed to parse intent: {e}")
+            import traceback
+            traceback.print_exc()  # Always print traceback for debugging
+            task_spec = None
+    else:
+        print("[LanguageTranslator] ❌ Conditions not met, skipping Language Translator")
+        if not ENABLE_LANGUAGE_TRANSLATOR:
+            print("   Reason: ENABLE_LANGUAGE_TRANSLATOR is False")
+        if not LANGUAGE_TRANSLATOR_AVAILABLE:
+            print("   Reason: LANGUAGE_TRANSLATOR_AVAILABLE is False (import failed)")
+        if not provider.startswith("openai"):
+            print(f"   Reason: provider '{provider}' does not start with 'openai'")
+        if not openai_key:
+            print("   Reason: openai_key is empty or None")
+    
+    # Phase 1: Focus Stack integration - resolve ambiguous references
+    focus_resolution = None
+    resolved_transcript = transcript
+    if FOCUS_STACK_AVAILABLE and rpc is not None:
+        # Check for ambiguous references
+        has_ambiguous_ref = bool(re.search(r'\b(it|this|that|them|these|those|they|all of them)\b', transcript, re.IGNORECASE))
+        if has_ambiguous_ref:
+            try:
+                # Get focus context from Blender
+                focus_context = rpc.get_focus_context()
+                if focus_context:
+                    # Use Focus Stack to resolve references
+                    focus_stack = get_focus_stack()
+                    focus_resolution = focus_stack.resolve_reference(
+                        selected_objects=focus_context.get("selected_objects", []),
+                        active_object=focus_context.get("active_object")
+                    )
+                    
+                    if focus_resolution and focus_resolution.get("resolved_objects"):
+                        resolved_objects = focus_resolution["resolved_objects"]
+                        resolution_method = focus_resolution.get("resolution_method", "unknown")
+                        confidence = focus_resolution.get("confidence", 0.0)
+                        
+                        print(f"[Focus Stack] Resolved reference: '{resolved_objects}' via {resolution_method} (confidence: {confidence:.2f})")
+                        
+                        # Replace ambiguous references with resolved object names in transcript
+                        # This helps GPT understand what "it" refers to
+                        if len(resolved_objects) == 1:
+                            # Single object - replace "it", "this", "that"
+                            resolved_transcript = re.sub(
+                                r'\b(it|this|that)\b',
+                                resolved_objects[0],
+                                transcript,
+                                flags=re.IGNORECASE
+                            )
+                        elif len(resolved_objects) > 1:
+                            # Multiple objects - replace "them", "these", "those", "they"
+                            objects_str = ", ".join(resolved_objects)
+                            resolved_transcript = re.sub(
+                                r'\b(them|these|those|they|all of them)\b',
+                                objects_str,
+                                transcript,
+                                flags=re.IGNORECASE
+                            )
+            except Exception as e:
+                print(f"[Focus Stack] Error resolving reference: {e}")
+                focus_resolution = None
+    
     # Get reference knowledge with step-by-step templates
     ref_knowledge = _get_reference_knowledge(target_object) if target_object else None
     
@@ -1436,7 +1711,7 @@ def gpt_to_json_react(transcript: str, modeling_context=None, mesh_analysis=None
         "Respond ONLY with blocks containing:",
         "Thought: <reasoning>",
         "Action: <execute|observe|finish|plan>",
-        "Action Input: <JSON or observation request>",
+        "Action Input: <ONLY valid JSON for execute actions. No comments, no explanations, no trailing text. Just the JSON object or array. Example: {\"op\":\"mesh.primitive_cube_add\",\"kwargs\":{}}>",
         "",
         "Action rules:",
         "- plan: Break down complex tasks into step-by-step plan (use this FIRST for multi-step tasks)",
@@ -1454,7 +1729,7 @@ def gpt_to_json_react(transcript: str, modeling_context=None, mesh_analysis=None
         "1. DO NOT observe more than 2 times in a row. After observing, you MUST execute an action.",
         "2. If an operation fails, try a DIFFERENT approach, don't just observe again.",
         "3. If you're stuck, simplify your approach or finish with what you have.",
-        "4. Always provide valid JSON in Action Input for execute actions.",
+        "4. Action Input for execute actions MUST contain ONLY valid JSON - no comments, no explanations, no trailing text after the closing bracket.",
         "5. For complex tasks, start with a PLAN action to outline steps before executing.",
         "",
         "--- ADVANCED BLENDER OPERATIONS (USE THESE FOR DETAILED OBJECTS) ---",
@@ -1491,6 +1766,38 @@ def gpt_to_json_react(transcript: str, modeling_context=None, mesh_analysis=None
         "- transform.rotate - Rotate objects/vertices",
         "- transform.resize - Scale objects/vertices",
         "- transform.shrink_fatten - Shrink/fatten selected geometry",
+        "",
+        "--- MATERIAL OPERATIONS (CRITICAL - BLENDER 2.8+ API) ---",
+        "CRITICAL: Blender 2.8+ uses Principled BSDF nodes, NOT diffuse_color!",
+        "",
+        "DO NOT USE (OLD API - DOESN'T WORK):",
+        "  bpy.data.materials['Material'].diffuse_color = (1, 0, 0, 1)  ❌ WRONG!",
+        "",
+        "CORRECT WAY (Blender 2.8+):",
+        "1. Create material: mat = bpy.data.materials.new(name='RedMaterial')",
+        "2. Enable nodes: mat.use_nodes = True",
+        "3. Get BSDF: bsdf = mat.node_tree.nodes.get('Principled BSDF')",
+        "4. Set Base Color: bsdf.inputs['Base Color'].default_value = (1.0, 0.0, 0.0, 1.0)",
+        "",
+        "COMPLETE EXAMPLE for red material:",
+        "import bpy",
+        "mat = bpy.data.materials.new(name='RedMaterial')",
+        "mat.use_nodes = True",
+        "bsdf = mat.node_tree.nodes.get('Principled BSDF')",
+        "if bsdf and 'Base Color' in bsdf.inputs:",
+        "    bsdf.inputs['Base Color'].default_value = (1.0, 0.0, 0.0, 1.0)  # Red",
+        "for obj in bpy.context.selected_objects:",
+        "    if obj.type == 'MESH':",
+        "        if not obj.data.materials:",
+        "            obj.data.materials.append(mat)",
+        "        else:",
+        "            obj.data.materials[0] = mat",
+        "",
+        "IMPORTANT:",
+        "- Always check if input exists: 'Base Color' in bsdf.inputs",
+        "- Use RGBA tuple: (R, G, B, A) where values are 0.0-1.0",
+        "- Combine material creation AND assignment in ONE execute call",
+        "- Ensure viewport is in Material Preview mode to see materials",
         "",
         "WORKFLOW FOR DETAILED OBJECTS:",
         "1. Create base primitive (cube, cylinder, etc.)",
@@ -1795,6 +2102,18 @@ def gpt_to_json_react(transcript: str, modeling_context=None, mesh_analysis=None
         if CONTEXT_DEBUG:
             print(f"[ReAct] ✅ Added scene analysis to system prompt ({summary.get('total_objects', 0)} objects)")
     
+    # Phase 1: Add Focus Stack resolution info to system prompt
+    if focus_resolution and focus_resolution.get("resolved_objects"):
+        system_prompt.append(f"\n--- Reference Resolution (Focus Stack) ---")
+        system_prompt.append(f"Ambiguous references in your command have been resolved:")
+        system_prompt.append(f"  Resolved objects: {', '.join(focus_resolution['resolved_objects'])}")
+        system_prompt.append(f"  Resolution method: {focus_resolution.get('resolution_method', 'unknown')}")
+        system_prompt.append(f"  Confidence: {focus_resolution.get('confidence', 0.0):.2f}")
+        system_prompt.append(f"  Explanation: {focus_resolution.get('explanation', '')}")
+        system_prompt.append(f"\nOriginal command: '{transcript}'")
+        system_prompt.append(f"Resolved command: '{resolved_transcript}'")
+        system_prompt.append(f"\nUse the resolved object names in your operations.")
+    
     system_prompt_text = "\n".join(system_prompt)
     
     if CONTEXT_DEBUG:
@@ -1829,8 +2148,8 @@ def gpt_to_json_react(transcript: str, modeling_context=None, mesh_analysis=None
                 "content": msg_content
             })
     
-    # Add current task with optional screenshot
-    task_content = f"Task: {transcript}\nUse ReAct format. Begin reasoning."
+    # Add current task with optional screenshot (use resolved transcript if available)
+    task_content = f"Task: {resolved_transcript}\nUse ReAct format. Begin reasoning."
     if screenshot_data:
         user_content = [
             {"type": "text", "text": task_content},
@@ -1951,9 +2270,9 @@ def gpt_to_json_react(transcript: str, modeling_context=None, mesh_analysis=None
                     print(f"[ReAct] ⚠️ OpenAI fallback also failed: {e2}")
                     output = None
         
-        if not output:
-            print(f"⚠️ ReAct AI error: No response (tried {provider if not using_openai_fallback else 'OpenAI'})")
-            return None
+            if not output:
+                print(f"⚠️ ReAct AI error: No response (tried {provider if not using_openai_fallback else 'OpenAI'})")
+                return None
         
         if CONTEXT_DEBUG:
             print(f"[ReAct] Iteration {iteration+1}: Received response ({len(output):,} characters)")
@@ -1962,11 +2281,39 @@ def gpt_to_json_react(transcript: str, modeling_context=None, mesh_analysis=None
         
         thought_match = re.search(r"Thought:\s*(.+?)(?=Action:|$)", output, re.DOTALL)
         action_match = re.search(r"Action:\s*(\w+)", output)
-        action_input_match = re.search(r"Action Input:\s*(.+)", output, re.DOTALL)
+        action_input_match = re.search(r"Action Input:\s*(.+?)(?=\n\n|\nAction:|$)", output, re.DOTALL)
         
         thought = thought_match.group(1).strip() if thought_match else ""
         action = action_match.group(1).strip().lower() if action_match else ""
-        action_input = action_input_match.group(1).strip() if action_input_match else ""
+        action_input_raw = action_input_match.group(1).strip() if action_input_match else ""
+        
+        # Extract only the JSON portion (handles comments and trailing text)
+        action_input = ""
+        if action_input_raw:
+            # Find the first { or [ which starts the JSON
+            json_start = -1
+            for i, char in enumerate(action_input_raw):
+                if char in '{[':
+                    json_start = i
+                    break
+            
+            if json_start != -1:
+                # Find the matching closing bracket
+                bracket_stack = []
+                json_end = len(action_input_raw)
+                for i, char in enumerate(action_input_raw[json_start:], json_start):
+                    if char in '{[':
+                        bracket_stack.append(char)
+                    elif char in '}]':
+                        if bracket_stack:
+                            bracket_stack.pop()
+                            if not bracket_stack:
+                                json_end = i + 1
+                                break
+                action_input = action_input_raw[json_start:json_end].strip()
+            else:
+                # No JSON found, use as-is (for observe actions)
+                action_input = action_input_raw
         
         # Track action history for loop detection
         action_history.append(action)
@@ -1997,7 +2344,37 @@ def gpt_to_json_react(transcript: str, modeling_context=None, mesh_analysis=None
             continue
         elif action == "execute":
             observation = _react_execute(action_input, executed_commands, thought=thought, target_object=target_object)
-            if "✅" in observation:  # Success
+            
+            # Track failed execute attempts (when observation contains error markers)
+            if "❌" in observation:
+                failed_execute_count = getattr(gpt_to_json_react, '_failed_execute_count', 0) + 1
+                gpt_to_json_react._failed_execute_count = failed_execute_count
+                
+                # If 3+ consecutive failed execute attempts, force a different approach
+                if failed_execute_count >= 3:
+                    print(f"[ReAct] ⚠️ Detection: {failed_execute_count} consecutive failed EXECUTE attempts")
+                    error_summary = f"⚠️ CRITICAL: You have failed {failed_execute_count} times in a row trying to execute commands. The last error was: {observation[:200]}. You MUST:\n"
+                    error_summary += "1. Check the exact JSON format required (must be valid JSON with 'op' and optional 'kwargs')\n"
+                    error_summary += "2. Use simpler, single-step commands instead of complex multi-step JSON\n"
+                    error_summary += "3. If applying materials, use: {\"op\":\"execute\",\"kwargs\":{\"code\":\"import bpy\\nmat = bpy.data.materials.get('RedMaterial')\\nif mat:\\n    bpy.context.active_object.data.materials.append(mat)\"}}\n"
+                    error_summary += "4. If still stuck, use FINISH to end the task\n"
+                    observation = error_summary
+                    # Reset counter after warning
+                    gpt_to_json_react._failed_execute_count = 0
+            else:
+                # Reset counter on success
+                gpt_to_json_react._failed_execute_count = 0
+            
+            # Add observation to conversation (both success and failure)
+            if "❌" in observation:
+                # Error case - make it very clear
+                print(f"[ReAct] ❌ Execute failed: {observation[:200]}...")
+                conversation.append({
+                    "role": "user",
+                    "content": f"Observation: {observation}\n\n⚠️ CRITICAL: Your last EXECUTE action failed. Review the error above and fix your JSON format. Use simple, valid JSON like: {{\"op\":\"execute\",\"kwargs\":{{\"code\":\"import bpy\\nmat = bpy.data.materials.get('RedMaterial')\\nif mat:\\n    bpy.context.active_object.data.materials.append(mat)\"}}}}"
+                })
+                continue
+            elif "✅" in observation:  # Success
                 last_execute_iteration = iteration
                 # Reset finish attempt counter since AI is taking action
                 consecutive_finish_attempts = 0
@@ -2194,8 +2571,12 @@ def gpt_to_json_react(transcript: str, modeling_context=None, mesh_analysis=None
             summary = action_input
             
             # MANDATORY QUALITY ASSESSMENT before finishing
-            quality_check_passed = False
-            if target_object and rpc:
+            # BUT: Skip quality check for simple creation commands without target_object
+            # Simple commands like "add a sphere" don't need quality validation
+            quality_check_passed = True  # Default to passed for simple commands
+            if not target_object:
+                print(f"[ReAct] ✅ Skipping quality check (no target object specified - simple command)")
+            elif target_object and rpc:
                 try:
                     print(f"[ReAct] 🔍 Performing mandatory quality assessment before finishing...")
                     assessment = rpc.assess_object_quality(target_object)
@@ -3050,7 +3431,7 @@ def try_local_rules(text: str):
                         break
             return {"op": op, "kwargs": kwargs}
 
-        # Helper to check if key matches (handles plurals)
+        # Helper to check if key matches (handles plurals and articles)
         def key_matches(key, text):
             if key in text:
                 return True
@@ -3059,10 +3440,16 @@ def try_local_rules(text: str):
                 return True
             if not key.endswith("s") and (key + "s") in text:
                 return True
-            # Handle multi-word keys (e.g., "uv sphere" matches "uv spheres")
+            # Handle multi-word keys (e.g., "uv sphere" matches "sphere" or "uv spheres")
             if " " in key:
+                # Extract the main object word (last word)
+                main_word = key.rsplit(" ", 1)[1]
+                # Check if main word matches (handles "add a sphere" matching "uv sphere")
+                if main_word in text or (main_word + "s") in text:
+                    return True
+                # Also check if base word matches
                 base = key.rsplit(" ", 1)[0]
-                if base in text and ("sphere" in text or "spheres" in text):
+                if base in text and main_word in text:
                     return True
             return False
 
@@ -3937,7 +4324,7 @@ if __name__ == "__main__":
                 if VERBOSE_DEBUG:
                     print(f"[DEBUG] Error reading text queue: {e}")
             return None
-        
+
         while True:
             try:
                 # First, check for typed text commands (priority over voice)
@@ -3982,30 +4369,31 @@ if __name__ == "__main__":
                         continue
                     print("📝 Transcript ->", text, flush=True)
 
-                if rpc is not None:
-                    try:
-                        rpc.start_voice_command()
-                    except Exception:
-                        pass
-                    
-                    try:
-                        super_state = rpc.get_super_mode_state()
-                        SUPER_MODE_TARGET = super_state.get("target_object", "")
-                        USE_REACT_REASONING = bool(super_state.get("use_react", False))
-                        if SUPER_MODE_TARGET:
-                            print(f"🎯 Modeling target: {SUPER_MODE_TARGET}")
-                        if USE_REACT_REASONING:
-                            print("[ReAct] Iterative reasoning enabled")
-                    except Exception:
+                    if rpc is not None:
+                        try:
+                            rpc.start_voice_command()
+                        except Exception:
+                            pass
+                        
+                        try:
+                            super_state = rpc.get_super_mode_state()
+                            SUPER_MODE_TARGET = super_state.get("target_object", "")
+                            USE_REACT_REASONING = bool(super_state.get("use_react", False))
+                            if SUPER_MODE_TARGET:
+                                print(f"🎯 Modeling target: {SUPER_MODE_TARGET}")
+                            if USE_REACT_REASONING:
+                                print("[ReAct] Iterative reasoning enabled")
+                        except Exception:
+                            SUPER_MODE_TARGET = ""
+                            USE_REACT_REASONING = False
+                    else:
                         SUPER_MODE_TARGET = ""
                         USE_REACT_REASONING = False
-                else:
-                    SUPER_MODE_TARGET = ""
-                    USE_REACT_REASONING = False
 
-                has_references = bool(re.search(r'\b(them|it|these|those|they|all of them|each of them)\b', text, re.IGNORECASE))
-                command_parts = _split_multiple_commands(text)
+                    has_references = bool(re.search(r'\b(them|it|these|those|they|all of them|each of them)\b', text, re.IGNORECASE))
+                    command_parts = _split_multiple_commands(text)
 
+                # Common processing for both typed and voice commands
                 context_cache = {"modeling": None, "mesh": None, "scene": None, "screenshot": None}
 
                 def ensure_context():
@@ -4082,6 +4470,27 @@ if __name__ == "__main__":
                                 executed = len(react_result.get("commands", []))
                                 iterations = react_result.get("iterations", "?")
                                 print(f"[ReAct] Executed {executed} commands in {iterations} iterations")
+                                
+                                # Phase 1: Update Focus Stack with command history
+                                if FOCUS_STACK_AVAILABLE and rpc is not None:
+                                    try:
+                                        # Get objects that were modified/created
+                                        context = rpc.get_modeling_context()
+                                        active = context.get("active_object")
+                                        target_objects = []
+                                        if active:
+                                            target_objects.append(active.get("name", ""))
+                                        
+                                        # Get operations from executed commands
+                                        operations = [cmd.get("op", "") for cmd in react_result.get("commands", [])]
+                                        
+                                        # Update Focus Stack
+                                        if target_objects:
+                                            rpc.update_focus_stack("modified", target_objects[0], text)
+                                            print(f"[Focus Stack] Recorded command: '{text}' -> {target_objects}")
+                                    except Exception as e:
+                                        print(f"[Focus Stack] Error recording command: {e}")
+                                
                                 continue
                             else:
                                 print("[ReAct] No plan returned, falling back to standard GPT")
