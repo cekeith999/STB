@@ -31,19 +31,22 @@ if _script_dir not in sys.path:
     sys.path.insert(0, _script_dir)
 
 try:
-    from agents import get_language_translator
+    from agents import get_language_translator, get_orchestrator
     LANGUAGE_TRANSLATOR_AVAILABLE = True
-    print("[LanguageTranslator] ✅ Import successful")
+    ORCHESTRATOR_AVAILABLE = True
+    print("[MultiAgent] ✅ Imports successful (Language Translator, Orchestrator)")
 except ImportError as e:
     LANGUAGE_TRANSLATOR_AVAILABLE = False
-    print(f"[Warning] Language Translator not available - import failed: {e}")
+    ORCHESTRATOR_AVAILABLE = False
+    print(f"[Warning] Multi-agent system not available - import failed: {e}")
     print(f"[Warning] Script dir: {_script_dir}")
     print(f"[Warning] Python path: {sys.path[:3]}...")  # Show first 3 entries
     import traceback
     traceback.print_exc()
 except Exception as e:
     LANGUAGE_TRANSLATOR_AVAILABLE = False
-    print(f"[Warning] Language Translator not available - unexpected error: {e}")
+    ORCHESTRATOR_AVAILABLE = False
+    print(f"[Warning] Multi-agent system not available - unexpected error: {e}")
     import traceback
     traceback.print_exc()
 
@@ -463,6 +466,7 @@ RPC_URL = "http://127.0.0.1:8765/RPC2"
 # Feature flags / verbosity
 ENABLE_GPT_FALLBACK = True   # GPT-4o fallback for natural language understanding
 ENABLE_LANGUAGE_TRANSLATOR = True  # Phase 2: Use Language Translator agent for intent parsing
+ENABLE_ORCHESTRATOR = True  # Phase 3: Use Orchestrator (Language Translator + Code Generator)
 VERBOSE_DEBUG = False        # debug prints for import matcher (set True for debugging)
 CONTEXT_DEBUG = True         # Show detailed context analysis (mesh, scene, screenshots) at each step
 
@@ -1557,6 +1561,57 @@ def _react_execute(action_input: str, executed_commands: list, thought: str = ""
         return " | ".join(observations)
     else:
         return _exec_single(cmd)
+
+
+def process_with_orchestrator(transcript: str, rpc_client) -> bool:
+    """
+    Process command through the multi-agent orchestrator (Phase 3).
+    
+    Returns:
+        True if command was processed successfully, False otherwise
+    """
+    if not ENABLE_ORCHESTRATOR or not ORCHESTRATOR_AVAILABLE:
+        return False
+    
+    # Get OpenAI API key
+    provider, openai_key, gemini_key = _get_ai_model_config()
+    if not provider.startswith("openai") or not openai_key:
+        print("[Orchestrator] ❌ OpenAI API key required")
+        return False
+    
+    try:
+        from agents import get_orchestrator
+        orchestrator = get_orchestrator(openai_key)
+        
+        print(f"[Orchestrator] Processing: '{transcript}'")
+        result = orchestrator.process_command(
+            transcript=transcript,
+            rpc_client=rpc_client,
+            include_evaluation=True  # Phase 4: Enable semantic evaluation
+        )
+        
+        if result.get("success"):
+            print(f"[Orchestrator] ✅ Command processed successfully")
+            steps_executed = result.get("steps_executed", [])
+            if steps_executed:
+                print(f"[Orchestrator] ✅ Executed {len(steps_executed)} steps iteratively")
+            if result.get("final_evaluation"):
+                eval_score = result["final_evaluation"].get("semantic_match_score", 0)
+                print(f"[Orchestrator] ✅ Final evaluation score: {eval_score:.2f}")
+            return True
+        else:
+            errors = result.get("errors", [])
+            print(f"[Orchestrator] ❌ Command failed: {errors}")
+            steps_executed = result.get("steps_executed", [])
+            if steps_executed:
+                print(f"[Orchestrator] ⚠️ Partial completion: {len(steps_executed)} steps executed before failure")
+            return False
+            
+    except Exception as e:
+        print(f"[Orchestrator] ❌ Error: {e}")
+        import traceback
+        traceback.print_exc()
+        return False
 
 
 def gpt_to_json_react(transcript: str, modeling_context=None, mesh_analysis=None, scene_analysis=None, target_object="", screenshot_data=None):
@@ -4439,7 +4494,20 @@ if __name__ == "__main__":
                     if local_cmds:
                         all_commands = local_cmds
                     else:
-                        # Step 3: Only use API (ReAct or GPT) if local rules failed
+                        # Step 3: Use current build (orchestrator or current ReAct)
+                        orchestrator_success = False
+                        if ENABLE_ORCHESTRATOR and ORCHESTRATOR_AVAILABLE and rpc is not None:
+                            try:
+                                orchestrator_success = process_with_orchestrator(text, rpc)
+                                if orchestrator_success:
+                                    print("[Orchestrator] ✅ Command completed via Orchestrator")
+                                    continue  # Skip fallback
+                            except Exception as e:
+                                print(f"[Orchestrator] Error: {e}")
+                                import traceback
+                                traceback.print_exc()
+                        
+                        # Step 4: Only use API (ReAct or GPT) if Orchestrator failed
                         react_attempted = False
                         
                         # Check if ReAct is enabled (only for API calls)
