@@ -8,8 +8,10 @@ the current ad-hoc approach in prompts.
 import sys
 import os
 
-# Add current directory to path
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+# Add repo root to path (parent of tests/)
+_repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _repo_root not in sys.path:
+    sys.path.insert(0, _repo_root)
 
 from analyzers.focus_stack import get_focus_stack, FocusStack
 

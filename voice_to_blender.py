@@ -2764,7 +2764,7 @@ def gpt_to_json_react(transcript: str, modeling_context=None, mesh_analysis=None
                 if addon_path not in sys.path:
                     sys.path.insert(0, addon_path)
                 
-                from success_library import BlenderSuccessLibrary
+                from lib.success_library import BlenderSuccessLibrary
                 library = BlenderSuccessLibrary()
                 
                 # Check if this should be auto-detected as success

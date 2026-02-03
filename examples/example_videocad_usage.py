@@ -8,6 +8,11 @@ speech-to-blender workflow.
 import sys
 import os
 
+# Ensure repo root is on path (for videocad_integration)
+_repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _repo_root not in sys.path:
+    sys.path.insert(0, _repo_root)
+
 # Add VideoCAD to path
 sys.path.append(r"C:\Users\Jordan\Downloads\myVideoCAD\myVideoCAD-main")
 

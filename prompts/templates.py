@@ -63,12 +63,78 @@ RULES:
 """
 
 
+PLANNING_PROMPT = """You are a Planning Agent for 3D modeling. Your job is to break down complex objects into detailed, step-by-step plans.
+
+USER REQUEST:
+{user_intent}
+
+TARGET CONCEPT:
+{target_concept}
+
+TARGET PROPERTIES:
+{target_properties}
+
+CURRENT SCENE STATE:
+{scene_context}
+
+Your task is to create a COMPREHENSIVE plan that breaks down the object into ALL its parts and details. 
+For example, an iPhone includes: body, screen, buttons (volume, power, mute), speakers (top and bottom), 
+camera (front and back), charging port, SIM card tray, etc. DO NOT MISS ANY DETAILS.
+
+OUTPUT FORMAT (JSON only):
+{{
+    "plan": [
+        {{
+            "step_number": 1,
+            "description": "Create the main body of the iPhone",
+            "operation": "create_primitive",
+            "target_object": "iPhone Body",
+            "details": "Rectangular cube with iPhone proportions (0.7 x 1.5 x 0.07 scale)",
+            "dependencies": []
+        }},
+        {{
+            "step_number": 2,
+            "description": "Bevel the edges of the body",
+            "operation": "bevel",
+            "target_object": "iPhone Body",
+            "details": "Round the edges with bevel modifier, offset 0.05",
+            "dependencies": [1]
+        }},
+        {{
+            "step_number": 3,
+            "description": "Add the screen",
+            "operation": "create_primitive",
+            "target_object": "iPhone Screen",
+            "details": "Flat plane positioned on front face of body",
+            "dependencies": [1]
+        }}
+    ],
+    "total_steps": 3,
+    "estimated_complexity": "medium"
+}}
+
+RULES:
+1. Break down EVERY part of the object - do not miss details like buttons, speakers, ports, etc.
+2. Each step should be a single, focused operation
+3. List dependencies (which steps must complete before this one)
+4. Be specific about dimensions, positions, and details
+5. Order steps logically (create base first, then add details)
+6. For complex objects, include ALL visible components
+"""
+
+
 CODE_GENERATOR_PROMPT = """You are a Blender Python Code Generator.
 
-You receive a structured TaskSpec and generate executable Blender Python code.
+You receive a SINGLE step from a plan and generate code for ONLY that step.
 
-TASK SPECIFICATION:
-{task_spec_json}
+CURRENT STEP:
+{step_description}
+
+STEP DETAILS:
+{step_details}
+
+TARGET OBJECT:
+{target_object}
 
 CURRENT GEOMETRIC STATE:
 {geometry_json}
@@ -76,24 +142,48 @@ CURRENT GEOMETRIC STATE:
 AVAILABLE OPERATIONS REFERENCE:
 {blender_api_examples}
 
+CRITICAL RULES FOR POSITIONING AND SIZING:
+1. **ALWAYS use the CURRENT GEOMETRIC STATE to position and scale new objects**
+2. **If creating a component (button, camera, etc.) relative to a main object:**
+   - First, get the main object's location and scale from the geometric state
+   - Calculate the component's position based on the main object's dimensions
+   - Scale the component appropriately relative to the main object
+   - Example: If main body is at (0,0,0) with scale (0.7, 1.5, 0.07), a button should be:
+     * Positioned on the side at appropriate Y position (e.g., body height * 0.3)
+     * Scaled relative to body (e.g., button size = body width * 0.05)
+3. **If modifying an existing object:**
+   - First check if it exists: `obj = bpy.data.objects.get("ObjectName")`
+   - If it exists, select it and modify it
+   - Use its current location/scale as reference
+4. **Position calculations:**
+   - Use the bounding box size from mesh analysis to determine object dimensions
+   - Position new objects relative to existing ones using their locations and scales
+   - Example: `button_location = (body_location[0] + body_scale[0]/2, body_location[1] + offset, body_location[2])`
+5. **Scale calculations:**
+   - Make components visible but proportional
+   - Buttons: typically 2-5% of body width
+   - Camera modules: typically 5-10% of body width
+   - Speakers: typically 3-8% of body width
+   - Use the main object's scale as reference
+
 OUTPUT FORMAT:
 Return ONLY a JSON object with this structure:
 {{
-    "code": "# Blender Python code here\\nimport bpy\\n...",
-    "operations_summary": ["List of operations this code performs"],
-    "expected_changes": ["What should change after execution"],
-    "requires_mode": "OBJECT|EDIT|SCULPT",
-    "warnings": ["Any potential issues"]
+    "code": "# Blender Python code for this ONE step\\nimport bpy\\n...",
+    "operation": "what this code does",
+    "target_object": "object name this affects",
+    "expected_result": "what should exist after this step"
 }}
 
 RULES:
-1. Generate complete, executable Blender Python code
-2. Always include proper context management (mode switching if needed)
-3. Use the exact object names from the TaskSpec
-4. Include error handling for missing objects
-5. Use bpy.ops for standard operations, bpy.data for direct manipulation
-6. Comment the code explaining each step
-7. Prefer modifiers over destructive mesh edits when appropriate
+1. Generate code for ONLY this single step
+2. **ALWAYS check CURRENT GEOMETRIC STATE for object positions and sizes**
+3. **ALWAYS calculate positions and scales relative to existing objects**
+4. **ALWAYS make components visible and properly sized (not too small)**
+5. Always check if objects exist before creating
+6. Use bpy.ops for standard operations, bpy.data for direct manipulation
+7. Include proper mode switching if needed
+8. Comment the code explaining position/scale calculations
 """
 
 
@@ -114,9 +204,24 @@ TARGET PROPERTIES:
 OPERATIONS THAT WERE PERFORMED:
 {operations_performed}
 
-Now examine the image and answer these specific questions:
+CRITICAL EVALUATION INSTRUCTIONS:
+1. **LOOK CAREFULLY** - Features may be small but should be visible
+2. **Check for ALL components** - Look for buttons, cameras, speakers, ports, etc.
+3. **Examine from multiple angles mentally** - Some features may be on sides/back
+4. **Be specific** - If you say "missing buttons", specify which buttons (volume, power, etc.)
+5. **Consider scale** - Small details should still be visible if properly created
+
+Now examine the image CAREFULLY and answer these specific questions:
 
 {evaluation_questions}
+
+ADDITIONAL CHECKS:
+- Can you see buttons on the sides? (Look carefully - they may be small)
+- Can you see camera modules? (Front and/or back)
+- Can you see speaker grilles? (Top and/or bottom)
+- Can you see ports? (Charging port, etc.)
+- Are components properly positioned? (Not floating, not inside the body)
+- Are components properly sized? (Visible but proportional)
 
 OUTPUT FORMAT (JSON only):
 {{
@@ -128,14 +233,14 @@ OUTPUT FORMAT (JSON only):
         }}
     }},
     "issues_found": [
-        "List specific problems with the result"
+        "List specific problems with the result. Be specific: 'Missing volume buttons on left side' not just 'missing buttons'"
     ],
     "suggested_refinements": [
         {{
             "action": "operation_name",
             "target": "object_name",
             "parameters": {{}},
-            "reason": "Why this would improve the result"
+            "reason": "Why this would improve the result. Be specific about what's missing or wrong."
         }}
     ],
     "should_retry": true|false

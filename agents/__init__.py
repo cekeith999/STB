@@ -90,6 +90,12 @@ def get_language_translator(openai_client):
     from agents.language_translator import LanguageTranslator
     return LanguageTranslator(openai_client)
 
+# Lazy import for Orchestrator (to avoid circular imports)
+def get_orchestrator(api_key: str):
+    """Get Orchestrator instance (lazy import)."""
+    from agents.orchestrator import get_orchestrator as _get_orchestrator
+    return _get_orchestrator(api_key)
+
 __all__ = [
     'TaskType',
     'InferredOperation',
@@ -98,4 +104,5 @@ __all__ = [
     'ExecutionResult',
     'EvaluationResult',
     'get_language_translator',
+    'get_orchestrator',
 ]

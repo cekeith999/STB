@@ -2010,7 +2010,7 @@ class STB_OT_MarkLastRunSuccess(bpy.types.Operator):
             if addon_path not in sys.path:
                 sys.path.insert(0, addon_path)
             
-            from success_library import BlenderSuccessLibrary
+            from lib.success_library import BlenderSuccessLibrary
             
             library = BlenderSuccessLibrary()
             last_run = library.get_last_run_info()
@@ -2073,7 +2073,7 @@ class STB_OT_DeleteRun(bpy.types.Operator):
             if addon_path not in sys.path:
                 sys.path.insert(0, addon_path)
             
-            from success_library import BlenderSuccessLibrary
+            from lib.success_library import BlenderSuccessLibrary
             
             library = BlenderSuccessLibrary()
             
@@ -2103,7 +2103,7 @@ class STB_OT_DeleteLastRun(bpy.types.Operator):
             if addon_path not in sys.path:
                 sys.path.insert(0, addon_path)
             
-            from success_library import BlenderSuccessLibrary
+            from lib.success_library import BlenderSuccessLibrary
             
             library = BlenderSuccessLibrary()
             last_run = library.get_last_run_info()
@@ -2142,7 +2142,7 @@ class STB_PT_SuccessLibrary(Panel):
             if addon_path not in sys.path:
                 sys.path.insert(0, addon_path)
             
-            from success_library import BlenderSuccessLibrary
+            from lib.success_library import BlenderSuccessLibrary
             library = BlenderSuccessLibrary()
             
             # Show last run info
