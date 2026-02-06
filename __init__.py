@@ -130,11 +130,12 @@ class STB_AddonPreferences(AddonPreferences):
         name="AI Model Provider",
         description="Choose which AI model to use for command understanding",
         items=[
+            ("openai-gpt-5", "OpenAI GPT-5", "OpenAI GPT-5 (latest, most capable)"),
             ("openai-gpt-4o", "OpenAI GPT-4o", "OpenAI GPT-4o (Vision capable, high quality)"),
             ("google-gemini-3-pro", "Google Gemini 3 Pro", "Google Gemini 3 Pro (Vision capable, high quality)"),
             ("google-gemini-3-fast", "Google Gemini 3 Fast", "Google Gemini 3 Fast (Vision capable, faster)"),
         ],
-        default="openai-gpt-4o",
+        default="openai-gpt-5",
     )
     
     gemini_api_key: StringProperty(
@@ -496,11 +497,11 @@ def _server_loop():
                 try:
                     if ADDON_ROOT in bpy.context.preferences.addons:
                         addon_prefs = bpy.context.preferences.addons[ADDON_ROOT].preferences
-                        provider = getattr(addon_prefs, "ai_model_provider", "openai-gpt-4o") or "openai-gpt-4o"
+                        provider = getattr(addon_prefs, "ai_model_provider", "openai-gpt-5") or "openai-gpt-5"
                         return provider
                 except Exception as e:
                     print(f"[SpeechToBlender] Error getting AI model provider: {e}")
-                return "openai-gpt-4o"  # Default fallback
+                return "openai-gpt-5"  # Default fallback
             
             def get_openai_api_key():
                 """RPC method: Get OpenAI API key from preferences (combines parts if split)."""
@@ -1482,6 +1483,67 @@ def _server_loop():
                     traceback.print_exc()
                     return {"error": str(e)}
             
+            def get_scene_state():
+                """
+                RPC method: Get comprehensive scene state for context-aware command generation.
+                Returns object names, positions, dimensions, bounds (world-space), and hierarchy.
+                """
+                try:
+                    from mathutils import Vector
+                    scene = bpy.context.scene
+                    view_layer = bpy.context.view_layer
+                    
+                    objects = []
+                    for obj in scene.objects:
+                        bbox_corners = [obj.matrix_world @ Vector(corner) for corner in obj.bound_box]
+                        min_corner = Vector((
+                            min(c.x for c in bbox_corners),
+                            min(c.y for c in bbox_corners),
+                            min(c.z for c in bbox_corners)
+                        ))
+                        max_corner = Vector((
+                            max(c.x for c in bbox_corners),
+                            max(c.y for c in bbox_corners),
+                            max(c.z for c in bbox_corners)
+                        ))
+                        
+                        obj_data = {
+                            "name": obj.name,
+                            "type": obj.type,
+                            "location": list(obj.location),
+                            "rotation_euler": list(obj.rotation_euler),
+                            "scale": list(obj.scale),
+                            "dimensions": list(obj.dimensions),
+                            "bounds": {
+                                "min": list(min_corner),
+                                "max": list(max_corner),
+                                "center": list((min_corner + max_corner) / 2)
+                            },
+                            "parent": obj.parent.name if obj.parent else None,
+                            "visible": obj.visible_get(),
+                        }
+                        
+                        if obj.type == 'MESH' and obj.data:
+                            obj_data["vertex_count"] = len(obj.data.vertices)
+                            obj_data["face_count"] = len(obj.data.polygons)
+                        
+                        objects.append(obj_data)
+                    
+                    active_name = view_layer.objects.active.name if view_layer.objects.active else None
+                    selected_names = [obj.name for obj in view_layer.objects.selected]
+                    
+                    return {
+                        "objects": objects,
+                        "active_object": active_name,
+                        "selected_objects": selected_names,
+                        "object_count": len(objects),
+                        "scene_name": scene.name,
+                    }
+                except Exception as e:
+                    import traceback
+                    traceback.print_exc()
+                    return {"error": str(e), "objects": []}
+            
             
             server.register_function(ping, "ping")
             server.register_function(enqueue_op_safe, "enqueue_op_safe")
@@ -1495,6 +1557,7 @@ def _server_loop():
             server.register_function(get_modeling_context, "get_modeling_context")
             server.register_function(analyze_current_mesh, "analyze_current_mesh")
             server.register_function(analyze_scene, "analyze_scene")
+            server.register_function(get_scene_state, "get_scene_state")
             server.register_function(capture_viewport_screenshot, "capture_viewport_screenshot")
             server.register_function(rename_active_object, "rename_active_object")
             server.register_function(assess_object_quality, "assess_object_quality")

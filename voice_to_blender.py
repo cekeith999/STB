@@ -136,13 +136,13 @@ def _get_ai_model_config():
     if _CACHE_MODEL_VALID and _CACHED_MODEL_PROVIDER:
         return _CACHED_MODEL_PROVIDER, _CACHED_API_KEY, _CACHED_GEMINI_KEY
     
-    provider = "openai-gpt-4o"  # Default
+    provider = "openai-gpt-5"  # Default
     openai_key = ""
     gemini_key = ""
     
     if rpc is not None:
         try:
-            provider = rpc.get_ai_model_provider() or "openai-gpt-4o"
+            provider = rpc.get_ai_model_provider() or "openai-gpt-5"
             openai_key = _get_openai_api_key()  # Uses existing function
             gemini_key = rpc.get_gemini_api_key() or ""
             
@@ -158,7 +158,7 @@ def _get_ai_model_config():
             if VERBOSE_DEBUG:
                 print(f"[DEBUG] Error getting AI model config: {e}")
             # Fall back to defaults
-            provider = "openai-gpt-4o"
+            provider = "openai-gpt-5"
             openai_key = _get_openai_api_key()
     
     return provider, openai_key, gemini_key
@@ -169,6 +169,11 @@ def _clear_model_cache():
     _CACHED_MODEL_PROVIDER = None
     _CACHED_GEMINI_KEY = None
     _CACHE_MODEL_VALID = False
+
+def _get_openai_model_name():
+    """Return the OpenAI model ID for the currently selected provider (e.g. gpt-5, gpt-4o)."""
+    provider, _, _ = _get_ai_model_config()
+    return "gpt-5" if provider == "openai-gpt-5" else "gpt-4o"
 
 def _call_unified_ai_api(messages, system_prompt=None, temperature=0, model_override=None):
     """
@@ -210,11 +215,13 @@ def _call_unified_ai_api(messages, system_prompt=None, temperature=0, model_over
             
             client = OpenAI(api_key=openai_key)
             
-            # Determine model name
-            model_name = "gpt-4o"  # Default
-            if provider == "openai-gpt-4o":
+            # Determine model name from provider
+            if provider == "openai-gpt-5":
+                model_name = "gpt-5"
+            elif provider == "openai-gpt-4o":
                 model_name = "gpt-4o"
-            # Add more OpenAI models here if needed
+            else:
+                model_name = "gpt-5"  # Default for any other openai-* provider
             
             # OpenAI expects messages in their format
             resp = client.chat.completions.create(
@@ -669,6 +676,32 @@ def _capture_screen_local():
         return None
 
 
+def _format_precise_scene_state(scene_state):
+    """
+    Format get_scene_state() RPC result as text for prompt/observation.
+    Used for precise context (exact coordinates, dimensions, bounds) in ReAct.
+    """
+    if not scene_state or scene_state.get("error"):
+        return "CURRENT SCENE OBJECTS (precise): Error or empty."
+    objs = scene_state.get("objects", [])
+    if not objs:
+        return "CURRENT SCENE OBJECTS (precise): No objects in scene."
+    lines = ["CURRENT SCENE OBJECTS (precise):"]
+    for obj in objs:
+        bounds = obj.get("bounds", {})
+        parts = [
+            f"  - {obj.get('name', '?')}: type={obj.get('type', '?')}",
+            f"location={obj.get('location', [])}",
+            f"dimensions={obj.get('dimensions', [])}",
+            f"bounds_min={bounds.get('min')}",
+            f"bounds_max={bounds.get('max')}",
+        ]
+        if obj.get("type") == "MESH":
+            parts.append(f"vertices={obj.get('vertex_count', '?')} faces={obj.get('face_count', '?')}")
+        lines.append(", ".join(parts))
+    return "\n".join(lines)
+
+
 def _log_context_data(modeling_context, mesh_analysis, scene_analysis, screenshot_data, step_name="Context"):
     """Log detailed context information for debugging."""
     if not CONTEXT_DEBUG:
@@ -971,6 +1004,14 @@ def _react_observe(request: str) -> str:
                 analysis = rpc.analyze_scene()
                 result = json.dumps(analysis, indent=2)
             
+            # Append precise scene state (exact positions, dimensions, bounds)
+            try:
+                scene_state = rpc.get_scene_state()
+                if scene_state and not scene_state.get("error"):
+                    result += "\n\n" + _format_precise_scene_state(scene_state)
+            except Exception:
+                pass
+            
             if screenshot_data:
                 result += f"\n📸 Screenshot captured ({len(screenshot_data)} bytes)"
             
@@ -1138,10 +1179,12 @@ def add_to_conversation_history(role: str, content: str, images: list = None):
     """Add message to persistent conversation history."""
     global _CONVERSATION_HISTORY
     has_images = bool(images and len(images) > 0)
+    # Don't store images in history: keeps reference context (text) but avoids
+    # sending many screenshots each turn (reduces latency and token bloat).
     _CONVERSATION_HISTORY.append({
         "role": role,
         "content": content,
-        "images": images or [],
+        "images": [],
         "timestamp": datetime.now().isoformat()
     })
     # Keep last N messages
@@ -2156,6 +2199,20 @@ def gpt_to_json_react(transcript: str, modeling_context=None, mesh_analysis=None
         
         if CONTEXT_DEBUG:
             print(f"[ReAct] ✅ Added scene analysis to system prompt ({summary.get('total_objects', 0)} objects)")
+    
+    # Precise context: exact object positions, dimensions, bounds for placement/positioning
+    if rpc:
+        try:
+            scene_state = rpc.get_scene_state()
+            if scene_state and not scene_state.get("error"):
+                precise_text = _format_precise_scene_state(scene_state)
+                system_prompt.append("\n--- Precise Scene State (exact positions, dimensions, bounds) ---")
+                system_prompt.append(precise_text)
+                if CONTEXT_DEBUG:
+                    print("[ReAct] ✅ Added precise scene state (get_scene_state) to system prompt")
+        except Exception as e:
+            if CONTEXT_DEBUG:
+                print(f"[ReAct] ⚠️ get_scene_state failed: {e}")
     
     # Phase 1: Add Focus Stack resolution info to system prompt
     if focus_resolution and focus_resolution.get("resolved_objects"):
@@ -3768,8 +3825,9 @@ Guidelines:
 - Consider both OBJECT and EDIT modes where appropriate
 - Include version/model-specific details when relevant (e.g., iPhone 16 vs iPhone 8)"""
                 
+                openai_model = _get_openai_model_name()
                 response = client.chat.completions.create(
-                    model="gpt-4o",
+                    model=openai_model,
                     messages=[
                         {"role": "system", "content": "You are a 3D modeling expert. Return only valid JSON matching the exact structure requested. Do not include markdown code fences."},
                         {"role": "user", "content": prompt}
@@ -4240,8 +4298,9 @@ def gpt_to_json(transcript: str, modeling_context=None, mesh_analysis=None, targ
             if screenshot_data:
                 print(f"[GPT] User message includes screenshot: {len(screenshot_data):,} bytes")
         
+        openai_model = _get_openai_model_name()
         resp = client.chat.completions.create(
-            model="gpt-4o",
+            model=openai_model,
             messages=messages,
             temperature=0,
         )
@@ -4276,7 +4335,7 @@ def gpt_to_json(transcript: str, modeling_context=None, mesh_analysis=None, targ
             print(f"   Troubleshooting:")
             print(f"   1. Verify the key is correct in OpenAI dashboard: https://platform.openai.com/api-keys")
             print(f"   2. Check if the key has been revoked or expired")
-            print(f"   3. Ensure the key has 'gpt-4o' model access")
+            print(f"   3. Ensure the key has model access (e.g. gpt-4o or gpt-5)")
             print(f"   4. For project keys (sk-proj-), verify project billing is active")
         elif "429" in error_msg or "rate limit" in error_msg.lower():
             print(f"⚠️ GPT error: Rate limit exceeded. Please try again later.")
@@ -4387,7 +4446,23 @@ if __name__ == "__main__":
                 if typed_text:
                     print(f"📝 Typed Command -> {typed_text}", flush=True)
                     text = typed_text
-                    # Skip audio recording and transcription, go straight to processing
+                    has_references = bool(re.search(r'\b(them|it|these|those|they|all of them|each of them)\b', text, re.IGNORECASE))
+                    command_parts = _split_multiple_commands(text)
+                    if rpc is not None:
+                        try:
+                            rpc.start_voice_command()
+                        except Exception:
+                            pass
+                        try:
+                            super_state = rpc.get_super_mode_state()
+                            SUPER_MODE_TARGET = super_state.get("target_object", "")
+                            USE_REACT_REASONING = bool(super_state.get("use_react", False))
+                        except Exception:
+                            SUPER_MODE_TARGET = ""
+                            USE_REACT_REASONING = False
+                    else:
+                        SUPER_MODE_TARGET = ""
+                        USE_REACT_REASONING = False
                 else:
                     # No typed text, proceed with voice recording
                     listening_enabled = True
