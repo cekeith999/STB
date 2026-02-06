@@ -38,6 +38,15 @@ _VOICE_RUNNING = False
 _VOICE_LISTENING_ENABLED = True  # Toggle for voice listening (Alt+F)
 DEFAULT_VOICE_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "voice_to_blender.py")
 
+# ───────── Live pipeline: Action Queue (Phase 3) ─────────
+# Thread-safe queue: Listener thread pushes, Modal Executor pops on main thread.
+# Message format: {"type": "PREDICT"|"CODE"|"ERROR", "payload": str}
+#   PREDICT = instant primitive (e.g. "cube", "sphere", "iphone")
+#   CODE   = Python/Blender code to exec (e.g. "bpy.ops.mesh.primitive_cube_add(...)")
+#   ERROR  = error message to show (e.g. console)
+_LIVE_ACTION_QUEUE = queue.Queue()
+_LIVE_SESSION_RUNNING = False  # Set True when Start Live; False when Stop Live
+
 # ───────── Preferences (single class) ─────────
 class STB_AddonPreferences(AddonPreferences):
     bl_idname = ADDON_ROOT
