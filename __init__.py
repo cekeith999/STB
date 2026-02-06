@@ -46,6 +46,8 @@ DEFAULT_VOICE_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), 
 #   ERROR  = error message to show (e.g. console)
 _LIVE_ACTION_QUEUE = queue.Queue()
 _LIVE_SESSION_RUNNING = False  # Set True when Start Live; False when Stop Live
+_LIVE_LISTENER = None  # LiveListener thread instance (Phase 7)
+_LIVE_TIMER = None  # bpy.app.timers registration handle (Phase 7)
 
 # ───────── Preferences (single class) ─────────
 class STB_AddonPreferences(AddonPreferences):
@@ -1807,6 +1809,29 @@ _LIVE_PREDICT_MAP = {
 }
 
 
+def _get_live_context_string():
+    """Build context string for Gemini Live (Phase 7: context injection). Active object and selection."""
+    try:
+        ctx = bpy.context
+        view_layer = ctx.view_layer
+        lines = ["Current Blender context for the user's scene:"]
+        active = view_layer.objects.active
+        if active:
+            lines.append(f"Active object: {active.name} (type={active.type}, location={list(active.location)})")
+        else:
+            lines.append("Active object: none")
+        sel = list(view_layer.objects.selected)
+        if sel:
+            names = [o.name for o in sel]
+            lines.append(f"Selected: {', '.join(names)}")
+        else:
+            lines.append("Selected: none")
+        lines.append("Respond with only executable Blender Python code (bpy.ops... or bpy.context...). No explanations.")
+        return " ".join(lines)
+    except Exception:
+        return "Respond with only executable Blender Python code (bpy.ops... or bpy.context...). No explanations."
+
+
 def _execute_predict(payload):
     """Execute PREDICT payload (Phase 5: instant primitive)."""
     payload = (payload or "").strip().lower()
@@ -2108,6 +2133,88 @@ class STB_OT_RPCStop(bpy.types.Operator):
         context.window_manager.stb_rpc_server_running = False
         self.report({'INFO'}, "RPC server stopping…")
         return {'FINISHED'}
+
+
+# ───────── Live Session (Phase 7) ─────────
+class STB_OT_LiveStart(bpy.types.Operator):
+    bl_idname = "stb.live_start"
+    bl_label = "Start Live Session"
+    bl_description = "Start Gemini Live: stream mic to Gemini, execute code in Blender in real time"
+
+    def execute(self, context):
+        global _LIVE_SESSION_RUNNING, _LIVE_LISTENER, _LIVE_TIMER
+        if _LIVE_SESSION_RUNNING:
+            self.report({'WARNING'}, "Live session already running")
+            return {'CANCELLED'}
+        try:
+            addon_prefs = context.preferences.addons[ADDON_ROOT].preferences
+            api_key = getattr(addon_prefs, "gemini_api_key", "") or ""
+        except Exception:
+            api_key = ""
+        if not api_key:
+            self.report({'ERROR'}, "Set Google Gemini API key in addon preferences")
+            return {'CANCELLED'}
+        try:
+            from google import genai
+            import pyaudio
+            import websockets
+        except ImportError as e:
+            self.report({'ERROR'}, f"Missing dependency for Live: {e}. Install: pip install google-genai pyaudio websockets")
+            return {'CANCELLED'}
+        try:
+            bpy.ops.ed.undo_push(message="Live Session Start")
+        except Exception:
+            pass
+        _LIVE_SESSION_RUNNING = True
+        context_str = _get_live_context_string()
+        addon_dir = os.path.dirname(os.path.abspath(__file__))
+        if addon_dir not in sys.path:
+            sys.path.insert(0, addon_dir)
+        from live_bridge import LiveListener
+        _LIVE_LISTENER = LiveListener(api_key=api_key, action_queue=_LIVE_ACTION_QUEUE, system_instruction=context_str)
+        _LIVE_LISTENER.start()
+        _LIVE_TIMER = bpy.app.timers.register(_drain_live_action_queue, first_interval=0.05)
+        self.report({'INFO'}, "Live session started – listening")
+        return {'FINISHED'}
+
+
+class STB_OT_LiveStop(bpy.types.Operator):
+    bl_idname = "stb.live_stop"
+    bl_label = "Stop Live Session"
+
+    def execute(self, context):
+        global _LIVE_SESSION_RUNNING, _LIVE_LISTENER, _LIVE_TIMER
+        _LIVE_SESSION_RUNNING = False
+        if _LIVE_LISTENER:
+            _LIVE_LISTENER.stop()
+            _LIVE_LISTENER = None
+        if _LIVE_TIMER is not None:
+            try:
+                bpy.app.timers.unregister(_LIVE_TIMER)
+            except Exception:
+                pass
+            _LIVE_TIMER = None
+        self.report({'INFO'}, "Live session stopped")
+        return {'FINISHED'}
+
+
+class STB_PT_Live(Panel):
+    bl_space_type = "VIEW_3D"
+    bl_region_type = "UI"
+    bl_category = "STB"
+    bl_label = "Live (Gemini)"
+    bl_options = {'DEFAULT_CLOSED'}
+
+    def draw(self, context):
+        layout = self.layout
+        global _LIVE_SESSION_RUNNING, _LIVE_LISTENER
+        is_running = _LIVE_SESSION_RUNNING or (_LIVE_LISTENER and _LIVE_LISTENER.running)
+        if is_running:
+            layout.label(text="Listening…", icon="OUTLINER_OB_SPEAKER")
+            layout.operator("stb.live_stop", icon="PAUSE", text="Stop Live Session")
+        else:
+            layout.operator("stb.live_start", icon="PLAY", text="Start Live Session")
+            layout.label(text="Stream mic to Gemini, run code in Blender", icon="INFO")
 
 
 class STB_OT_ToggleVoiceListening(bpy.types.Operator):
@@ -2470,6 +2577,9 @@ _CLASSES = (
     STB_PT_MeshyStatus,
     STB_OT_RPCStart,
     STB_OT_RPCStop,
+    STB_OT_LiveStart,
+    STB_OT_LiveStop,
+    STB_PT_Live,
     STB_OT_ToggleVoiceListening,
     STB_PT_RPCBridge,
     STB_PT_VoiceMode,
@@ -2511,6 +2621,9 @@ def register():
     bpy.utils.register_class(STB_PT_MeshyStatus)
     bpy.utils.register_class(STB_OT_RPCStart)
     bpy.utils.register_class(STB_OT_RPCStop)
+    bpy.utils.register_class(STB_OT_LiveStart)
+    bpy.utils.register_class(STB_OT_LiveStop)
+    bpy.utils.register_class(STB_PT_Live)
     bpy.utils.register_class(STB_OT_ToggleVoiceListening)
     bpy.utils.register_class(STB_OT_SubmitTextCommand)
     bpy.utils.register_class(STB_PT_RPCBridge)
@@ -2567,6 +2680,22 @@ def unregister():
     # prefs
     try:
         bpy.utils.unregister_class(STB_AddonPreferences)
+    except Exception:
+        pass
+
+    # Stop Live session if running (Phase 7)
+    try:
+        global _LIVE_SESSION_RUNNING, _LIVE_LISTENER, _LIVE_TIMER
+        _LIVE_SESSION_RUNNING = False
+        if _LIVE_LISTENER:
+            _LIVE_LISTENER.stop()
+            _LIVE_LISTENER = None
+        if _LIVE_TIMER is not None:
+            try:
+                bpy.app.timers.unregister(_LIVE_TIMER)
+            except Exception:
+                pass
+            _LIVE_TIMER = None
     except Exception:
         pass
 
