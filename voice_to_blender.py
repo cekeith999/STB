@@ -1036,8 +1036,12 @@ def _react_observe(request: str) -> str:
             
         if req in ("assess_object_quality", "quality", "assessment", "assess"):
             try:
-                # Extract target_object from request if provided, or use empty string
-                # Format: "assess_object_quality iPhone 16" or just "assess_object_quality"
+                state = rpc.get_super_mode_state() if rpc else {}
+                if not state.get("enable_quality_assessment"):
+                    result = "Quality assessment is disabled (enable in addon preferences for turn-based ReAct)."
+                    if screenshot_data:
+                        result += f"\n📸 Screenshot captured ({len(screenshot_data)} bytes)"
+                    return result
                 target_object = ""
                 req_parts = request.strip().split(maxsplit=1)
                 if len(req_parts) > 1:
@@ -2689,77 +2693,66 @@ def gpt_to_json_react(transcript: str, modeling_context=None, mesh_analysis=None
             if not target_object:
                 print(f"[ReAct] ✅ Skipping quality check (no target object specified - simple command)")
             elif target_object and rpc:
-                try:
-                    print(f"[ReAct] 🔍 Performing mandatory quality assessment before finishing...")
-                    assessment = rpc.assess_object_quality(target_object)
-                    
-                    if assessment and not assessment.get("error"):
-                        quality_score = assessment.get("quality_score", 0.0)
-                        target_match = assessment.get("target_match_score", 0.0)
-                        issues = assessment.get("issues", [])
-                        missing_features = assessment.get("missing_features", [])
-                        
-                        print(f"[ReAct] Quality Score: {quality_score:.2f}/1.0, Target Match: {target_match:.2f}/1.0")
-                        
-                        # Require minimum quality threshold
-                        if quality_score < 0.5 or target_match < 0.5:
-                            quality_check_passed = False
-                            
-                            # Get suggestions from assessment
-                            suggestions = assessment.get("suggestions", [])
-                            found_features = assessment.get("found_features", [])
-                            
-                            assessment_msg = f"❌ QUALITY CHECK FAILED - CANNOT FINISH YET:\n\n"
-                            assessment_msg += f"Quality Score: {quality_score:.2f}/1.0 (minimum: 0.5) ❌\n"
-                            assessment_msg += f"Target Match: {target_match:.2f}/1.0 (minimum: 0.5) ❌\n\n"
-                            
-                            if found_features:
-                                assessment_msg += f"✅ Found: {', '.join(found_features)}\n"
-                            
-                            if missing_features:
-                                assessment_msg += f"\n❌ MISSING REQUIRED PARTS:\n"
-                                for missing in missing_features:
-                                    assessment_msg += f"  - {missing}\n"
-                            
-                            if issues:
-                                assessment_msg += f"\n⚠️ Issues:\n"
-                                for issue in issues[:5]:  # Show up to 5 issues
-                                    assessment_msg += f"  - {issue}\n"
-                            
-                            if suggestions:
-                                assessment_msg += f"\n💡 Suggestions:\n"
-                                for suggestion in suggestions[:3]:  # Show up to 3 suggestions
-                                    assessment_msg += f"  - {suggestion}\n"
-                            
-                            assessment_msg += f"\n🚫 ACTION REQUIRED: You CANNOT finish until quality_score >= 0.5 AND target_match_score >= 0.5.\n"
-                            assessment_msg += f"You MUST:\n"
-                            assessment_msg += f"1. Use 'execute' to ADD the missing parts listed above\n"
-                            assessment_msg += f"2. Use 'execute' to REFINE existing parts if needed\n"
-                            assessment_msg += f"3. Use 'observe assess_object_quality' to check progress\n"
-                            assessment_msg += f"4. Only use 'finish' AFTER quality check passes\n\n"
-                            assessment_msg += f"DO NOT try to finish again until you have actually added the missing parts!"
-                            
-                            print(f"[ReAct] ⚠️ {assessment_msg}")
-                            conversation.append({"role": "user", "content": f"Observation: {assessment_msg}"})
+                state = rpc.get_super_mode_state()
+                if not state.get("enable_quality_assessment"):
+                    print(f"[ReAct] ✅ Skipping quality check (quality assessment disabled in preferences)")
+                else:
+                    try:
+                        print(f"[ReAct] 🔍 Performing mandatory quality assessment before finishing...")
+                        assessment = rpc.assess_object_quality(target_object)
+                        if assessment and not assessment.get("error"):
+                            quality_score = assessment.get("quality_score", 0.0)
+                            target_match = assessment.get("target_match_score", 0.0)
+                            issues = assessment.get("issues", [])
+                            missing_features = assessment.get("missing_features", [])
+                            print(f"[ReAct] Quality Score: {quality_score:.2f}/1.0, Target Match: {target_match:.2f}/1.0")
+                            if quality_score < 0.5 or target_match < 0.5:
+                                quality_check_passed = False
+                                suggestions = assessment.get("suggestions", [])
+                                found_features = assessment.get("found_features", [])
+                                assessment_msg = f"❌ QUALITY CHECK FAILED - CANNOT FINISH YET:\n\n"
+                                assessment_msg += f"Quality Score: {quality_score:.2f}/1.0 (minimum: 0.5) ❌\n"
+                                assessment_msg += f"Target Match: {target_match:.2f}/1.0 (minimum: 0.5) ❌\n\n"
+                                if found_features:
+                                    assessment_msg += f"✅ Found: {', '.join(found_features)}\n"
+                                if missing_features:
+                                    assessment_msg += f"\n❌ MISSING REQUIRED PARTS:\n"
+                                    for missing in missing_features:
+                                        assessment_msg += f"  - {missing}\n"
+                                if issues:
+                                    assessment_msg += f"\n⚠️ Issues:\n"
+                                    for issue in issues[:5]:
+                                        assessment_msg += f"  - {issue}\n"
+                                if suggestions:
+                                    assessment_msg += f"\n💡 Suggestions:\n"
+                                    for suggestion in suggestions[:3]:
+                                        assessment_msg += f"  - {suggestion}\n"
+                                assessment_msg += f"\n🚫 ACTION REQUIRED: You CANNOT finish until quality_score >= 0.5 AND target_match_score >= 0.5.\n"
+                                assessment_msg += f"You MUST:\n"
+                                assessment_msg += f"1. Use 'execute' to ADD the missing parts listed above\n"
+                                assessment_msg += f"2. Use 'execute' to REFINE existing parts if needed\n"
+                                assessment_msg += f"3. Use 'observe assess_object_quality' to check progress\n"
+                                assessment_msg += f"4. Only use 'finish' AFTER quality check passes\n\n"
+                                assessment_msg += f"DO NOT try to finish again until you have actually added the missing parts!"
+                                print(f"[ReAct] ⚠️ {assessment_msg}")
+                                conversation.append({"role": "user", "content": f"Observation: {assessment_msg}"})
+                            else:
+                                quality_check_passed = True
+                                print(f"[ReAct] ✅ Quality check passed! Object matches target '{target_object}'")
+                                final_quality = quality_score
+                                final_target_match = target_match
                         else:
-                            quality_check_passed = True
-                            print(f"[ReAct] ✅ Quality check passed! Object matches target '{target_object}'")
-                            # Store quality scores for success library
-                            final_quality = quality_score
-                            final_target_match = target_match
-                    else:
-                        # If assessment failed, still require manual check
-                        print(f"[ReAct] ⚠️ Quality assessment unavailable, requiring manual verification")
-                        conversation.append({"role": "user", "content": f"Observation: Before finishing, verify the object looks like '{target_object}'. Use 'observe assess_object_quality' to check. If quality is low, continue refining."})
+                            print(f"[ReAct] ⚠️ Quality assessment unavailable, requiring manual verification")
+                            conversation.append({"role": "user", "content": f"Observation: Before finishing, verify the object looks like '{target_object}'. Use 'observe assess_object_quality' to check. If quality is low, continue refining."})
+                            quality_check_passed = False
+                            final_quality = 0.0
+                            final_target_match = 0.0
+                    except Exception as e:
+                        print(f"[ReAct] ⚠️ Quality assessment error: {e}")
+                        conversation.append({"role": "user", "content": f"Observation: Quality check failed ({e}). Before finishing, verify the object looks like '{target_object}'. Use 'observe assess_object_quality' to check."})
                         quality_check_passed = False
                         final_quality = 0.0
                         final_target_match = 0.0
-                except Exception as e:
-                    print(f"[ReAct] ⚠️ Quality assessment error: {e}")
-                    conversation.append({"role": "user", "content": f"Observation: Quality check failed ({e}). Before finishing, verify the object looks like '{target_object}'. Use 'observe assess_object_quality' to check."})
-                    quality_check_passed = False
-                    final_quality = 0.0
-                    final_target_match = 0.0
             
             # Also run legacy validation for backwards compatibility
             validation_failed = False
@@ -2803,9 +2796,9 @@ def gpt_to_json_react(transcript: str, modeling_context=None, mesh_analysis=None
             if 'final_quality' not in locals() or 'final_target_match' not in locals():
                 final_quality = 0.0
                 final_target_match = 0.0
-                # Try to get final quality assessment
                 try:
-                    if rpc and target_object:
+                    state = rpc.get_super_mode_state() if rpc else {}
+                    if rpc and target_object and state.get("enable_quality_assessment"):
                         assessment = rpc.assess_object_quality(target_object)
                         if assessment:
                             final_quality = assessment.get('quality_score', 0.0)

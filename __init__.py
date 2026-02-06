@@ -118,11 +118,16 @@ class STB_AddonPreferences(AddonPreferences):
         maxlen=200,
     )
     
-    # Modeling context settings (formerly Super Mode)
+    # Modeling context (optional hint; real-time mode uses context injection instead)
     super_mode_target_object: StringProperty(
         name="Modeling Target",
-        description="What are you building? (e.g., 'Echo Dot', 'Coffee Mug', 'Character Head')",
+        description="Optional context hint for GPT (e.g., 'Echo Dot', 'Coffee Mug'). Not required to speak.",
         default="",
+    )
+    enable_quality_assessment: bpy.props.BoolProperty(
+        name="Enable Quality Assessment",
+        description="Run assess_object_quality in voice pipeline (turn-based ReAct). Disabled for real-time Live mode.",
+        default=False,
     )
     
     # AI Model Selection
@@ -205,14 +210,14 @@ class STB_AddonPreferences(AddonPreferences):
         col.separator()
         col.label(text="Used for natural language command understanding", icon="INFO")
         
-        # Modeling Context Settings
+        # Modeling Context (optional; real-time uses context injection)
         box = layout.box()
-        box.label(text="Modeling Context", icon="LIGHT")
+        box.label(text="Modeling Context (optional)", icon="LIGHT")
         col = box.column(align=True)
         col.prop(self, "super_mode_target_object")
+        col.prop(self, "enable_quality_assessment")
         col.separator()
-        col.label(text="Target object gives GPT extra context for modeling", icon="INFO")
-        col.label(text="Examples: 'Echo Dot', 'Coffee Mug', 'Smartphone'", icon="BLANK1")
+        col.label(text="Target is optional hint. Quality assessment is for turn-based ReAct only.", icon="INFO")
 
 
 # ───────── Minimal operator and panels so UI never crashes ─────────
@@ -604,19 +609,22 @@ def _server_loop():
                 try:
                     target_object = ""
                     use_react = False
+                    enable_quality = False
                     if ADDON_ROOT in bpy.context.preferences.addons:
                         addon_prefs = bpy.context.preferences.addons[ADDON_ROOT].preferences
                         target_object = getattr(addon_prefs, "super_mode_target_object", "")
                         use_react = getattr(addon_prefs, "use_react_reasoning", False)
+                        enable_quality = getattr(addon_prefs, "enable_quality_assessment", False)
                     
                     return {
-                        "enabled": True,  # Mode is always on now
+                        "enabled": True,
                         "target_object": target_object,
                         "use_react": use_react,
+                        "enable_quality_assessment": enable_quality,
                     }
                 except Exception as e:
                     print(f"[SpeechToBlender] Error getting modeling state: {e}")
-                    return {"enabled": True, "target_object": "", "use_react": False}
+                    return {"enabled": True, "target_object": "", "use_react": False, "enable_quality_assessment": False}
             
             def get_modeling_context():
                 """RPC method: Get current modeling context (scene state, selected objects, mode, modifiers)."""

@@ -1,8 +1,11 @@
 openai>=2.7.0
 google-generativeai>=0.8.0
+google-genai>=1.0.0
 webrtcvad-wheels>=2.0.14
 Pillow>=10.0.0
 mss>=9.0.0
+pyaudio>=0.2.14
+websockets>=12.0
 
 
 
