@@ -1772,6 +1772,45 @@ def _drain_task_queue():
     return 0.5 if _SERVER_RUNNING else None
 
 
+def _execute_predict(payload):
+    """Execute PREDICT payload (Phase 5: instant primitive). Placeholder until keyword map exists."""
+    pass
+
+
+def _drain_live_action_queue():
+    """Drain Live Action Queue on main thread (Phase 4). Handle CODE, PREDICT, ERROR."""
+    global _LIVE_SESSION_RUNNING
+    if not _LIVE_SESSION_RUNNING:
+        return None
+    try:
+        while not _LIVE_ACTION_QUEUE.empty():
+            try:
+                item = _LIVE_ACTION_QUEUE.get_nowait()
+            except queue.Empty:
+                break
+            if not isinstance(item, dict):
+                continue
+            msg_type = item.get("type")
+            payload = item.get("payload", "")
+            if msg_type == "ERROR":
+                print(f"[SpeechToBlender Live] ERROR: {payload}")
+            elif msg_type == "CODE":
+                try:
+                    exec(payload, {"__builtins__": __builtins__, "bpy": bpy})
+                    print("[SpeechToBlender Live] CODE executed")
+                except Exception as e:
+                    import traceback
+                    print(f"[SpeechToBlender Live] CODE exec failed: {e}")
+                    traceback.print_exc()
+            elif msg_type == "PREDICT":
+                _execute_predict(payload)
+    except Exception as e:
+        print(f"[SpeechToBlender] Error draining live queue: {e}")
+        import traceback
+        traceback.print_exc()
+    return 0.05 if _LIVE_SESSION_RUNNING else None
+
+
 # ───────── Voice Process Management ─────────
 def _get_voice_script_path():
     """Get the path to voice_to_blender.py script."""
