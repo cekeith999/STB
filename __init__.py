@@ -1772,9 +1772,33 @@ def _drain_task_queue():
     return 0.5 if _SERVER_RUNNING else None
 
 
+# Phase 5: Predictive God Mode - keyword -> Blender code (instant primitives)
+_LIVE_PREDICT_MAP = {
+    "cube": "bpy.ops.mesh.primitive_cube_add()",
+    "sphere": "bpy.ops.mesh.primitive_uv_sphere_add()",
+    "cylinder": "bpy.ops.mesh.primitive_cylinder_add()",
+    "plane": "bpy.ops.mesh.primitive_plane_add()",
+    "cone": "bpy.ops.mesh.primitive_cone_add()",
+    "torus": "bpy.ops.mesh.primitive_torus_add()",
+    "camera": "bpy.ops.object.camera_add()",
+    "light": "bpy.ops.object.light_add(type='POINT')",
+    "iphone": "bpy.ops.mesh.primitive_cube_add(); bpy.context.object.scale = (0.036, 0.074, 0.004)",
+}
+
+
 def _execute_predict(payload):
-    """Execute PREDICT payload (Phase 5: instant primitive). Placeholder until keyword map exists."""
-    pass
+    """Execute PREDICT payload (Phase 5: instant primitive)."""
+    payload = (payload or "").strip().lower()
+    code = _LIVE_PREDICT_MAP.get(payload)
+    if not code:
+        return
+    try:
+        exec(code, {"__builtins__": __builtins__, "bpy": bpy})
+        print(f"[SpeechToBlender Live] PREDICT executed: {payload}")
+    except Exception as e:
+        import traceback
+        print(f"[SpeechToBlender Live] PREDICT failed ({payload}): {e}")
+        traceback.print_exc()
 
 
 def _drain_live_action_queue():

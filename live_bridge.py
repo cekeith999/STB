@@ -1,10 +1,14 @@
 """
 Gemini Live Listener (Phase 2): background thread that streams mic audio to Gemini Live
 and pushes received text/code to the action queue. No top-level heavy imports.
+Phase 5: scan text for PREDICT keywords and push instant primitives.
 """
 import asyncio
 import threading
 import queue
+
+# Phase 5: keywords that trigger instant PREDICT (must match addon _LIVE_PREDICT_MAP keys)
+PREDICT_KEYWORDS = ("cube", "sphere", "cylinder", "plane", "cone", "torus", "camera", "light", "iphone")
 
 
 class LiveListener(threading.Thread):
@@ -118,7 +122,13 @@ class LiveListener(threading.Thread):
                         text_obj = getattr(part, "text", None)
                         text = getattr(text_obj, "text", None) if text_obj else (getattr(part, "text", None) or "")
                         if isinstance(text, str) and text.strip():
-                            self.action_queue.put({"type": "CODE", "payload": text.strip()})
+                            t = text.strip()
+                            text_lower = t.lower()
+                            for kw in PREDICT_KEYWORDS:
+                                if kw in text_lower:
+                                    self.action_queue.put({"type": "PREDICT", "payload": kw})
+                                    break
+                            self.action_queue.put({"type": "CODE", "payload": t})
             except asyncio.CancelledError:
                 pass
             except Exception as e:
