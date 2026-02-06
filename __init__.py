@@ -1772,6 +1772,27 @@ def _drain_task_queue():
     return 0.5 if _SERVER_RUNNING else None
 
 
+# Phase 6: Safety - forbidden substrings in CODE (block before exec)
+_LIVE_CODE_BLACKLIST = (
+    "import os",
+    "import sys",
+    "os.",
+    "sys.",
+    "shutil",
+    "sys.exit",
+    "quit_blender",
+    "quit(",
+    "exit(",
+    "open(",
+    "__import__",
+    "eval(",
+    "exec(",
+    "compile(",
+    "subprocess",
+    "remove(",
+)
+
+
 # Phase 5: Predictive God Mode - keyword -> Blender code (instant primitives)
 _LIVE_PREDICT_MAP = {
     "cube": "bpy.ops.mesh.primitive_cube_add()",
@@ -1819,13 +1840,20 @@ def _drain_live_action_queue():
             if msg_type == "ERROR":
                 print(f"[SpeechToBlender Live] ERROR: {payload}")
             elif msg_type == "CODE":
-                try:
-                    exec(payload, {"__builtins__": __builtins__, "bpy": bpy})
-                    print("[SpeechToBlender Live] CODE executed")
-                except Exception as e:
-                    import traceback
-                    print(f"[SpeechToBlender Live] CODE exec failed: {e}")
-                    traceback.print_exc()
+                blocked = False
+                for forbidden in _LIVE_CODE_BLACKLIST:
+                    if forbidden in payload:
+                        print(f"[SpeechToBlender Live] BLOCKED (forbidden: {forbidden!r})")
+                        blocked = True
+                        break
+                if not blocked:
+                    try:
+                        exec(payload, {"__builtins__": __builtins__, "bpy": bpy})
+                        print("[SpeechToBlender Live] CODE executed")
+                    except Exception as e:
+                        import traceback
+                        print(f"[SpeechToBlender Live] CODE exec failed: {e}")
+                        traceback.print_exc()
             elif msg_type == "PREDICT":
                 _execute_predict(payload)
     except Exception as e:
